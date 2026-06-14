@@ -1,0 +1,5 @@
+/target
+
+# Local-only symlinks (see intro.md)
+/md
+/game
