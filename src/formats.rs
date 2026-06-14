@@ -4,4 +4,5 @@
 //! building blocks (the byte [`Reader`](crate::Reader), the [`Truncated`](crate::Truncated)
 //! error, and small parsing helpers) live in the crate root.
 
+pub mod bif;
 pub mod key;

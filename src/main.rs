@@ -9,8 +9,10 @@ mod formats;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
+use std::path::Path;
 use std::process::ExitCode;
 
+use formats::bif::BifArchive;
 use formats::key::{KeyFile, type_extension};
 
 const DEFAULT_KEY_PATH: &str = "game/chitin.key";
@@ -164,13 +166,54 @@ fn report(key: &KeyFile) {
     }
 }
 
+/// Extract the first resource end-to-end (KEY lookup → open BIF → read bytes)
+/// to verify the BIF parser. `game_dir` is the root the KEY's BIF paths are
+/// relative to.
+fn demo_extract(key: &KeyFile, game_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(res) = key.resources().first() else {
+        return Ok(());
+    };
+
+    let Some(bif_name) = key.bif_name(res.source_index()) else {
+        return Ok(());
+    };
+
+    // KEY stores BIF paths relative to the game root, possibly with `\` separators.
+    let relative = bif_name.replace('\\', "/");
+    let bif_path = game_dir.join(relative);
+
+    let mut bif = BifArchive::open(&bif_path)?;
+    let bytes = bif.read_resource(res.file_index(), res.res_type())?;
+
+    println!(
+        "\nExtracted {}.{} from {} — {} bytes",
+        res.name(),
+        type_extension(res.res_type()),
+        bif_name,
+        bytes.len()
+    );
+    let preview: String = String::from_utf8_lossy(&bytes)
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" / ");
+    println!("  first lines: {preview}");
+
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_KEY_PATH.to_string());
-    let data = std::fs::read(&path)?;
+    let key_path = Path::new(&path);
+    let data = std::fs::read(key_path)?;
     let key = KeyFile::parse(&data)?;
     report(&key);
+
+    let game_dir = key_path.parent().unwrap_or_else(|| Path::new("."));
+    demo_extract(&key, game_dir)?;
+
     Ok(())
 }
 
