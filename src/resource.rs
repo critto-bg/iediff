@@ -10,7 +10,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::formats::bif::{BifArchive, BifError};
-use crate::formats::key::{KeyError, KeyFile};
+use crate::formats::ids::{IDS_TYPE, IdsFile};
+use crate::formats::key::{KeyError, KeyFile, type_extension};
 
 /// Anything that can go wrong while resolving or reading a resource.
 #[derive(Debug)]
@@ -80,6 +81,36 @@ pub struct ResourceInfo {
     pub bif: String,
 }
 
+impl fmt::Display for ResourceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "  type: 0x{:04x} ({})",
+            self.res_type,
+            type_extension(self.res_type)
+        )?;
+        writeln!(f, "  size: {} bytes", self.size)?;
+        writeln!(f, "  bif:  {}", self.bif)
+    }
+}
+
+/// A loaded resource: a parsed view for formats we understand, otherwise the
+/// basic metadata. Renders itself via [`Display`](fmt::Display), so callers
+/// print it without knowing the concrete format.
+pub enum Resource {
+    Ids(IdsFile),
+    Other(ResourceInfo),
+}
+
+impl fmt::Display for Resource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Resource::Ids(ids) => write!(f, "{ids}"),
+            Resource::Other(info) => write!(f, "{info}"),
+        }
+    }
+}
+
 /// Loads a KEY and serves resource bytes out of the BIFs it indexes.
 pub struct ResourceManager {
     key: KeyFile,
@@ -140,9 +171,24 @@ impl ResourceManager {
         })
     }
 
+    /// Load a resource, parsing it when the format is supported and otherwise
+    /// returning its metadata.
+    pub fn load(&mut self, name: &str, res_type: u16) -> Result<Resource, ResourceError> {
+        if res_type == IDS_TYPE {
+            Ok(Resource::Ids(self.ids(name)?))
+        } else {
+            Ok(Resource::Other(self.info(name, res_type)?))
+        }
+    }
+
+    /// Load and parse an IDS table by name.
+    pub fn ids(&mut self, name: &str) -> Result<IdsFile, ResourceError> {
+        let bytes = self.read(name, IDS_TYPE)?;
+        Ok(IdsFile::parse(&bytes))
+    }
+
     /// Resolve a resource by name and type and return its raw bytes. The core
-    /// extraction path; will back the upcoming resource-format parsers.
-    #[allow(dead_code)]
+    /// extraction path behind the format parsers.
     pub fn read(&mut self, name: &str, res_type: u16) -> Result<Vec<u8>, ResourceError> {
         let (source, file_index, expected_type) = match self.key.lookup(name, res_type) {
             Some(res) => (res.source_index(), res.file_index(), res.res_type()),

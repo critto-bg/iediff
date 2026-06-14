@@ -5,4 +5,5 @@
 //! error, and small parsing helpers) live in the crate root.
 
 pub mod bif;
+pub mod ids;
 pub mod key;

@@ -7,6 +7,7 @@
 mod formats;
 mod resource;
 
+use std::borrow::Cow;
 use std::env;
 use std::fmt;
 use std::path::Path;
@@ -109,6 +110,29 @@ pub fn describe_tag(tag: &[u8; 4]) -> String {
     format!("\"{printable}\" ({})", hex.join(" "))
 }
 
+/// The 64-byte key used to XOR-encrypt some text resources (mainly IDS, and
+/// occasionally 2DA). See `md/file_formats/ie_formats/encryption.md`.
+const TEXT_XOR_KEY: [u8; 64] = [
+    0x88, 0xa8, 0x8f, 0xba, 0x8a, 0xd3, 0xb9, 0xf5, 0xed, 0xb1, 0xcf, 0xea, 0xaa, 0xe4, 0xb5, 0xfb,
+    0xeb, 0x82, 0xf9, 0x90, 0xca, 0xc9, 0xb5, 0xe7, 0xdc, 0x8e, 0xb7, 0xac, 0xee, 0xf7, 0xe0, 0xca,
+    0x8e, 0xea, 0xca, 0x80, 0xce, 0xc5, 0xad, 0xb7, 0xc4, 0xd0, 0x84, 0x93, 0xd5, 0xf0, 0xeb, 0xc8,
+    0xb4, 0x9d, 0xcc, 0xaf, 0xa5, 0x95, 0xba, 0x99, 0x87, 0xd2, 0x9d, 0xe3, 0x91, 0xba, 0x90, 0xca,
+];
+
+/// Decrypt a text resource if it carries the `0xFFFF` encryption marker;
+/// otherwise borrow it unchanged. The cipher is a repeating-key XOR.
+pub fn decrypt_text(bytes: &[u8]) -> Cow<'_, [u8]> {
+    match bytes {
+        [0xff, 0xff, body @ ..] => Cow::Owned(
+            body.iter()
+                .enumerate()
+                .map(|(i, b)| b ^ TEXT_XOR_KEY[i % TEXT_XOR_KEY.len()])
+                .collect(),
+        ),
+        _ => Cow::Borrowed(bytes),
+    }
+}
+
 /// Look up a single resource and print where it lives and how big it is.
 ///
 /// The query may include an extension (`ABCLASRQ.2da`) to pin the type, or omit
@@ -152,15 +176,11 @@ fn lookup_and_print(
         }
     };
 
-    let info = manager.info(stem, res_type)?;
-    println!("{}.{}", stem, type_extension(info.res_type));
-    println!(
-        "  type: 0x{:04x} ({})",
-        info.res_type,
-        type_extension(info.res_type)
-    );
-    println!("  size: {} bytes", info.size);
-    println!("  bif:  {}", info.bif);
+    // The manager dispatches on type and returns a self-rendering resource; we
+    // print an identity heading and its view.
+    let resource = manager.load(stem, res_type)?;
+    println!("{}.{}", stem, type_extension(res_type));
+    print!("{resource}");
 
     Ok(())
 }
