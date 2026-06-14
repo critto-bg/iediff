@@ -11,6 +11,10 @@ tested against a real BG2:EE install. See `README.md` for goals.
 
 - **Rust, standard library only.** No external crates — this is educational.
   Keep code simple, safe, and idiomatic.
+- **Robust error handling, no panics.** No `unwrap()`/`expect()`/`panic!`,
+  no indexing that can panic, no `unsafe`. Parsers take untrusted bytes:
+  return `Result` with a descriptive error type and bounds-check every read.
+  (`unwrap_or`/`unwrap_or_else`/`unwrap_or_default` are fine — they can't panic.)
 - **Incremental.** Add formats and features one at a time; don't scaffold ahead
   of need.
 - Brevity in docs and output.
