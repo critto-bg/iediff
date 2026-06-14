@@ -53,28 +53,6 @@ impl From<Truncated> for KeyError {
     }
 }
 
-/// One BIF archive listed in the KEY directory.
-pub struct BifEntry {
-    file_length: u32,
-    name: String,
-    /// Location flags: bit 0 = in `data`, bit 1 = in `cache`, bits 2-7 = CD index.
-    flags: u16,
-}
-
-impl BifEntry {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn file_length(&self) -> u32 {
-        self.file_length
-    }
-
-    pub fn flags(&self) -> u16 {
-        self.flags
-    }
-}
-
 /// One resource entry: a name + type pointing at a slot inside a BIF.
 pub struct ResourceEntry {
     name: String,
@@ -96,11 +74,6 @@ impl ResourceEntry {
         (self.locator >> 20) as usize
     }
 
-    /// Tileset index within the BIF (locator bits 19-14).
-    pub fn tileset_index(&self) -> u32 {
-        (self.locator >> 14) & 0x3f
-    }
-
     /// Non-tileset file index within the BIF (locator bits 13-0).
     pub fn file_index(&self) -> u32 {
         self.locator & 0x3fff
@@ -109,7 +82,8 @@ impl ResourceEntry {
 
 /// A fully parsed KEY file, with a lookup index for resolving resources by name.
 pub struct KeyFile {
-    bifs: Vec<BifEntry>,
+    /// BIF archive paths, relative to the game root, indexed by source index.
+    bifs: Vec<String>,
     resources: Vec<ResourceEntry>,
     /// (UPPERCASE name, type) -> index into `resources`. Resrefs are case-insensitive.
     index: HashMap<(String, u16), usize>,
@@ -149,21 +123,15 @@ impl KeyFile {
         })
     }
 
-    fn parse_bifs(reader: &Reader, count: usize, offset: usize) -> Result<Vec<BifEntry>, KeyError> {
+    fn parse_bifs(reader: &Reader, count: usize, offset: usize) -> Result<Vec<String>, KeyError> {
         let mut bifs = Vec::with_capacity(count);
         for i in 0..count {
             let base = offset + i * BIF_ENTRY_LEN;
-            let file_length = reader.u32_at(base, "bif entry length")?;
+            // Bytes 0-3 (file length) and 10-11 (location flags) are unused for now.
             let name_offset = reader.u32_at(base + 4, "bif name offset")? as usize;
             let name_length = reader.u16_at(base + 8, "bif name length")? as usize;
-            let flags = reader.u16_at(base + 10, "bif flags")?;
-
             let raw = reader.slice(name_offset, name_length, "bif name")?;
-            bifs.push(BifEntry {
-                file_length,
-                name: parse_asciiz(raw),
-                flags,
-            });
+            bifs.push(parse_asciiz(raw));
         }
 
         Ok(bifs)
@@ -190,22 +158,65 @@ impl KeyFile {
         Ok(resources)
     }
 
-    pub fn bifs(&self) -> &[BifEntry] {
-        &self.bifs
-    }
-
-    pub fn resources(&self) -> &[ResourceEntry] {
-        &self.resources
-    }
-
     /// Resolve a resource by name and type (case-insensitive name).
     pub fn lookup(&self, name: &str, res_type: u16) -> Option<&ResourceEntry> {
         let key = (name.to_ascii_uppercase(), res_type);
         self.index.get(&key).and_then(|&i| self.resources.get(i))
     }
 
+    /// All resources sharing a name, regardless of type. Used to disambiguate a
+    /// query given without an extension.
+    pub fn find_by_name(&self, name: &str) -> Vec<&ResourceEntry> {
+        self.resources
+            .iter()
+            .filter(|res| res.name.eq_ignore_ascii_case(name))
+            .collect()
+    }
+
     pub fn bif_name(&self, index: usize) -> Option<&str> {
-        self.bifs.get(index).map(|b| b.name.as_str())
+        self.bifs.get(index).map(String::as_str)
+    }
+
+    /// A high-level summary of the index: archive and resource counts, and a
+    /// per-type breakdown (most common first).
+    pub fn stats(&self) -> KeyStats {
+        let mut counts: HashMap<u16, usize> = HashMap::new();
+        for res in &self.resources {
+            *counts.entry(res.res_type).or_insert(0) += 1;
+        }
+        let mut by_type: Vec<(u16, usize)> = counts.into_iter().collect();
+        by_type.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        KeyStats {
+            bifs: self.bifs.len(),
+            resources: self.resources.len(),
+            by_type,
+        }
+    }
+}
+
+/// Summary statistics for a KEY index. See [`KeyFile::stats`].
+pub struct KeyStats {
+    pub bifs: usize,
+    pub resources: usize,
+    /// (resource type, count), most common first.
+    pub by_type: Vec<(u16, usize)>,
+}
+
+impl fmt::Display for KeyStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{} BIFs, {} resources", self.bifs, self.resources)?;
+        writeln!(f, "resources by type:")?;
+        for (res_type, count) in &self.by_type {
+            writeln!(
+                f,
+                "  {:<5} (0x{:04x})  {:>6}",
+                type_extension(*res_type),
+                res_type,
+                count
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -255,4 +266,54 @@ pub fn type_extension(res_type: u16) -> &'static str {
         0x0802 => "ini",
         _ => "???",
     }
+}
+
+/// Map a (lowercase) file extension to its resource type code. The inverse of
+/// [`type_extension`]; returns `None` for unknown extensions.
+pub fn extension_type(ext: &str) -> Option<u16> {
+    let res_type = match ext {
+        "bmp" => 0x0001,
+        "mve" => 0x0002,
+        "wav" => 0x0004,
+        "wfx" => 0x0005,
+        "plt" => 0x0006,
+        "bam" => 0x03e8,
+        "wed" => 0x03e9,
+        "chu" => 0x03ea,
+        "tis" => 0x03eb,
+        "mos" => 0x03ec,
+        "itm" => 0x03ed,
+        "spl" => 0x03ee,
+        "bcs" => 0x03ef,
+        "ids" => 0x03f0,
+        "cre" => 0x03f1,
+        "are" => 0x03f2,
+        "dlg" => 0x03f3,
+        "2da" => 0x03f4,
+        "gam" => 0x03f5,
+        "sto" => 0x03f6,
+        "wmp" => 0x03f7,
+        "eff" => 0x03f8,
+        "bs" => 0x03f9,
+        "chr" => 0x03fa,
+        "vvc" => 0x03fb,
+        "vef" => 0x03fc,
+        "pro" => 0x03fd,
+        "bio" => 0x03fe,
+        "wbm" => 0x03ff,
+        "fnt" => 0x0400,
+        "gui" => 0x0402,
+        "sql" => 0x0403,
+        "pvrz" => 0x0404,
+        "glsl" => 0x0405,
+        "tot" => 0x0406,
+        "toh" => 0x0407,
+        "menu" => 0x0408,
+        "lua" => 0x0409,
+        "ttf" => 0x040a,
+        "png" => 0x040b,
+        "ini" => 0x0802,
+        _ => return None,
+    };
+    Some(res_type)
 }

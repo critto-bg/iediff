@@ -185,14 +185,9 @@ impl BifArchive {
         Ok(entries)
     }
 
-    /// Extract a resource's raw bytes by its file index (locator bits 0-13).
-    /// `expected_type` is the resource type the KEY recorded; it's cross-checked
-    /// against the BIF's own type field.
-    pub fn read_resource(
-        &mut self,
-        file_index: u32,
-        expected_type: u16,
-    ) -> Result<Vec<u8>, BifError> {
+    /// Locate a file entry by index and cross-check its type against the type
+    /// the KEY recorded. Shared by the size and read paths.
+    fn entry_for(&self, file_index: u32, expected_type: u16) -> Result<FileEntry, BifError> {
         let entry = match self
             .index
             .get(&file_index)
@@ -209,6 +204,25 @@ impl BifArchive {
                 found: entry.res_type,
             });
         }
+
+        Ok(entry)
+    }
+
+    /// Size in bytes of a resource, read from the entry table without touching
+    /// the bulk data.
+    pub fn resource_size(&self, file_index: u32, expected_type: u16) -> Result<u32, BifError> {
+        Ok(self.entry_for(file_index, expected_type)?.size)
+    }
+
+    /// Extract a resource's raw bytes by its file index (locator bits 0-13).
+    /// `expected_type` is the resource type the KEY recorded; it's cross-checked
+    /// against the BIF's own type field.
+    pub fn read_resource(
+        &mut self,
+        file_index: u32,
+        expected_type: u16,
+    ) -> Result<Vec<u8>, BifError> {
+        let entry = self.entry_for(file_index, expected_type)?;
 
         self.file.seek(SeekFrom::Start(entry.offset as u64))?;
         let mut buf = vec![0u8; entry.size as usize];

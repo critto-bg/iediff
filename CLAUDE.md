@@ -21,7 +21,12 @@ tested against a real BG2:EE install. See `README.md` for goals.
 
 ## Layout
 
-- `src/` — the crate (currently just `main.rs`).
+- `src/main.rs` — crate root: shared, format-agnostic building blocks
+  (`Reader`, `Truncated`, `parse_asciiz`, `describe_tag`) plus the CLI driver.
+- `src/resource.rs` — `ResourceManager`: the coordinator that resolves a
+  resource through the KEY and serves its bytes from a lazily-opened, cached BIF.
+- `src/formats/` — one submodule per resource format (`key`, `bif`, …). Each
+  owns its own error type that wraps the shared `Truncated` via `From`.
 - `md/` — symlink: IESDP format docs. Authoritative reference for every format.
   Start at `md/file_formats/index.md`; conventions in
   `md/file_formats/general.md`.

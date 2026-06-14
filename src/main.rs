@@ -5,15 +5,15 @@
 //! error) plus the CLI driver.
 
 mod formats;
+mod resource;
 
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
 
-use formats::bif::BifArchive;
-use formats::key::{KeyFile, type_extension};
+use formats::key::{extension_type, type_extension};
+use resource::ResourceManager;
 
 const DEFAULT_KEY_PATH: &str = "game/chitin.key";
 
@@ -109,111 +109,68 @@ pub fn describe_tag(tag: &[u8; 4]) -> String {
     format!("\"{printable}\" ({})", hex.join(" "))
 }
 
-/// Print a summary of the parsed KEY, enough to verify the parser by eye.
-fn report(key: &KeyFile) {
-    println!(
-        "KEY V1 parsed: {} BIFs, {} resources",
-        key.bifs().len(),
-        key.resources().len()
-    );
+/// Look up a single resource and print where it lives and how big it is.
+///
+/// The query may include an extension (`ABCLASRQ.2da`) to pin the type, or omit
+/// it (`ABCLASRQ`). Without an extension, an unambiguous match is printed; an
+/// ambiguous one lists the variants so the caller can pick a type.
+fn lookup_and_print(
+    manager: &mut ResourceManager,
+    query: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (stem, ext) = match query.rsplit_once('.') {
+        Some((stem, ext)) => (stem, Some(ext)),
+        None => (query, None),
+    };
 
-    println!("\nFirst BIFs:");
-    for bif in key.bifs().iter().take(5) {
-        println!(
-            "  {:<28} {:>10} bytes  flags=0x{:04x}",
-            bif.name(),
-            bif.file_length(),
-            bif.flags()
-        );
-    }
-
-    // Resource counts per type — a good sanity check on the whole table.
-    let mut counts: HashMap<u16, usize> = HashMap::new();
-    for res in key.resources() {
-        *counts.entry(res.res_type()).or_insert(0) += 1;
-    }
-
-    let mut by_count: Vec<(u16, usize)> = counts.into_iter().collect();
-    by_count.sort_by(|a, b| b.1.cmp(&a.1));
-
-    println!("\nTop resource types:");
-    for (res_type, count) in by_count.iter().take(8) {
-        println!(
-            "  {:<5} (0x{:04x})  {:>6}",
-            type_extension(*res_type),
-            res_type,
-            count
-        );
-    }
-
-    // Demonstrate a round-trip lookup using the first resource entry.
-    if let Some(first) = key.resources().first() {
-        let ext = type_extension(first.res_type());
-        println!("\nExample lookup: {}.{}", first.name(), ext);
-        match key.lookup(first.name(), first.res_type()) {
-            Some(res) => {
-                let bif = key.bif_name(res.source_index()).unwrap_or("<out of range>");
-                println!(
-                    "  found in BIF #{} ({}), file index {}, tileset {}",
-                    res.source_index(),
-                    bif,
-                    res.file_index(),
-                    res.tileset_index()
-                );
+    let res_type = match ext {
+        Some(ext) => match extension_type(&ext.to_ascii_lowercase()) {
+            Some(res_type) => res_type,
+            None => return Err(format!("unknown resource extension: .{ext}").into()),
+        },
+        // No extension: resolve by name alone. The block ends the KEY borrow
+        // before we go on to read through the manager.
+        None => {
+            let matches = manager.key().find_by_name(stem);
+            match matches.as_slice() {
+                [] => return Err(format!("resource not found: {query}").into()),
+                [only] => only.res_type(),
+                many => {
+                    println!("'{stem}' is ambiguous; specify an extension:");
+                    let mut variants: Vec<String> = many
+                        .iter()
+                        .map(|res| format!("{}.{}", res.name(), type_extension(res.res_type())))
+                        .collect();
+                    variants.sort();
+                    variants.dedup();
+                    for variant in variants {
+                        println!("  {variant}");
+                    }
+                    return Ok(());
+                }
             }
-            None => println!("  not found (lookup index inconsistent)"),
         }
-    }
-}
-
-/// Extract the first resource end-to-end (KEY lookup → open BIF → read bytes)
-/// to verify the BIF parser. `game_dir` is the root the KEY's BIF paths are
-/// relative to.
-fn demo_extract(key: &KeyFile, game_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(res) = key.resources().first() else {
-        return Ok(());
     };
 
-    let Some(bif_name) = key.bif_name(res.source_index()) else {
-        return Ok(());
-    };
-
-    // KEY stores BIF paths relative to the game root, possibly with `\` separators.
-    let relative = bif_name.replace('\\', "/");
-    let bif_path = game_dir.join(relative);
-
-    let mut bif = BifArchive::open(&bif_path)?;
-    let bytes = bif.read_resource(res.file_index(), res.res_type())?;
-
+    let info = manager.info(stem, res_type)?;
+    println!("{}.{}", stem, type_extension(info.res_type));
     println!(
-        "\nExtracted {}.{} from {} — {} bytes",
-        res.name(),
-        type_extension(res.res_type()),
-        bif_name,
-        bytes.len()
+        "  type: 0x{:04x} ({})",
+        info.res_type,
+        type_extension(info.res_type)
     );
-    let preview: String = String::from_utf8_lossy(&bytes)
-        .lines()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(" / ");
-    println!("  first lines: {preview}");
+    println!("  size: {} bytes", info.size);
+    println!("  bif:  {}", info.bif);
 
     Ok(())
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_KEY_PATH.to_string());
-    let key_path = Path::new(&path);
-    let data = std::fs::read(key_path)?;
-    let key = KeyFile::parse(&data)?;
-    report(&key);
-
-    let game_dir = key_path.parent().unwrap_or_else(|| Path::new("."));
-    demo_extract(&key, game_dir)?;
-
+    let mut manager = ResourceManager::open(Path::new(DEFAULT_KEY_PATH))?;
+    match env::args().nth(1) {
+        Some(query) => lookup_and_print(&mut manager, &query)?,
+        None => print!("{}", manager.key().stats()),
+    }
     Ok(())
 }
 
