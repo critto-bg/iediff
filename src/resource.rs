@@ -13,6 +13,7 @@ use crate::formats::bif::{BifArchive, BifError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
 use crate::formats::key::{KeyError, KeyFile, type_extension};
 use crate::formats::tlk::{TlkError, TlkFile};
+use crate::formats::twoda::{TWODA_TYPE, TwoDA, TwoDAError};
 
 /// Locale whose `dialog.tlk` strings are resolved against. BG2:EE ships several
 /// under `lang/`; English is the default. (Selectable later.)
@@ -25,6 +26,7 @@ pub enum ResourceError {
     Key(KeyError),
     Bif(BifError),
     Tlk(TlkError),
+    TwoDA(TwoDAError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -41,6 +43,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Key(e) => write!(f, "{e}"),
             ResourceError::Bif(e) => write!(f, "{e}"),
             ResourceError::Tlk(e) => write!(f, "{e}"),
+            ResourceError::TwoDA(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -58,6 +61,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Key(e) => Some(e),
             ResourceError::Bif(e) => Some(e),
             ResourceError::Tlk(e) => Some(e),
+            ResourceError::TwoDA(e) => Some(e),
             _ => None,
         }
     }
@@ -87,6 +91,12 @@ impl From<TlkError> for ResourceError {
     }
 }
 
+impl From<TwoDAError> for ResourceError {
+    fn from(e: TwoDAError) -> Self {
+        ResourceError::TwoDA(e)
+    }
+}
+
 /// Where a resource lives and how big it is, without its data.
 pub struct ResourceInfo {
     pub res_type: u16,
@@ -113,6 +123,7 @@ impl fmt::Display for ResourceInfo {
 /// print it without knowing the concrete format.
 pub enum Resource {
     Ids(IdsFile),
+    TwoDA(TwoDA),
     Other(ResourceInfo),
 }
 
@@ -120,6 +131,7 @@ impl fmt::Display for Resource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Resource::Ids(ids) => write!(f, "{ids}"),
+            Resource::TwoDA(table) => write!(f, "{table}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -191,10 +203,10 @@ impl ResourceManager {
     /// Load a resource, parsing it when the format is supported and otherwise
     /// returning its metadata.
     pub fn load(&mut self, name: &str, res_type: u16) -> Result<Resource, ResourceError> {
-        if res_type == IDS_TYPE {
-            Ok(Resource::Ids(self.ids(name)?))
-        } else {
-            Ok(Resource::Other(self.info(name, res_type)?))
+        match res_type {
+            IDS_TYPE => Ok(Resource::Ids(self.ids(name)?)),
+            TWODA_TYPE => Ok(Resource::TwoDA(self.twoda(name)?)),
+            _ => Ok(Resource::Other(self.info(name, res_type)?)),
         }
     }
 
@@ -202,6 +214,12 @@ impl ResourceManager {
     pub fn ids(&mut self, name: &str) -> Result<IdsFile, ResourceError> {
         let bytes = self.read(name, IDS_TYPE)?;
         Ok(IdsFile::parse(&bytes))
+    }
+
+    /// Load and parse a 2DA table by name.
+    pub fn twoda(&mut self, name: &str) -> Result<TwoDA, ResourceError> {
+        let bytes = self.read(name, TWODA_TYPE)?;
+        Ok(TwoDA::parse(&bytes)?)
     }
 
     /// Resolve a resource by name and type and return its raw bytes. The core
