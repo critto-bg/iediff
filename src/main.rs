@@ -10,6 +10,7 @@ mod resource;
 use std::borrow::Cow;
 use std::env;
 use std::fmt;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -139,6 +140,7 @@ pub fn decrypt_text(bytes: &[u8]) -> Cow<'_, [u8]> {
 /// it (`ABCLASRQ`). Without an extension, an unambiguous match is printed; an
 /// ambiguous one lists the variants so the caller can pick a type.
 fn lookup_and_print(
+    out: &mut impl Write,
     manager: &mut ResourceManager,
     query: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -160,7 +162,7 @@ fn lookup_and_print(
                 [] => return Err(format!("resource not found: {query}").into()),
                 [only] => only.res_type(),
                 many => {
-                    println!("'{stem}' is ambiguous; specify an extension:");
+                    writeln!(out, "'{stem}' is ambiguous; specify an extension:")?;
                     let mut variants: Vec<String> = many
                         .iter()
                         .map(|res| format!("{}.{}", res.name(), type_extension(res.res_type())))
@@ -168,7 +170,7 @@ fn lookup_and_print(
                     variants.sort();
                     variants.dedup();
                     for variant in variants {
-                        println!("  {variant}");
+                        writeln!(out, "  {variant}")?;
                     }
                     return Ok(());
                 }
@@ -179,14 +181,15 @@ fn lookup_and_print(
     // The manager dispatches on type and returns a self-rendering resource; we
     // print an identity heading and its view.
     let resource = manager.load(stem, res_type)?;
-    println!("{}.{}", stem, type_extension(res_type));
-    print!("{resource}");
+    writeln!(out, "{}.{}", stem, type_extension(res_type))?;
+    write!(out, "{resource}")?;
 
     Ok(())
 }
 
 /// Resolve and print a single `dialog.tlk` string by its strref.
 fn print_string(
+    out: &mut impl Write,
     manager: &mut ResourceManager,
     number: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -194,30 +197,42 @@ fn print_string(
         .parse()
         .map_err(|_| format!("invalid strref: {number}"))?;
     let string = manager.string(strref)?;
-    println!("strref {strref}:");
-    println!("{string}");
+    writeln!(out, "strref {strref}:")?;
+    writeln!(out, "{string}")?;
     Ok(())
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut manager = ResourceManager::open(Path::new(DEFAULT_KEY_PATH))?;
     match env::args().nth(1) {
-        None => print!("{}", manager.key().stats()),
+        None => write!(out, "{}", manager.key().stats())?,
         // A `strref:N` query resolves a TLK string; anything else is a resource.
         Some(query) => match query.strip_prefix("strref:") {
-            Some(number) => print_string(&mut manager, number)?,
-            None => lookup_and_print(&mut manager, &query)?,
+            Some(number) => print_string(out, &mut manager, number)?,
+            None => lookup_and_print(out, &mut manager, &query)?,
         },
     }
     Ok(())
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let mut out = io::stdout().lock();
+    match run(&mut out) {
         Ok(()) => ExitCode::SUCCESS,
+        // A closed stdout — e.g. piping into `head` or quitting a pager — is the
+        // reader's choice, not an error. Exit quietly, as is conventional.
+        Err(e) if is_broken_pipe(e.as_ref()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Whether an error is (or wraps) a broken-pipe I/O error.
+fn is_broken_pipe(e: &(dyn std::error::Error + 'static)) -> bool {
+    match e.downcast_ref::<io::Error>() {
+        Some(io_err) => io_err.kind() == io::ErrorKind::BrokenPipe,
+        None => false,
     }
 }
