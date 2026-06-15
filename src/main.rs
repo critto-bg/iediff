@@ -185,11 +185,29 @@ fn lookup_and_print(
     Ok(())
 }
 
+/// Resolve and print a single `dialog.tlk` string by its strref.
+fn print_string(
+    manager: &mut ResourceManager,
+    number: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let strref: u32 = number
+        .parse()
+        .map_err(|_| format!("invalid strref: {number}"))?;
+    let string = manager.string(strref)?;
+    println!("strref {strref}:");
+    println!("{string}");
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut manager = ResourceManager::open(Path::new(DEFAULT_KEY_PATH))?;
     match env::args().nth(1) {
-        Some(query) => lookup_and_print(&mut manager, &query)?,
         None => print!("{}", manager.key().stats()),
+        // A `strref:N` query resolves a TLK string; anything else is a resource.
+        Some(query) => match query.strip_prefix("strref:") {
+            Some(number) => print_string(&mut manager, number)?,
+            None => lookup_and_print(&mut manager, &query)?,
+        },
     }
     Ok(())
 }

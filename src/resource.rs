@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use crate::formats::bif::{BifArchive, BifError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
 use crate::formats::key::{KeyError, KeyFile, type_extension};
+use crate::formats::tlk::{TlkError, TlkFile};
+
+/// Locale whose `dialog.tlk` strings are resolved against. BG2:EE ships several
+/// under `lang/`; English is the default. (Selectable later.)
+const DEFAULT_LOCALE: &str = "en_US";
 
 /// Anything that can go wrong while resolving or reading a resource.
 #[derive(Debug)]
@@ -19,6 +24,7 @@ pub enum ResourceError {
     Io(std::io::Error),
     Key(KeyError),
     Bif(BifError),
+    Tlk(TlkError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -34,6 +40,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Io(e) => write!(f, "i/o error: {e}"),
             ResourceError::Key(e) => write!(f, "{e}"),
             ResourceError::Bif(e) => write!(f, "{e}"),
+            ResourceError::Tlk(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -50,6 +57,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Io(e) => Some(e),
             ResourceError::Key(e) => Some(e),
             ResourceError::Bif(e) => Some(e),
+            ResourceError::Tlk(e) => Some(e),
             _ => None,
         }
     }
@@ -70,6 +78,12 @@ impl From<KeyError> for ResourceError {
 impl From<BifError> for ResourceError {
     fn from(e: BifError) -> Self {
         ResourceError::Bif(e)
+    }
+}
+
+impl From<TlkError> for ResourceError {
+    fn from(e: TlkError) -> Self {
+        ResourceError::Tlk(e)
     }
 }
 
@@ -118,6 +132,8 @@ pub struct ResourceManager {
     game_dir: PathBuf,
     /// BIF source index -> open archive. Populated lazily on first access.
     open_bifs: HashMap<usize, BifArchive>,
+    /// The `dialog.tlk` string table, opened lazily on first string lookup.
+    dialog: Option<TlkFile>,
 }
 
 impl ResourceManager {
@@ -135,6 +151,7 @@ impl ResourceManager {
             key,
             game_dir,
             open_bifs: HashMap::new(),
+            dialog: None,
         })
     }
 
@@ -202,6 +219,28 @@ impl ResourceManager {
 
         let archive = self.archive_for(source)?;
         Ok(archive.read_resource(file_index, expected_type)?)
+    }
+
+    /// Resolve a strref to its display string from `dialog.tlk`. The TLK is
+    /// opened lazily and kept open for subsequent lookups.
+    pub fn string(&mut self, strref: u32) -> Result<String, ResourceError> {
+        Ok(self.dialog()?.string(strref)?)
+    }
+
+    /// Borrow the dialog TLK, opening it on first use from the locale's
+    /// `lang/<locale>/dialog.tlk`.
+    fn dialog(&mut self) -> Result<&mut TlkFile, ResourceError> {
+        match self.dialog {
+            Some(ref mut tlk) => Ok(tlk),
+            None => {
+                let path = self
+                    .game_dir
+                    .join("lang")
+                    .join(DEFAULT_LOCALE)
+                    .join("dialog.tlk");
+                Ok(self.dialog.insert(TlkFile::open(&path)?))
+            }
+        }
     }
 
     /// Borrow the archive for a BIF source index, opening and caching it on
