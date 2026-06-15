@@ -52,6 +52,14 @@ Resource lookup is a two-level index:
 3. **TLK** (`game/lang/<locale>/dialog.tlk`, format `tlk_v1.md`) — resolves a
    `strref` to its display string.
 
+The **override** directory (`game/override/`) sits in front of this index. It
+holds loose files named `<resref>.<ext>`; any resource present there shadows the
+archived copy, so resolution checks override first, then falls back to KEY→BIF.
+This is how mods edit resources (the updated file is dropped into override) and
+how they add wholly new ones (which exist only in override, with no KEY entry).
+`ResourceManager` honours this priority by default; `--biff` skips override to
+reach the untouched original.
+
 Each resource type then has its own format under `md/file_formats/ie_formats/`
 (e.g. `cre_v1.md`, `itm_v1.md`, `2da.md`). Many formats are versioned; read the
 4-byte signature + version from the header before parsing. Some text formats

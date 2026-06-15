@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use formats::key::{extension_type, type_extension};
-use resource::ResourceManager;
+use resource::{ResourceManager, Source};
 
 const DEFAULT_KEY_PATH: &str = "game/chitin.key";
 
@@ -134,15 +134,17 @@ pub fn decrypt_text(bytes: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-/// Look up a single resource and print where it lives and how big it is.
+/// Look up a single resource and print it, noting where it was resolved from.
 ///
 /// The query may include an extension (`ABCLASRQ.2da`) to pin the type, or omit
-/// it (`ABCLASRQ`). Without an extension, an unambiguous match is printed; an
-/// ambiguous one lists the variants so the caller can pick a type.
+/// it (`ABCLASRQ`). Without an extension, an unambiguous match is loaded; an
+/// ambiguous one lists the override and archive variants so the caller can pick
+/// a type. `source` carries the `--biff` choice (skip the override layer).
 fn lookup_and_print(
     out: &mut impl Write,
     manager: &mut ResourceManager,
     query: &str,
+    source: Source,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (stem, ext) = match query.rsplit_once('.') {
         Some((stem, ext)) => (stem, Some(ext)),
@@ -154,23 +156,37 @@ fn lookup_and_print(
             Some(res_type) => res_type,
             None => return Err(format!("unknown resource extension: .{ext}").into()),
         },
-        // No extension: resolve by name alone. The block ends the KEY borrow
-        // before we go on to read through the manager.
+        // No extension: resolve the type by name. `--biff` hides the override
+        // layer; otherwise the two layers are listed separately when ambiguous.
         None => {
-            let matches = manager.key().find_by_name(stem);
-            match matches.as_slice() {
+            let matches = manager.matches(stem);
+            let over: &[u16] = if source == Source::Biff {
+                &[]
+            } else {
+                &matches.over
+            };
+            let biff = &matches.biff;
+
+            let mut types: Vec<u16> = over.iter().chain(biff.iter()).copied().collect();
+            types.sort_unstable();
+            types.dedup();
+
+            match types.as_slice() {
                 [] => return Err(format!("resource not found: {query}").into()),
-                [only] => only.res_type(),
-                many => {
+                [only] => *only,
+                _ => {
                     writeln!(out, "'{stem}' is ambiguous; specify an extension:")?;
-                    let mut variants: Vec<String> = many
-                        .iter()
-                        .map(|res| format!("{}.{}", res.name(), type_extension(res.res_type())))
-                        .collect();
-                    variants.sort();
-                    variants.dedup();
-                    for variant in variants {
-                        writeln!(out, "  {variant}")?;
+                    if !over.is_empty() {
+                        writeln!(out, "  override:")?;
+                        for res_type in over {
+                            writeln!(out, "    {stem}.{}", type_extension(*res_type))?;
+                        }
+                    }
+                    if !biff.is_empty() {
+                        writeln!(out, "  biff:")?;
+                        for res_type in biff {
+                            writeln!(out, "    {stem}.{}", type_extension(*res_type))?;
+                        }
                     }
                     return Ok(());
                 }
@@ -178,11 +194,17 @@ fn lookup_and_print(
         }
     };
 
-    // The manager dispatches on type and returns a self-rendering resource; we
-    // print an identity heading and its view.
-    let resource = manager.load(stem, res_type)?;
-    writeln!(out, "{}.{}", stem, type_extension(res_type))?;
-    write!(out, "{resource}")?;
+    // The manager dispatches on type and reports where it resolved from; we
+    // print an identity heading with that origin, then the resource's view.
+    let loaded = manager.load(stem, res_type, source)?;
+    writeln!(
+        out,
+        "{}.{}  ({})",
+        stem,
+        type_extension(res_type),
+        loaded.origin
+    )?;
+    write!(out, "{}", loaded.resource)?;
 
     Ok(())
 }
@@ -203,15 +225,28 @@ fn print_string(
 }
 
 fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
+    let mut query: Option<String> = None;
+    let mut source = Source::Auto;
+
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            // Skip the override layer and read straight from the archives.
+            "--biff" => source = Source::Biff,
+            _ if query.is_none() => query = Some(arg),
+            _ => return Err(format!("unexpected argument: {arg}").into()),
+        }
+    }
+
     let mut manager = ResourceManager::open(Path::new(DEFAULT_KEY_PATH))?;
-    match env::args().nth(1) {
+    match query {
         None => write!(out, "{}", manager.key().stats())?,
         // A `strref:N` query resolves a TLK string; anything else is a resource.
         Some(query) => match query.strip_prefix("strref:") {
             Some(number) => print_string(out, &mut manager, number)?,
-            None => lookup_and_print(out, &mut manager, &query)?,
+            None => lookup_and_print(out, &mut manager, &query, source)?,
         },
     }
+
     Ok(())
 }
 

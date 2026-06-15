@@ -61,10 +61,6 @@ pub struct ResourceEntry {
 }
 
 impl ResourceEntry {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     pub fn res_type(&self) -> u16 {
         self.res_type
     }
