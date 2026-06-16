@@ -160,10 +160,41 @@ impl fmt::Display for Resource {
     }
 }
 
+/// A resource resolved to a concrete place, ready to read.
+enum Located {
+    Override {
+        path: PathBuf,
+        res_type: u16,
+    },
+    Bif {
+        source: usize,
+        file_index: u32,
+        res_type: u16,
+        bif: String,
+    },
+}
+
+impl Located {
+    fn origin(&self) -> Origin {
+        match self {
+            Located::Override { path, .. } => Origin::Override(path.clone()),
+            Located::Bif { bif, .. } => Origin::Bif(bif.clone()),
+        }
+    }
+}
+
 /// A loaded resource together with where it was resolved from.
 pub struct Loaded {
     pub origin: Origin,
     pub resource: Resource,
+}
+
+/// Resource types found for a name, grouped by where they live.
+pub struct NameMatches {
+    /// Types present in the override directory.
+    pub over: Vec<u16>,
+    /// Types present in the BIF archives (via the KEY).
+    pub biff: Vec<u16>,
 }
 
 /// Loads a KEY and serves resource bytes out of the BIFs it indexes.
@@ -361,37 +392,6 @@ impl ResourceManager {
             .get_mut(&source)
             .ok_or(ResourceError::BifIndexOutOfRange(source))
     }
-}
-
-/// A resource resolved to a concrete place, ready to read.
-enum Located {
-    Override {
-        path: PathBuf,
-        res_type: u16,
-    },
-    Bif {
-        source: usize,
-        file_index: u32,
-        res_type: u16,
-        bif: String,
-    },
-}
-
-impl Located {
-    fn origin(&self) -> Origin {
-        match self {
-            Located::Override { path, .. } => Origin::Override(path.clone()),
-            Located::Bif { bif, .. } => Origin::Bif(bif.clone()),
-        }
-    }
-}
-
-/// Resource types found for a name, grouped by where they live.
-pub struct NameMatches {
-    /// Types present in the override directory.
-    pub over: Vec<u16>,
-    /// Types present in the BIF archives (via the KEY).
-    pub biff: Vec<u16>,
 }
 
 /// One resource sitting in the override directory.
