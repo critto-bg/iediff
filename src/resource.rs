@@ -11,6 +11,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::formats::bif::{BifArchive, BifError};
+use crate::formats::eff::{EFF_TYPE, Eff, EffError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
 use crate::formats::key::{KeyError, KeyFile, extension_type, type_extension};
 use crate::formats::tlk::{TlkError, TlkFile};
@@ -28,6 +29,7 @@ pub enum ResourceError {
     Bif(BifError),
     Tlk(TlkError),
     TwoDA(TwoDAError),
+    Eff(EffError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -45,6 +47,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Bif(e) => write!(f, "{e}"),
             ResourceError::Tlk(e) => write!(f, "{e}"),
             ResourceError::TwoDA(e) => write!(f, "{e}"),
+            ResourceError::Eff(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -63,6 +66,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Bif(e) => Some(e),
             ResourceError::Tlk(e) => Some(e),
             ResourceError::TwoDA(e) => Some(e),
+            ResourceError::Eff(e) => Some(e),
             _ => None,
         }
     }
@@ -95,6 +99,12 @@ impl From<TlkError> for ResourceError {
 impl From<TwoDAError> for ResourceError {
     fn from(e: TwoDAError) -> Self {
         ResourceError::TwoDA(e)
+    }
+}
+
+impl From<EffError> for ResourceError {
+    fn from(e: EffError) -> Self {
+        ResourceError::Eff(e)
     }
 }
 
@@ -147,6 +157,7 @@ impl fmt::Display for ResourceInfo {
 pub enum Resource {
     Ids(IdsFile),
     TwoDA(TwoDA),
+    Eff(Eff),
     Other(ResourceInfo),
 }
 
@@ -155,6 +166,7 @@ impl fmt::Display for Resource {
         match self {
             Resource::Ids(ids) => write!(f, "{ids}"),
             Resource::TwoDA(table) => write!(f, "{table}"),
+            Resource::Eff(eff) => write!(f, "{eff}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -279,6 +291,15 @@ impl ResourceManager {
         let resource = match res_type {
             IDS_TYPE => Resource::Ids(IdsFile::parse(&self.read_located(&located)?)),
             TWODA_TYPE => Resource::TwoDA(TwoDA::parse(&self.read_located(&located)?)?),
+            EFF_TYPE => {
+                let mut eff = Eff::parse(&self.read_located(&located)?)?;
+                // The primary/secondary types index dictionary tables; resolve
+                // them to symbolic names for the human-readable view.
+                let primary = self.dictionary_label("MSCHOOL", eff.primary_type());
+                let secondary = self.dictionary_label("MSECTYPE", eff.secondary_type());
+                eff.set_type_names(primary, secondary);
+                Resource::Eff(eff)
+            }
             _ => Resource::Other(self.info_located(&located)?),
         };
 
@@ -349,6 +370,21 @@ impl ResourceManager {
         biff.dedup();
 
         NameMatches { over, biff }
+    }
+
+    /// Resolve a numeric value to its row label in a dictionary 2DA (e.g.
+    /// MSCHOOL, MSECTYPE), where the value is the 0-based row index.
+    fn dictionary_label(&mut self, table: &str, value: u32) -> Option<String> {
+        let twoda = self.load_2da(table)?;
+        twoda.row_label(value as usize).map(str::to_string)
+    }
+
+    /// Load and parse a 2DA by name, honouring the override layer. `None` on any
+    /// failure — suited to the best-effort dictionary lookups above.
+    fn load_2da(&mut self, name: &str) -> Option<TwoDA> {
+        let located = self.locate(name, TWODA_TYPE, Source::Auto)?;
+        let bytes = self.read_located(&located).ok()?;
+        TwoDA::parse(&bytes).ok()
     }
 
     /// Resolve a strref to its display string from `dialog.tlk`. The TLK is

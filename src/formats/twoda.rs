@@ -131,6 +131,13 @@ impl TwoDA {
         })
     }
 
+    /// Label of the row at a positional index — the value→name direction used
+    /// when another resource indexes this table as a dictionary (e.g. an EFF's
+    /// primary type into MSCHOOL.2DA). `None` if the index is out of range.
+    pub fn row_label(&self, index: usize) -> Option<&str> {
+        self.rows.get(index).map(|row| row.label.as_str())
+    }
+
     /// Cell value at a row/column index. `None` if either index is out of range;
     /// an absent cell within range yields the table default.
     #[allow(dead_code)] // consumed by resource-field resolution (later milestone)

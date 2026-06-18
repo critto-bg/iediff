@@ -83,6 +83,12 @@ impl<'a> Reader<'a> {
         let b = self.slice(offset, 4, context)?;
         Ok([b[0], b[1], b[2], b[3]])
     }
+
+    /// Read an 8-byte resref field (a NUL-padded resource name), trimming its
+    /// padding.
+    pub fn resref_at(&self, offset: usize, context: &'static str) -> Result<String, Truncated> {
+        Ok(parse_asciiz(self.slice(offset, 8, context)?))
+    }
 }
 
 /// Decode a NUL-terminated (and possibly NUL-padded) ASCII field. Trailing
