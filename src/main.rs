@@ -151,6 +151,7 @@ fn lookup_and_print(
     manager: &mut ResourceManager,
     query: &str,
     source: Source,
+    raw: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (stem, ext) = match query.rsplit_once('.') {
         Some((stem, ext)) => (stem, Some(ext)),
@@ -200,17 +201,19 @@ fn lookup_and_print(
         }
     };
 
-    // The manager dispatches on type and reports where it resolved from; we
-    // print an identity heading with that origin, then the resource's view.
     let loaded = manager.load(stem, res_type, source)?;
-    writeln!(
-        out,
-        "{}.{}  ({})",
-        stem,
-        type_extension(res_type),
-        loaded.origin
-    )?;
-    write!(out, "{}", loaded.resource)?;
+    if raw {
+        loaded.resource.write_raw(out)?;
+    } else {
+        writeln!(
+            out,
+            "{}.{}  ({})",
+            stem,
+            type_extension(res_type),
+            loaded.origin
+        )?;
+        write!(out, "{}", loaded.resource)?;
+    }
 
     Ok(())
 }
@@ -233,11 +236,14 @@ fn print_string(
 fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut query: Option<String> = None;
     let mut source = Source::Auto;
+    let mut raw = false;
 
     for arg in env::args().skip(1) {
         match arg.as_str() {
             // Skip the override layer and read straight from the archives.
             "--biff" => source = Source::Biff,
+            // Emit the machine-readable `key=value` view instead of the human one.
+            "--raw" => raw = true,
             _ if query.is_none() => query = Some(arg),
             _ => return Err(format!("unexpected argument: {arg}").into()),
         }
@@ -249,7 +255,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
         // A `strref:N` query resolves a TLK string; anything else is a resource.
         Some(query) => match query.strip_prefix("strref:") {
             Some(number) => print_string(out, &mut manager, number)?,
-            None => lookup_and_print(out, &mut manager, &query, source)?,
+            None => lookup_and_print(out, &mut manager, &query, source, raw)?,
         },
     }
 

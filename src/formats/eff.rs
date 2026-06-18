@@ -11,6 +11,7 @@
 //! Spec: `md/file_formats/ie_formats/eff_v2.md`.
 
 use std::fmt;
+use std::io::{self, Write};
 
 use crate::{Reader, Truncated, describe_tag, parse_asciiz};
 
@@ -206,6 +207,52 @@ impl Eff {
     pub fn set_type_names(&mut self, primary: Option<String>, secondary: Option<String>) {
         self.primary_name = primary;
         self.secondary_name = secondary;
+    }
+
+    /// Write the effect's fields as `key=value` lines, in disk order, exactly as
+    /// stored (unsigned, undecoded). The machine-readable counterpart to
+    /// [`Display`](fmt::Display); the format's unknown/structural words and the
+    /// resolved dictionary names are intentionally omitted.
+    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
+        writeln!(out, "opcode={}", self.opcode)?;
+        writeln!(out, "target={}", self.target)?;
+        writeln!(out, "power={}", self.power)?;
+        writeln!(out, "param1={}", self.param1)?;
+        writeln!(out, "param2={}", self.param2)?;
+        writeln!(out, "timing_mode={}", self.timing_mode)?;
+        writeln!(out, "duration={}", self.duration)?;
+        writeln!(out, "probability1={}", self.probability1)?;
+        writeln!(out, "probability2={}", self.probability2)?;
+        writeln!(out, "resource={}", self.resource)?;
+        writeln!(out, "dice_thrown={}", self.dice_thrown)?;
+        writeln!(out, "dice_sides={}", self.dice_sides)?;
+        writeln!(out, "save_type={}", self.save_type)?;
+        writeln!(out, "save_bonus={}", self.save_bonus)?;
+        writeln!(out, "special={}", self.special)?;
+        writeln!(out, "primary_type={}", self.primary_type)?;
+        writeln!(out, "affected_level_low={}", self.affected_level_low)?;
+        writeln!(out, "affected_level_high={}", self.affected_level_high)?;
+        writeln!(out, "dispel={}", self.dispel)?;
+        writeln!(out, "param3={}", self.param3)?;
+        writeln!(out, "param4={}", self.param4)?;
+        writeln!(out, "param5={}", self.param5)?;
+        writeln!(out, "time_applied={}", self.time_applied)?;
+        writeln!(out, "resource2={}", self.resource2)?;
+        writeln!(out, "resource3={}", self.resource3)?;
+        writeln!(out, "caster_x={}", self.caster_x)?;
+        writeln!(out, "caster_y={}", self.caster_y)?;
+        writeln!(out, "target_x={}", self.target_x)?;
+        writeln!(out, "target_y={}", self.target_y)?;
+        writeln!(out, "parent_resource_type={}", self.parent_resource_type)?;
+        writeln!(out, "parent_resource={}", self.parent_resource)?;
+        writeln!(out, "parent_resource_flags={}", self.parent_resource_flags)?;
+        writeln!(out, "projectile={}", self.projectile)?;
+        writeln!(out, "parent_resource_slot={}", self.parent_resource_slot)?;
+        writeln!(out, "variable={}", self.variable)?;
+        writeln!(out, "caster_level={}", self.caster_level)?;
+        writeln!(out, "first_apply={}", self.first_apply)?;
+        writeln!(out, "secondary_type={}", self.secondary_type)?;
+        Ok(())
     }
 }
 

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::formats::bif::{BifArchive, BifError};
@@ -168,6 +169,20 @@ impl fmt::Display for Resource {
             Resource::TwoDA(table) => write!(f, "{table}"),
             Resource::Eff(eff) => write!(f, "{eff}"),
             Resource::Other(info) => write!(f, "{info}"),
+        }
+    }
+}
+
+impl Resource {
+    /// Write the machine-readable view: flat `key=value` lines for the binary
+    /// formats. The text formats (IDS, 2DA) are already field-oriented, so they
+    /// reuse their normal rendering.
+    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
+        match self {
+            Resource::Eff(eff) => eff.write_raw(out),
+            Resource::Ids(ids) => write!(out, "{ids}"),
+            Resource::TwoDA(table) => write!(out, "{table}"),
+            Resource::Other(info) => write!(out, "{info}"),
         }
     }
 }
