@@ -13,6 +13,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::formats::opcode::opcode_name;
 use crate::{Reader, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for EFF files.
@@ -261,7 +262,10 @@ impl fmt::Display for Eff {
     /// resrefs, dice, and extra parameters shown only when they carry a value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "EFF V2.0")?;
-        writeln!(f, "  opcode:      {}", self.opcode)?;
+        match opcode_name(self.opcode) {
+            Some(name) => writeln!(f, "  opcode:      {} ({name})", self.opcode)?,
+            None => writeln!(f, "  opcode:      {}", self.opcode)?,
+        }
         // Many authored effects store -1 in target/parameter fields as a "none"
         // sentinel, so these read as signed; annotate the target only when it
         // names a known type.

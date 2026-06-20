@@ -8,5 +8,6 @@ pub mod bif;
 pub mod eff;
 pub mod ids;
 pub mod key;
+pub mod opcode;
 pub mod tlk;
 pub mod twoda;
