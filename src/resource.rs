@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::formats::bif::{BifArchive, BifError};
 use crate::formats::eff::{EFF_TYPE, Eff, EffError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
+use crate::formats::itm::{ITM_TYPE, Itm, ItmError};
 use crate::formats::key::{KeyError, KeyFile, extension_type, type_extension};
 use crate::formats::tlk::{TlkError, TlkFile};
 use crate::formats::twoda::{TWODA_TYPE, TwoDA, TwoDAError};
@@ -31,6 +32,7 @@ pub enum ResourceError {
     Tlk(TlkError),
     TwoDA(TwoDAError),
     Eff(EffError),
+    Itm(ItmError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -49,6 +51,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Tlk(e) => write!(f, "{e}"),
             ResourceError::TwoDA(e) => write!(f, "{e}"),
             ResourceError::Eff(e) => write!(f, "{e}"),
+            ResourceError::Itm(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -68,6 +71,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Tlk(e) => Some(e),
             ResourceError::TwoDA(e) => Some(e),
             ResourceError::Eff(e) => Some(e),
+            ResourceError::Itm(e) => Some(e),
             _ => None,
         }
     }
@@ -106,6 +110,12 @@ impl From<TwoDAError> for ResourceError {
 impl From<EffError> for ResourceError {
     fn from(e: EffError) -> Self {
         ResourceError::Eff(e)
+    }
+}
+
+impl From<ItmError> for ResourceError {
+    fn from(e: ItmError) -> Self {
+        ResourceError::Itm(e)
     }
 }
 
@@ -159,6 +169,7 @@ pub enum Resource {
     Ids(IdsFile),
     TwoDA(TwoDA),
     Eff(Eff),
+    Itm(Itm),
     Other(ResourceInfo),
 }
 
@@ -168,6 +179,7 @@ impl fmt::Display for Resource {
             Resource::Ids(ids) => write!(f, "{ids}"),
             Resource::TwoDA(table) => write!(f, "{table}"),
             Resource::Eff(eff) => write!(f, "{eff}"),
+            Resource::Itm(itm) => write!(f, "{itm}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -180,6 +192,7 @@ impl Resource {
     pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
         match self {
             Resource::Eff(eff) => eff.write_raw(out),
+            Resource::Itm(itm) => itm.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => write!(out, "{table}"),
             Resource::Other(info) => write!(out, "{info}"),
@@ -315,6 +328,36 @@ impl ResourceManager {
                 eff.set_type_names(primary, secondary);
                 Resource::Eff(eff)
             }
+            ITM_TYPE => {
+                let mut itm = Itm::parse(&self.read_located(&located)?)?;
+                // Each ability's primary/secondary type indexes the same
+                // dictionary tables as an EFF; resolve them per ability.
+                let codes: Vec<(u32, u32)> = itm
+                    .ext_headers()
+                    .iter()
+                    .map(|ext| (ext.primary_type(), ext.secondary_type()))
+                    .collect();
+                let names: Vec<(Option<String>, Option<String>)> = codes
+                    .into_iter()
+                    .map(|(primary, secondary)| {
+                        (
+                            self.dictionary_label("MSCHOOL", primary),
+                            self.dictionary_label("MSECTYPE", secondary),
+                        )
+                    })
+                    .collect();
+                for (ext, (primary, secondary)) in itm.ext_headers_mut().iter_mut().zip(names) {
+                    ext.set_type_names(primary, secondary);
+                }
+
+                // Resolve the item's display names from the TLK.
+                let (unid, id) = itm.name_strrefs();
+                let unid = self.string_label(unid);
+                let id = self.string_label(id);
+                itm.set_names(unid, id);
+
+                Resource::Itm(itm)
+            }
             _ => Resource::Other(self.info_located(&located)?),
         };
 
@@ -385,6 +428,22 @@ impl ResourceManager {
         biff.dedup();
 
         NameMatches { over, biff }
+    }
+
+    /// Best-effort resolve a strref to its TLK string for display. `None` for
+    /// the -1 "no string" sentinel, on any lookup error, or when the string is
+    /// empty.
+    fn string_label(&mut self, strref: u32) -> Option<String> {
+        if strref == u32::MAX {
+            return None;
+        }
+        let string = self.string(strref).ok()?;
+        let trimmed = string.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     /// Resolve a numeric value to its row label in a dictionary 2DA (e.g.

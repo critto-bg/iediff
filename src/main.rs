@@ -69,6 +69,11 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn u8_at(&self, offset: usize, context: &'static str) -> Result<u8, Truncated> {
+        let b = self.slice(offset, 1, context)?;
+        Ok(b[0])
+    }
+
     pub fn u16_at(&self, offset: usize, context: &'static str) -> Result<u16, Truncated> {
         let b = self.slice(offset, 2, context)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))

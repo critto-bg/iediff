@@ -306,8 +306,14 @@ impl fmt::Display for Eff {
         write_type(f, "primary", self.primary_type, &self.primary_name)?;
         write_type(f, "secondary", self.secondary_type, &self.secondary_name)?;
 
+        // Dual-purpose with max/min level for non-damage opcodes, which store
+        // the -1 "no limit" sentinel here; render signed so it reads as `-1`.
         if self.dice_thrown != 0 || self.dice_sides != 0 {
-            writeln!(f, "  dice:        {}d{}", self.dice_thrown, self.dice_sides)?;
+            writeln!(
+                f,
+                "  dice:        {}d{}",
+                self.dice_thrown as i32, self.dice_sides as i32
+            )?;
         }
         if self.param3 != 0 || self.param4 != 0 || self.param5 != 0 {
             writeln!(
@@ -345,6 +351,151 @@ impl fmt::Display for Eff {
             writeln!(f, "  variable:    {:?}", self.variable)?;
         }
 
+        Ok(())
+    }
+}
+
+/// Size of one EFF V1 feature block on disk.
+pub const FEATURE_SIZE: usize = 48;
+
+/// A parsed EFF V1 "feature block": the 48-byte embedded effect carried by ITM
+/// and SPL files (as equipping/casting effects and per-ability effects). It is
+/// the same effect the standalone V2.0 [`Eff`] describes, in a tighter layout:
+/// every field is byte-sized where V2 widened it to a dword, and the V2-only
+/// runtime/coordinate fields are absent. The interpretation helpers
+/// ([`target_type`], [`timing_mode`], …) are shared with [`Eff`].
+///
+/// Unlike [`Eff`], this is never a standalone resource, so it has no `Display`
+/// of its own: the embedding format (ITM) drives layout and passes the
+/// indent/prefix.
+pub struct Feature {
+    opcode: u16,
+    target: u8,
+    power: u8,
+    param1: u32,
+    param2: u32,
+    timing_mode: u8,
+    dispel: u8,
+    duration: u32,
+    probability1: u8,
+    probability2: u8,
+    resource: String,
+    dice_thrown: u32,
+    dice_sides: u32,
+    save_type: u32,
+    save_bonus: u32,
+    /// 0x2c — "Unknown" in eff_v1, repurposed as a TobEx stacking ID in ITM.
+    special: u32,
+}
+
+impl Feature {
+    /// Parse one feature block at `base` (an absolute offset into the embedding
+    /// file). Bounds-checked through `reader`.
+    pub fn parse_at(reader: &Reader, base: usize) -> Result<Feature, Truncated> {
+        Ok(Feature {
+            opcode: reader.u16_at(base, "opcode")?,
+            target: reader.u8_at(base + 0x02, "target type")?,
+            power: reader.u8_at(base + 0x03, "power")?,
+            param1: reader.u32_at(base + 0x04, "parameter 1")?,
+            param2: reader.u32_at(base + 0x08, "parameter 2")?,
+            timing_mode: reader.u8_at(base + 0x0c, "timing mode")?,
+            dispel: reader.u8_at(base + 0x0d, "dispel/resistance")?,
+            duration: reader.u32_at(base + 0x0e, "duration")?,
+            probability1: reader.u8_at(base + 0x12, "probability 1")?,
+            probability2: reader.u8_at(base + 0x13, "probability 2")?,
+            resource: reader.resref_at(base + 0x14, "resource")?,
+            dice_thrown: reader.u32_at(base + 0x1c, "dice thrown")?,
+            dice_sides: reader.u32_at(base + 0x20, "dice sides")?,
+            save_type: reader.u32_at(base + 0x24, "saving throw type")?,
+            save_bonus: reader.u32_at(base + 0x28, "save bonus")?,
+            special: reader.u32_at(base + 0x2c, "special")?,
+        })
+    }
+
+    /// Render the feature in the human-readable view, each line prefixed with
+    /// `indent`. The optional resrefs, dice, and special word print only when
+    /// they carry a value — matching [`Eff`]'s `Display`.
+    pub fn write_human(&self, f: &mut dyn fmt::Write, indent: &str) -> fmt::Result {
+        match opcode_name(self.opcode as u32) {
+            Some(name) => writeln!(f, "{indent}opcode {} ({name})", self.opcode)?,
+            None => writeln!(f, "{indent}opcode {}", self.opcode)?,
+        }
+        let d = format!("{indent}  ");
+        match target_type(self.target as u32) {
+            Some(name) => writeln!(f, "{d}{:<9} {} ({name})", "target:", self.target)?,
+            None => writeln!(f, "{d}{:<9} {}", "target:", self.target)?,
+        }
+        writeln!(f, "{d}{:<9} {}", "power:", self.power)?;
+        writeln!(
+            f,
+            "{d}{:<9} p1={} p2={}",
+            "params:", self.param1 as i32, self.param2 as i32
+        )?;
+        writeln!(
+            f,
+            "{d}{:<9} {} ({}), duration {}",
+            "timing:",
+            self.timing_mode,
+            timing_mode(self.timing_mode as u16),
+            self.duration
+        )?;
+        writeln!(
+            f,
+            "{d}{:<9} {}..{}",
+            "prob:", self.probability1, self.probability2
+        )?;
+        writeln!(
+            f,
+            "{d}{:<9} {} (bonus {})",
+            "save:",
+            save_type(self.save_type),
+            self.save_bonus as i32
+        )?;
+        writeln!(
+            f,
+            "{d}{:<9} {} ({})",
+            "resist:",
+            self.dispel,
+            dispel_desc(self.dispel as u32)
+        )?;
+        // Dual-purpose with max/min level for non-damage opcodes, which store
+        // the -1 "no limit" sentinel here; render signed so it reads as `-1`.
+        if self.dice_thrown != 0 || self.dice_sides != 0 {
+            writeln!(
+                f,
+                "{d}{:<9} {}d{}",
+                "dice:", self.dice_thrown as i32, self.dice_sides as i32
+            )?;
+        }
+        if !self.resource.is_empty() {
+            writeln!(f, "{d}{:<9} {:?}", "resource:", self.resource)?;
+        }
+        if self.special != 0 {
+            writeln!(f, "{d}{:<9} {}", "special:", self.special as i32)?;
+        }
+        Ok(())
+    }
+
+    /// Write the feature's fields as `key=value` lines, in disk order, exactly as
+    /// stored. Each key is prefixed (e.g. `"ext.0.effect.2."`) so the line is
+    /// self-locating in the flat machine-readable view.
+    pub fn write_raw(&self, out: &mut dyn Write, prefix: &str) -> io::Result<()> {
+        writeln!(out, "{prefix}opcode={}", self.opcode)?;
+        writeln!(out, "{prefix}target={}", self.target)?;
+        writeln!(out, "{prefix}power={}", self.power)?;
+        writeln!(out, "{prefix}param1={}", self.param1)?;
+        writeln!(out, "{prefix}param2={}", self.param2)?;
+        writeln!(out, "{prefix}timing_mode={}", self.timing_mode)?;
+        writeln!(out, "{prefix}dispel={}", self.dispel)?;
+        writeln!(out, "{prefix}duration={}", self.duration)?;
+        writeln!(out, "{prefix}probability1={}", self.probability1)?;
+        writeln!(out, "{prefix}probability2={}", self.probability2)?;
+        writeln!(out, "{prefix}resource={}", self.resource)?;
+        writeln!(out, "{prefix}dice_thrown={}", self.dice_thrown)?;
+        writeln!(out, "{prefix}dice_sides={}", self.dice_sides)?;
+        writeln!(out, "{prefix}save_type={}", self.save_type)?;
+        writeln!(out, "{prefix}save_bonus={}", self.save_bonus)?;
+        writeln!(out, "{prefix}special={}", self.special)?;
         Ok(())
     }
 }

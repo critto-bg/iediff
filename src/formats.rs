@@ -7,6 +7,7 @@
 pub mod bif;
 pub mod eff;
 pub mod ids;
+pub mod itm;
 pub mod key;
 pub mod opcode;
 pub mod tlk;
