@@ -12,7 +12,8 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crate::formats::eff::{FEATURE_SIZE, Feature};
+use crate::formats::eff::Feature;
+use crate::formats::fields::{set_bits, set_flags, write_bitfield, write_school};
 use crate::{Reader, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for ITM files.
@@ -386,7 +387,8 @@ impl Itm {
         let equipping_count = reader.u16_at(0x70, "equipping count")?;
 
         // Equipping (always-on) effects: a slice of the shared feature pool.
-        let equipping = read_features(&reader, feature_offset, equipping_index, equipping_count)?;
+        let equipping =
+            Feature::read_pool(&reader, feature_offset, equipping_index, equipping_count)?;
 
         // Each extended header reads its own slice of the same pool.
         let mut ext_headers = Vec::with_capacity(ext_count);
@@ -395,7 +397,8 @@ impl Itm {
             let mut ext = ExtHeader::parse_at(&reader, base)?;
             let feature_index = reader.u16_at(base + 0x20, "feature index")?;
             let feature_count = reader.u16_at(base + 0x1e, "feature count")?;
-            ext.features = read_features(&reader, feature_offset, feature_index, feature_count)?;
+            ext.features =
+                Feature::read_pool(&reader, feature_offset, feature_index, feature_count)?;
             ext_headers.push(ext);
         }
 
@@ -544,48 +547,19 @@ impl fmt::Display for Itm {
             writeln!(f, "  replacement: {:?}", h.replacement_item)?;
         }
 
+        writeln!(f)?;
         writeln!(f, "  equipping effects: {}", self.equipping.len())?;
         for feat in &self.equipping {
             feat.write_human(f, "    ")?;
         }
 
+        writeln!(f)?;
         writeln!(f, "  abilities: {}", self.ext_headers.len())?;
         for (i, ext) in self.ext_headers.iter().enumerate() {
+            writeln!(f)?;
             ext.write_human(f, i)?;
         }
         Ok(())
-    }
-}
-
-/// Read `count` feature blocks starting at pool index `index`. Each read is
-/// bounds-checked through `reader`.
-fn read_features(
-    reader: &Reader,
-    feature_offset: u32,
-    index: u16,
-    count: u16,
-) -> Result<Vec<Feature>, Truncated> {
-    let mut features = Vec::with_capacity(count as usize);
-    for k in 0..count as usize {
-        let base = feature_offset as usize + (index as usize + k) * FEATURE_SIZE;
-        features.push(Feature::parse_at(reader, base)?);
-    }
-    Ok(features)
-}
-
-/// Write a `<label>: <value> (<name>)` school line, omitting the parenthetical
-/// when the dictionary lookup left the name unresolved.
-fn write_school(
-    f: &mut fmt::Formatter<'_>,
-    indent: &str,
-    label: &str,
-    value: u8,
-    name: &Option<String>,
-) -> fmt::Result {
-    let field = format!("{label}:");
-    match name {
-        Some(name) => writeln!(f, "{indent}{field:<9} {value} ({name})"),
-        None => writeln!(f, "{indent}{field:<9} {value}"),
     }
 }
 
@@ -675,41 +649,6 @@ fn depletion_name(value: u16) -> &'static str {
         3 => "item recharges",
         _ => "item remains",
     }
-}
-
-/// Write a `<label>0x...` line, appending the set flag names in parentheses
-/// when any are set.
-fn write_bitfield(
-    f: &mut fmt::Formatter<'_>,
-    label: &str,
-    value: u32,
-    names: &[&str],
-) -> fmt::Result {
-    if names.is_empty() {
-        writeln!(f, "{label}0x{value:08x}")
-    } else {
-        writeln!(f, "{label}0x{value:08x} ({})", names.join(", "))
-    }
-}
-
-/// Collect the names of the set bits in `value`, given a `(bit, name)` table.
-fn set_flags(value: u32, table: &[(u32, &'static str)]) -> Vec<&'static str> {
-    table
-        .iter()
-        .filter(|(bit, _)| value & (1 << bit) != 0)
-        .map(|(_, name)| *name)
-        .collect()
-}
-
-/// Collect the names of the set bits in `value`, where bit `i` names entry `i`
-/// of `names` (a contiguous bit-to-name table).
-fn set_bits(value: u32, names: &[&'static str]) -> Vec<&'static str> {
-    names
-        .iter()
-        .enumerate()
-        .filter(|(bit, _)| value & (1u32 << bit) != 0)
-        .map(|(_, name)| *name)
-        .collect()
 }
 
 /// Names of the set header flags (header 0x18). BG2:EE-relevant bits only.

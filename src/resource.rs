@@ -16,6 +16,7 @@ use crate::formats::eff::{EFF_TYPE, Eff, EffError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
 use crate::formats::itm::{ITM_TYPE, Itm, ItmError};
 use crate::formats::key::{KeyError, KeyFile, extension_type, type_extension};
+use crate::formats::spl::{SPL_TYPE, Spl, SplError};
 use crate::formats::tlk::{TlkError, TlkFile};
 use crate::formats::twoda::{TWODA_TYPE, TwoDA, TwoDAError};
 
@@ -33,6 +34,7 @@ pub enum ResourceError {
     TwoDA(TwoDAError),
     Eff(EffError),
     Itm(ItmError),
+    Spl(SplError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -52,6 +54,7 @@ impl fmt::Display for ResourceError {
             ResourceError::TwoDA(e) => write!(f, "{e}"),
             ResourceError::Eff(e) => write!(f, "{e}"),
             ResourceError::Itm(e) => write!(f, "{e}"),
+            ResourceError::Spl(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -72,6 +75,7 @@ impl std::error::Error for ResourceError {
             ResourceError::TwoDA(e) => Some(e),
             ResourceError::Eff(e) => Some(e),
             ResourceError::Itm(e) => Some(e),
+            ResourceError::Spl(e) => Some(e),
             _ => None,
         }
     }
@@ -116,6 +120,12 @@ impl From<EffError> for ResourceError {
 impl From<ItmError> for ResourceError {
     fn from(e: ItmError) -> Self {
         ResourceError::Itm(e)
+    }
+}
+
+impl From<SplError> for ResourceError {
+    fn from(e: SplError) -> Self {
+        ResourceError::Spl(e)
     }
 }
 
@@ -170,6 +180,7 @@ pub enum Resource {
     TwoDA(TwoDA),
     Eff(Eff),
     Itm(Itm),
+    Spl(Spl),
     Other(ResourceInfo),
 }
 
@@ -180,6 +191,7 @@ impl fmt::Display for Resource {
             Resource::TwoDA(table) => write!(f, "{table}"),
             Resource::Eff(eff) => write!(f, "{eff}"),
             Resource::Itm(itm) => write!(f, "{itm}"),
+            Resource::Spl(spl) => write!(f, "{spl}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -193,6 +205,7 @@ impl Resource {
         match self {
             Resource::Eff(eff) => eff.write_raw(out),
             Resource::Itm(itm) => itm.write_raw(out),
+            Resource::Spl(spl) => spl.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => write!(out, "{table}"),
             Resource::Other(info) => write!(out, "{info}"),
@@ -358,6 +371,40 @@ impl ResourceManager {
 
                 Resource::Itm(itm)
             }
+            SPL_TYPE => {
+                let mut spl = Spl::parse(&self.read_located(&located)?)?;
+
+                let primary = self.dictionary_label("MSCHOOL", spl.primary_type());
+                let secondary = self.dictionary_label("MSECTYPE", spl.secondary_type());
+                spl.set_type_names(primary, secondary);
+
+                let (unid, id) = spl.name_strrefs();
+                let unid = self.string_label(unid);
+                let id = self.string_label(id);
+                spl.set_names(unid, id);
+
+                let (unid, id) = spl.description_strrefs();
+                let unid = self.string_label(unid);
+                let id = self.string_label(id);
+                spl.set_descriptions(unid, id);
+
+                // Each header's projectile indexes projectl.ids, off by one
+                // (binary N → ids N-1) in BG2.
+                let projectiles: Vec<u16> = spl
+                    .ext_headers()
+                    .iter()
+                    .map(|ext| ext.projectile())
+                    .collect();
+                let names: Vec<Option<String>> = projectiles
+                    .into_iter()
+                    .map(|projectile| self.ids_label("PROJECTL", projectile as i64 - 1))
+                    .collect();
+                for (ext, name) in spl.ext_headers_mut().iter_mut().zip(names) {
+                    ext.set_projectile_name(name);
+                }
+
+                Resource::Spl(spl)
+            }
             _ => Resource::Other(self.info_located(&located)?),
         };
 
@@ -459,6 +506,16 @@ impl ResourceManager {
         let located = self.locate(name, TWODA_TYPE, Source::Auto)?;
         let bytes = self.read_located(&located).ok()?;
         TwoDA::parse(&bytes).ok()
+    }
+
+    /// Resolve a numeric value to its symbol in an IDS table (e.g. PROJECTL),
+    /// where the value indexes by its IDS number. `None` when unresolved.
+    fn ids_label(&mut self, table: &str, value: i64) -> Option<String> {
+        let located = self.locate(table, IDS_TYPE, Source::Auto)?;
+        let bytes = self.read_located(&located).ok()?;
+        IdsFile::parse(&bytes)
+            .lookup_by_value(value)
+            .map(str::to_string)
     }
 
     /// Resolve a strref to its display string from `dialog.tlk`. The TLK is

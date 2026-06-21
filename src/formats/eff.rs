@@ -366,7 +366,7 @@ pub const FEATURE_SIZE: usize = 48;
 /// ([`target_type`], [`timing_mode`], …) are shared with [`Eff`].
 ///
 /// Unlike [`Eff`], this is never a standalone resource, so it has no `Display`
-/// of its own: the embedding format (ITM) drives layout and passes the
+/// of its own: the embedding format (ITM/SPL) drives layout and passes the
 /// indent/prefix.
 pub struct Feature {
     opcode: u16,
@@ -389,6 +389,23 @@ pub struct Feature {
 }
 
 impl Feature {
+    /// Read `count` feature blocks from the shared pool at `pool_offset`,
+    /// starting at pool `index`. ITM and SPL both reference their effects this
+    /// way — a continuous pool sliced by `(index, count)`. Bounds-checked.
+    pub fn read_pool(
+        reader: &Reader,
+        pool_offset: u32,
+        index: u16,
+        count: u16,
+    ) -> Result<Vec<Feature>, Truncated> {
+        let mut features = Vec::with_capacity(count as usize);
+        for k in 0..count as usize {
+            let base = pool_offset as usize + (index as usize + k) * FEATURE_SIZE;
+            features.push(Feature::parse_at(reader, base)?);
+        }
+        Ok(features)
+    }
+
     /// Parse one feature block at `base` (an absolute offset into the embedding
     /// file). Bounds-checked through `reader`.
     pub fn parse_at(reader: &Reader, base: usize) -> Result<Feature, Truncated> {
