@@ -11,7 +11,9 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::Reader;
 use crate::formats::bif::{BifArchive, BifError};
+use crate::formats::cre::{CRE_TYPE, Cre, CreError, CreNames};
 use crate::formats::eff::{EFF_TYPE, Eff, EffError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
 use crate::formats::itm::{ITM_TYPE, Itm, ItmError};
@@ -35,6 +37,7 @@ pub enum ResourceError {
     Eff(EffError),
     Itm(ItmError),
     Spl(SplError),
+    Cre(CreError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -55,6 +58,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Eff(e) => write!(f, "{e}"),
             ResourceError::Itm(e) => write!(f, "{e}"),
             ResourceError::Spl(e) => write!(f, "{e}"),
+            ResourceError::Cre(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -76,6 +80,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Eff(e) => Some(e),
             ResourceError::Itm(e) => Some(e),
             ResourceError::Spl(e) => Some(e),
+            ResourceError::Cre(e) => Some(e),
             _ => None,
         }
     }
@@ -126,6 +131,12 @@ impl From<ItmError> for ResourceError {
 impl From<SplError> for ResourceError {
     fn from(e: SplError) -> Self {
         ResourceError::Spl(e)
+    }
+}
+
+impl From<CreError> for ResourceError {
+    fn from(e: CreError) -> Self {
+        ResourceError::Cre(e)
     }
 }
 
@@ -181,6 +192,7 @@ pub enum Resource {
     Eff(Eff),
     Itm(Itm),
     Spl(Spl),
+    Cre(Cre),
     Other(ResourceInfo),
 }
 
@@ -192,6 +204,7 @@ impl fmt::Display for Resource {
             Resource::Eff(eff) => write!(f, "{eff}"),
             Resource::Itm(itm) => write!(f, "{itm}"),
             Resource::Spl(spl) => write!(f, "{spl}"),
+            Resource::Cre(cre) => write!(f, "{cre}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -203,9 +216,10 @@ impl Resource {
     /// reuse their normal rendering.
     pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
         match self {
-            Resource::Eff(eff) => eff.write_raw(out),
+            Resource::Eff(eff) => eff.write_raw(out, ""),
             Resource::Itm(itm) => itm.write_raw(out),
             Resource::Spl(spl) => spl.write_raw(out),
+            Resource::Cre(cre) => cre.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => write!(out, "{table}"),
             Resource::Other(info) => write!(out, "{info}"),
@@ -261,6 +275,30 @@ pub struct ResourceManager {
     dialog: Option<TlkFile>,
     /// Index of the override directory; its resources shadow the BIFs.
     over: Override,
+    /// Cache of resolved names, keyed by (UPPERCASE resref, type). A creature
+    /// may reference the same spell/item many times.
+    name_cache: HashMap<(String, u16), ResourceNames>,
+    /// Cache of parsed dictionary 2DAs, keyed by UPPERCASE name. `None` records
+    /// a table that could not be loaded, so it is not retried.
+    twoda_cache: HashMap<String, Option<TwoDA>>,
+    /// Cache of parsed IDS tables, keyed by UPPERCASE name.
+    ids_cache: HashMap<String, Option<IdsFile>>,
+}
+
+/// The display names a resource (ITM/SPL) carries, resolved from its header
+/// strrefs. Both are kept so a consumer can pick whichever it needs; most want
+/// [`display`](ResourceNames::display).
+#[derive(Clone, Default)]
+pub struct ResourceNames {
+    pub identified: Option<String>,
+    pub unidentified: Option<String>,
+}
+
+impl ResourceNames {
+    /// The name to show by default: identified if resolved, else unidentified.
+    pub fn display(&self) -> Option<&str> {
+        self.identified.as_deref().or(self.unidentified.as_deref())
+    }
 }
 
 impl ResourceManager {
@@ -282,6 +320,9 @@ impl ResourceManager {
             open_bifs: HashMap::new(),
             dialog: None,
             over,
+            name_cache: HashMap::new(),
+            twoda_cache: HashMap::new(),
+            ids_cache: HashMap::new(),
         })
     }
 
@@ -405,6 +446,54 @@ impl ResourceManager {
 
                 Resource::Spl(spl)
             }
+            CRE_TYPE => {
+                let mut cre = Cre::parse(&self.read_located(&located)?)?;
+
+                // Identity: names from the TLK, the IDS octet and animation from
+                // their IDS tables.
+                let (long, short) = cre.name_strrefs();
+                let codes = cre.ids_codes();
+                let names = CreNames {
+                    long_name: self.string_label(long),
+                    short_name: self.string_label(short),
+                    ea: self.ids_label("EA", codes.ea as i64),
+                    general: self.ids_label("GENERAL", codes.general as i64),
+                    race: self.ids_label("RACE", codes.race as i64),
+                    class: self.ids_label("CLASS", codes.class as i64),
+                    specific: self.ids_label("SPECIFIC", codes.specific as i64),
+                    gender: self.ids_label("GENDER", codes.gender as i64),
+                    alignment: self.ids_label("ALIGNMEN", codes.alignment as i64),
+                    animation: self.ids_label("ANIMATE", codes.animation as i64),
+                    // KIT.IDS is indexed by the kit dword with its high
+                    // and low 16-bit halves swapped (so e.g. the
+                    // stored 0x40000000 → 0x00004000 = TRUECLASS, and the
+                    // low-word 0x00004000 → 0x40000000 = BARBARIAN).
+                    kit: self.ids_label("KIT", codes.kit.rotate_left(16) as i64),
+                };
+                cre.set_names(names);
+
+                // Resolve display names for referenced spells (SPL) and items (ITM).
+                self.resolve_refs(
+                    cre.known_spells_mut(),
+                    SPL_TYPE,
+                    |s| s.resource(),
+                    |s, n| s.set_name(n),
+                );
+                self.resolve_refs(
+                    cre.memorized_spells_mut(),
+                    SPL_TYPE,
+                    |s| s.resource(),
+                    |s, n| s.set_name(n),
+                );
+                self.resolve_refs(
+                    cre.items_mut(),
+                    ITM_TYPE,
+                    |it| it.resource(),
+                    |it, n| it.set_name(n),
+                );
+
+                Resource::Cre(cre)
+            }
             _ => Resource::Other(self.info_located(&located)?),
         };
 
@@ -496,13 +585,23 @@ impl ResourceManager {
     /// Resolve a numeric value to its row label in a dictionary 2DA (e.g.
     /// MSCHOOL, MSECTYPE), where the value is the 0-based row index.
     fn dictionary_label(&mut self, table: &str, value: u32) -> Option<String> {
-        let twoda = self.load_2da(table)?;
-        twoda.row_label(value as usize).map(str::to_string)
+        self.load_2da(table)?
+            .row_label(value as usize)
+            .map(str::to_string)
     }
 
-    /// Load and parse a 2DA by name, honouring the override layer. `None` on any
-    /// failure — suited to the best-effort dictionary lookups above.
-    fn load_2da(&mut self, name: &str) -> Option<TwoDA> {
+    /// Borrow a parsed 2DA by name, honouring the override layer. Parsed once
+    /// and cached; a load failure is cached as `None` so it is not retried.
+    fn load_2da(&mut self, name: &str) -> Option<&TwoDA> {
+        let key = name.to_ascii_uppercase();
+        if !self.twoda_cache.contains_key(&key) {
+            let parsed = self.parse_2da(name);
+            self.twoda_cache.insert(key.clone(), parsed);
+        }
+        self.twoda_cache.get(&key)?.as_ref()
+    }
+
+    fn parse_2da(&mut self, name: &str) -> Option<TwoDA> {
         let located = self.locate(name, TWODA_TYPE, Source::Auto)?;
         let bytes = self.read_located(&located).ok()?;
         TwoDA::parse(&bytes).ok()
@@ -511,11 +610,85 @@ impl ResourceManager {
     /// Resolve a numeric value to its symbol in an IDS table (e.g. PROJECTL),
     /// where the value indexes by its IDS number. `None` when unresolved.
     fn ids_label(&mut self, table: &str, value: i64) -> Option<String> {
-        let located = self.locate(table, IDS_TYPE, Source::Auto)?;
-        let bytes = self.read_located(&located).ok()?;
-        IdsFile::parse(&bytes)
+        self.load_ids(table)?
             .lookup_by_value(value)
             .map(str::to_string)
+    }
+
+    /// Borrow a parsed IDS table by name. Parsed once and cached.
+    fn load_ids(&mut self, name: &str) -> Option<&IdsFile> {
+        let key = name.to_ascii_uppercase();
+        if !self.ids_cache.contains_key(&key) {
+            let parsed = self.parse_ids(name);
+            self.ids_cache.insert(key.clone(), parsed);
+        }
+        self.ids_cache.get(&key)?.as_ref()
+    }
+
+    fn parse_ids(&mut self, name: &str) -> Option<IdsFile> {
+        let located = self.locate(name, IDS_TYPE, Source::Auto)?;
+        let bytes = self.read_located(&located).ok()?;
+        Some(IdsFile::parse(&bytes))
+    }
+
+    /// Resolve display names for a slice of records that reference another
+    /// resource by resref (e.g. a creature's spells or items). `get` reads the
+    /// resref, `set` stores the resolved name back.
+    fn resolve_refs<T>(
+        &mut self,
+        items: &mut [T],
+        res_type: u16,
+        get: impl Fn(&T) -> &str,
+        set: impl Fn(&mut T, Option<String>),
+    ) {
+        let refs: Vec<String> = items.iter().map(|t| get(t).to_string()).collect();
+        let names: Vec<Option<String>> = refs
+            .iter()
+            .map(|r| {
+                self.resource_names(r, res_type)
+                    .display()
+                    .map(str::to_string)
+            })
+            .collect();
+        for (t, name) in items.iter_mut().zip(names) {
+            set(t, name);
+        }
+    }
+
+    /// Resolved identified/unidentified names for a referenced resource (ITM/SPL),
+    /// read from its header strrefs without a full parse. Cached, since references
+    /// repeat (a creature may memorize the same spell hundreds of times).
+    fn resource_names(&mut self, resref: &str, res_type: u16) -> ResourceNames {
+        if resref.is_empty() {
+            return ResourceNames::default();
+        }
+
+        let key = (resref.to_ascii_uppercase(), res_type);
+        if let Some(cached) = self.name_cache.get(&key) {
+            return cached.clone();
+        }
+
+        let names = self.read_resource_names(resref, res_type);
+        self.name_cache.insert(key, names.clone());
+        names
+    }
+
+    /// Resolve an ITM/SPL's identified (0x0c) and unidentified (0x08) name
+    /// strrefs against the TLK, without a full parse.
+    fn read_resource_names(&mut self, resref: &str, res_type: u16) -> ResourceNames {
+        let Some(located) = self.locate(resref, res_type, Source::Auto) else {
+            return ResourceNames::default();
+        };
+        let Ok(bytes) = self.read_located(&located) else {
+            return ResourceNames::default();
+        };
+        let reader = Reader::new(&bytes);
+        let identified = reader.u32_at(0x0c, "identified name").ok();
+        let unidentified = reader.u32_at(0x08, "unidentified name").ok();
+        ResourceNames {
+            identified: identified.and_then(|s| self.string_label(s)),
+            unidentified: unidentified.and_then(|s| self.string_label(s)),
+        }
     }
 
     /// Resolve a strref to its display string from `dialog.tlk`. The TLK is

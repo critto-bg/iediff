@@ -22,6 +22,10 @@ pub const EFF_TYPE: u16 = 0x03f8;
 const EFF_SIGNATURE: &[u8; 4] = b"EFF ";
 const EFF_VERSION: &[u8; 4] = b"V2.0";
 
+/// Size of a CRE-embedded V2 effect: the 0x110-byte standalone layout minus its
+/// 8-byte outer header. See [`Eff::parse_embedded_at`].
+pub const EFF_V2_BODY_SIZE: usize = 0x108;
+
 /// Anything that can go wrong while parsing an EFF file.
 #[derive(Debug)]
 pub enum EffError {
@@ -123,7 +127,9 @@ pub struct Eff {
 }
 
 impl Eff {
-    /// Parse a standalone EFF V2.0 resource.
+    /// Parse a standalone EFF V2.0 resource. The 0x110-byte file is an 8-byte
+    /// outer header (sig/ver) followed by the body, which begins with a repeat
+    /// of the sig/ver at 0x08.
     pub fn parse(data: &[u8]) -> Result<Eff, EffError> {
         let reader = Reader::new(data);
 
@@ -137,56 +143,72 @@ impl Eff {
             return Err(EffError::BadVersion(version));
         }
 
-        // The body repeats the signature/version at 0x08; the effect proper
-        // begins at 0x10 (see eff_v2.md).
+        Ok(Eff::parse_body(&reader, 0x08)?)
+    }
+
+    /// Parse a CRE-embedded V2 effect at `base`. These omit the 8-byte outer
+    /// header, so the body (starting with its sig/ver echo) begins directly at
+    /// `base` — every field then sits at its standalone offset minus 8. The
+    /// total length is [`EFF_V2_BODY_SIZE`]. See `cre_v1.md`.
+    pub fn parse_embedded_at(reader: &Reader, base: usize) -> Result<Eff, Truncated> {
+        Eff::parse_body(reader, base)
+    }
+
+    /// Parse the effect body, whose sig/ver echo sits at `body_base`. Every
+    /// other field is read relative to it (opcode at `body_base + 0x08`, …),
+    /// which is what makes the standalone (`body_base = 0x08`) and CRE-embedded
+    /// (`body_base = base`) forms one code path.
+    fn parse_body(reader: &Reader, body_base: usize) -> Result<Eff, Truncated> {
+        let at = |off: usize| body_base + off;
+
         let mut unknown_tail = [0u32; 15];
         for (i, slot) in unknown_tail.iter_mut().enumerate() {
-            *slot = reader.u32_at(0xd4 + i * 4, "trailing unknown")?;
+            *slot = reader.u32_at(at(0xcc) + i * 4, "trailing unknown")?;
         }
 
         Ok(Eff {
-            signature2: reader.tag_at(0x08, "body signature")?,
-            version2: reader.tag_at(0x0c, "body version")?,
-            opcode: reader.u32_at(0x10, "opcode")?,
-            target: reader.u32_at(0x14, "target type")?,
-            power: reader.u32_at(0x18, "power")?,
-            param1: reader.u32_at(0x1c, "parameter 1")?,
-            param2: reader.u32_at(0x20, "parameter 2")?,
-            timing_mode: reader.u16_at(0x24, "timing mode")?,
-            timing_unknown: reader.u16_at(0x26, "timing (secondary)")?,
-            duration: reader.u32_at(0x28, "duration")?,
-            probability1: reader.u16_at(0x2c, "probability 1")?,
-            probability2: reader.u16_at(0x2e, "probability 2")?,
-            resource: reader.resref_at(0x30, "resource")?,
-            dice_thrown: reader.u32_at(0x38, "dice thrown")?,
-            dice_sides: reader.u32_at(0x3c, "dice sides")?,
-            save_type: reader.u32_at(0x40, "saving throw type")?,
-            save_bonus: reader.u32_at(0x44, "save bonus")?,
-            special: reader.u32_at(0x48, "special")?,
-            primary_type: reader.u32_at(0x4c, "primary type")?,
-            unknown_0x50: reader.u32_at(0x50, "unknown")?,
-            affected_level_low: reader.u32_at(0x54, "lowest affected level")?,
-            affected_level_high: reader.u32_at(0x58, "highest affected level")?,
-            dispel: reader.u32_at(0x5c, "dispel/resistance")?,
-            param3: reader.u32_at(0x60, "parameter 3")?,
-            param4: reader.u32_at(0x64, "parameter 4")?,
-            param5: reader.u32_at(0x68, "parameter 5")?,
-            time_applied: reader.u32_at(0x6c, "time applied")?,
-            resource2: reader.resref_at(0x70, "resource 2")?,
-            resource3: reader.resref_at(0x78, "resource 3")?,
-            caster_x: reader.u32_at(0x80, "caster x")?,
-            caster_y: reader.u32_at(0x84, "caster y")?,
-            target_x: reader.u32_at(0x88, "target x")?,
-            target_y: reader.u32_at(0x8c, "target y")?,
-            parent_resource_type: reader.u32_at(0x90, "parent resource type")?,
-            parent_resource: reader.resref_at(0x94, "parent resource")?,
-            parent_resource_flags: reader.u32_at(0x9c, "parent resource flags")?,
-            projectile: reader.u32_at(0xa0, "projectile")?,
-            parent_resource_slot: reader.u32_at(0xa4, "parent resource slot")?,
-            variable: parse_asciiz(reader.slice(0xa8, 32, "variable name")?),
-            caster_level: reader.u32_at(0xc8, "caster level")?,
-            first_apply: reader.u32_at(0xcc, "first apply")?,
-            secondary_type: reader.u32_at(0xd0, "secondary type")?,
+            signature2: reader.tag_at(at(0x00), "body signature")?,
+            version2: reader.tag_at(at(0x04), "body version")?,
+            opcode: reader.u32_at(at(0x08), "opcode")?,
+            target: reader.u32_at(at(0x0c), "target type")?,
+            power: reader.u32_at(at(0x10), "power")?,
+            param1: reader.u32_at(at(0x14), "parameter 1")?,
+            param2: reader.u32_at(at(0x18), "parameter 2")?,
+            timing_mode: reader.u16_at(at(0x1c), "timing mode")?,
+            timing_unknown: reader.u16_at(at(0x1e), "timing (secondary)")?,
+            duration: reader.u32_at(at(0x20), "duration")?,
+            probability1: reader.u16_at(at(0x24), "probability 1")?,
+            probability2: reader.u16_at(at(0x26), "probability 2")?,
+            resource: reader.resref_at(at(0x28), "resource")?,
+            dice_thrown: reader.u32_at(at(0x30), "dice thrown")?,
+            dice_sides: reader.u32_at(at(0x34), "dice sides")?,
+            save_type: reader.u32_at(at(0x38), "saving throw type")?,
+            save_bonus: reader.u32_at(at(0x3c), "save bonus")?,
+            special: reader.u32_at(at(0x40), "special")?,
+            primary_type: reader.u32_at(at(0x44), "primary type")?,
+            unknown_0x50: reader.u32_at(at(0x48), "unknown")?,
+            affected_level_low: reader.u32_at(at(0x4c), "lowest affected level")?,
+            affected_level_high: reader.u32_at(at(0x50), "highest affected level")?,
+            dispel: reader.u32_at(at(0x54), "dispel/resistance")?,
+            param3: reader.u32_at(at(0x58), "parameter 3")?,
+            param4: reader.u32_at(at(0x5c), "parameter 4")?,
+            param5: reader.u32_at(at(0x60), "parameter 5")?,
+            time_applied: reader.u32_at(at(0x64), "time applied")?,
+            resource2: reader.resref_at(at(0x68), "resource 2")?,
+            resource3: reader.resref_at(at(0x70), "resource 3")?,
+            caster_x: reader.u32_at(at(0x78), "caster x")?,
+            caster_y: reader.u32_at(at(0x7c), "caster y")?,
+            target_x: reader.u32_at(at(0x80), "target x")?,
+            target_y: reader.u32_at(at(0x84), "target y")?,
+            parent_resource_type: reader.u32_at(at(0x88), "parent resource type")?,
+            parent_resource: reader.resref_at(at(0x8c), "parent resource")?,
+            parent_resource_flags: reader.u32_at(at(0x94), "parent resource flags")?,
+            projectile: reader.u32_at(at(0x98), "projectile")?,
+            parent_resource_slot: reader.u32_at(at(0x9c), "parent resource slot")?,
+            variable: parse_asciiz(reader.slice(at(0xa0), 32, "variable name")?),
+            caster_level: reader.u32_at(at(0xc0), "caster level")?,
+            first_apply: reader.u32_at(at(0xc4), "first apply")?,
+            secondary_type: reader.u32_at(at(0xc8), "secondary type")?,
             unknown_tail,
             primary_name: None,
             secondary_name: None,
@@ -211,147 +233,190 @@ impl Eff {
     }
 
     /// Write the effect's fields as `key=value` lines, in disk order, exactly as
-    /// stored (unsigned, undecoded). The machine-readable counterpart to
-    /// [`Display`](fmt::Display); the format's unknown/structural words and the
+    /// stored (unsigned, undecoded). Each key carries `prefix` so the line is
+    /// self-locating when embedded (e.g. `"effect.3."` in a CRE); the standalone
+    /// resource passes `""`. The format's unknown/structural words and the
     /// resolved dictionary names are intentionally omitted.
-    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
-        writeln!(out, "opcode={}", self.opcode)?;
-        writeln!(out, "target={}", self.target)?;
-        writeln!(out, "power={}", self.power)?;
-        writeln!(out, "param1={}", self.param1)?;
-        writeln!(out, "param2={}", self.param2)?;
-        writeln!(out, "timing_mode={}", self.timing_mode)?;
-        writeln!(out, "duration={}", self.duration)?;
-        writeln!(out, "probability1={}", self.probability1)?;
-        writeln!(out, "probability2={}", self.probability2)?;
-        writeln!(out, "resource={}", self.resource)?;
-        writeln!(out, "dice_thrown={}", self.dice_thrown)?;
-        writeln!(out, "dice_sides={}", self.dice_sides)?;
-        writeln!(out, "save_type={}", self.save_type)?;
-        writeln!(out, "save_bonus={}", self.save_bonus)?;
-        writeln!(out, "special={}", self.special)?;
-        writeln!(out, "primary_type={}", self.primary_type)?;
-        writeln!(out, "affected_level_low={}", self.affected_level_low)?;
-        writeln!(out, "affected_level_high={}", self.affected_level_high)?;
-        writeln!(out, "dispel={}", self.dispel)?;
-        writeln!(out, "param3={}", self.param3)?;
-        writeln!(out, "param4={}", self.param4)?;
-        writeln!(out, "param5={}", self.param5)?;
-        writeln!(out, "time_applied={}", self.time_applied)?;
-        writeln!(out, "resource2={}", self.resource2)?;
-        writeln!(out, "resource3={}", self.resource3)?;
-        writeln!(out, "caster_x={}", self.caster_x)?;
-        writeln!(out, "caster_y={}", self.caster_y)?;
-        writeln!(out, "target_x={}", self.target_x)?;
-        writeln!(out, "target_y={}", self.target_y)?;
-        writeln!(out, "parent_resource_type={}", self.parent_resource_type)?;
-        writeln!(out, "parent_resource={}", self.parent_resource)?;
-        writeln!(out, "parent_resource_flags={}", self.parent_resource_flags)?;
-        writeln!(out, "projectile={}", self.projectile)?;
-        writeln!(out, "parent_resource_slot={}", self.parent_resource_slot)?;
-        writeln!(out, "variable={}", self.variable)?;
-        writeln!(out, "caster_level={}", self.caster_level)?;
-        writeln!(out, "first_apply={}", self.first_apply)?;
-        writeln!(out, "secondary_type={}", self.secondary_type)?;
+    pub fn write_raw(&self, out: &mut dyn Write, prefix: &str) -> io::Result<()> {
+        writeln!(out, "{prefix}opcode={}", self.opcode)?;
+        writeln!(out, "{prefix}target={}", self.target)?;
+        writeln!(out, "{prefix}power={}", self.power)?;
+        writeln!(out, "{prefix}param1={}", self.param1)?;
+        writeln!(out, "{prefix}param2={}", self.param2)?;
+        writeln!(out, "{prefix}timing_mode={}", self.timing_mode)?;
+        writeln!(out, "{prefix}duration={}", self.duration)?;
+        writeln!(out, "{prefix}probability1={}", self.probability1)?;
+        writeln!(out, "{prefix}probability2={}", self.probability2)?;
+        writeln!(out, "{prefix}resource={}", self.resource)?;
+        writeln!(out, "{prefix}dice_thrown={}", self.dice_thrown)?;
+        writeln!(out, "{prefix}dice_sides={}", self.dice_sides)?;
+        writeln!(out, "{prefix}save_type={}", self.save_type)?;
+        writeln!(out, "{prefix}save_bonus={}", self.save_bonus)?;
+        writeln!(out, "{prefix}special={}", self.special)?;
+        writeln!(out, "{prefix}primary_type={}", self.primary_type)?;
+        writeln!(
+            out,
+            "{prefix}affected_level_low={}",
+            self.affected_level_low
+        )?;
+        writeln!(
+            out,
+            "{prefix}affected_level_high={}",
+            self.affected_level_high
+        )?;
+        writeln!(out, "{prefix}dispel={}", self.dispel)?;
+        writeln!(out, "{prefix}param3={}", self.param3)?;
+        writeln!(out, "{prefix}param4={}", self.param4)?;
+        writeln!(out, "{prefix}param5={}", self.param5)?;
+        writeln!(out, "{prefix}time_applied={}", self.time_applied)?;
+        writeln!(out, "{prefix}resource2={}", self.resource2)?;
+        writeln!(out, "{prefix}resource3={}", self.resource3)?;
+        writeln!(out, "{prefix}caster_x={}", self.caster_x)?;
+        writeln!(out, "{prefix}caster_y={}", self.caster_y)?;
+        writeln!(out, "{prefix}target_x={}", self.target_x)?;
+        writeln!(out, "{prefix}target_y={}", self.target_y)?;
+        writeln!(
+            out,
+            "{prefix}parent_resource_type={}",
+            self.parent_resource_type
+        )?;
+        writeln!(out, "{prefix}parent_resource={}", self.parent_resource)?;
+        writeln!(
+            out,
+            "{prefix}parent_resource_flags={}",
+            self.parent_resource_flags
+        )?;
+        writeln!(out, "{prefix}projectile={}", self.projectile)?;
+        writeln!(
+            out,
+            "{prefix}parent_resource_slot={}",
+            self.parent_resource_slot
+        )?;
+        writeln!(out, "{prefix}variable={}", self.variable)?;
+        writeln!(out, "{prefix}caster_level={}", self.caster_level)?;
+        writeln!(out, "{prefix}first_apply={}", self.first_apply)?;
+        writeln!(out, "{prefix}secondary_type={}", self.secondary_type)?;
         Ok(())
     }
 }
 
-impl fmt::Display for Eff {
-    /// Human-readable view: the authored effect fields, with the optional
-    /// resrefs, dice, and extra parameters shown only when they carry a value.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "EFF V2.0")?;
+impl Eff {
+    /// Render the authored effect fields, each line prefixed with `indent`. The
+    /// optional resrefs, dice, and extra parameters appear only when they carry
+    /// a value. Shared by the standalone [`Display`](fmt::Display) (indent
+    /// `"  "`) and the CRE effect list, which nests it deeper.
+    pub fn write_human(&self, f: &mut dyn fmt::Write, indent: &str) -> fmt::Result {
         match opcode_name(self.opcode) {
-            Some(name) => writeln!(f, "  opcode:      {} ({name})", self.opcode)?,
-            None => writeln!(f, "  opcode:      {}", self.opcode)?,
+            Some(name) => writeln!(f, "{indent}{:<13}{} ({name})", "opcode:", self.opcode)?,
+            None => writeln!(f, "{indent}{:<13}{}", "opcode:", self.opcode)?,
         }
         // Many authored effects store -1 in target/parameter fields as a "none"
         // sentinel, so these read as signed; annotate the target only when it
         // names a known type.
         match target_type(self.target) {
-            Some(name) => writeln!(f, "  target:      {} ({name})", self.target as i32)?,
-            None => writeln!(f, "  target:      {}", self.target as i32)?,
+            Some(name) => writeln!(
+                f,
+                "{indent}{:<13}{} ({name})",
+                "target:", self.target as i32
+            )?,
+            None => writeln!(f, "{indent}{:<13}{}", "target:", self.target as i32)?,
         }
-        writeln!(f, "  power:       {}", self.power)?;
+        writeln!(f, "{indent}{:<13}{}", "power:", self.power)?;
         writeln!(
             f,
-            "  parameters:  p1={} p2={}",
-            self.param1 as i32, self.param2 as i32
+            "{indent}{:<13}p1={} p2={}",
+            "parameters:", self.param1 as i32, self.param2 as i32
         )?;
         writeln!(
             f,
-            "  timing:      {} ({}), duration {}",
+            "{indent}{:<13}{} ({}), duration {}",
+            "timing:",
             self.timing_mode,
             timing_mode(self.timing_mode),
             self.duration
         )?;
         writeln!(
             f,
-            "  probability: {}..{}",
-            self.probability1, self.probability2
+            "{indent}{:<13}{}..{}",
+            "probability:", self.probability1, self.probability2
         )?;
         writeln!(
             f,
-            "  save:        {} (bonus {})",
+            "{indent}{:<13}{} (bonus {})",
+            "save:",
             save_type(self.save_type),
             self.save_bonus as i32
         )?;
         writeln!(
             f,
-            "  resistance:  {} ({})",
+            "{indent}{:<13}{} ({})",
+            "resistance:",
             self.dispel,
             dispel_desc(self.dispel)
         )?;
-        write_type(f, "primary", self.primary_type, &self.primary_name)?;
-        write_type(f, "secondary", self.secondary_type, &self.secondary_name)?;
+        write_type(f, indent, "primary", self.primary_type, &self.primary_name)?;
+        write_type(
+            f,
+            indent,
+            "secondary",
+            self.secondary_type,
+            &self.secondary_name,
+        )?;
 
         // Dual-purpose with max/min level for non-damage opcodes, which store
         // the -1 "no limit" sentinel here; render signed so it reads as `-1`.
         if self.dice_thrown != 0 || self.dice_sides != 0 {
             writeln!(
                 f,
-                "  dice:        {}d{}",
-                self.dice_thrown as i32, self.dice_sides as i32
+                "{indent}{:<13}{}d{}",
+                "dice:", self.dice_thrown as i32, self.dice_sides as i32
             )?;
         }
         if self.param3 != 0 || self.param4 != 0 || self.param5 != 0 {
             writeln!(
                 f,
-                "  params 3-5:  {} {} {}",
-                self.param3 as i32, self.param4 as i32, self.param5 as i32
+                "{indent}{:<13}{} {} {}",
+                "params 3-5:", self.param3 as i32, self.param4 as i32, self.param5 as i32
             )?;
         }
         if self.special != 0 {
-            writeln!(f, "  special:     {}", self.special as i32)?;
+            writeln!(f, "{indent}{:<13}{}", "special:", self.special as i32)?;
         }
         if self.affected_level_low != 0 || self.affected_level_high != 0 {
             writeln!(
                 f,
-                "  levels:      {}-{}",
-                self.affected_level_low, self.affected_level_high
+                "{indent}{:<13}{}-{}",
+                "levels:", self.affected_level_low, self.affected_level_high
             )?;
         }
         if self.projectile != 0 {
-            writeln!(f, "  projectile:  {}", self.projectile)?;
+            writeln!(f, "{indent}{:<13}{}", "projectile:", self.projectile)?;
         }
         if !self.resource.is_empty() {
-            writeln!(f, "  resource:    {:?}", self.resource)?;
+            writeln!(f, "{indent}{:<13}{:?}", "resource:", self.resource)?;
         }
         if !self.resource2.is_empty() {
-            writeln!(f, "  resource 2:  {:?}", self.resource2)?;
+            writeln!(f, "{indent}{:<13}{:?}", "resource 2:", self.resource2)?;
         }
         if !self.resource3.is_empty() {
-            writeln!(f, "  resource 3:  {:?}", self.resource3)?;
+            writeln!(f, "{indent}{:<13}{:?}", "resource 3:", self.resource3)?;
         }
         if !self.parent_resource.is_empty() {
-            writeln!(f, "  parent:      {:?}", self.parent_resource)?;
+            writeln!(f, "{indent}{:<13}{:?}", "parent:", self.parent_resource)?;
         }
         if !self.variable.is_empty() {
-            writeln!(f, "  variable:    {:?}", self.variable)?;
+            writeln!(f, "{indent}{:<13}{:?}", "variable:", self.variable)?;
         }
 
         Ok(())
+    }
+}
+
+impl fmt::Display for Eff {
+    /// Human-readable view of a standalone EFF V2.0 resource.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "EFF V2.0")?;
+        self.write_human(f, "  ")
     }
 }
 
@@ -520,15 +585,16 @@ impl Feature {
 /// Write a `<label>: <value> (<name>)` line, omitting the parenthetical when
 /// the dictionary lookup left the name unresolved.
 fn write_type(
-    f: &mut fmt::Formatter<'_>,
+    f: &mut dyn fmt::Write,
+    indent: &str,
     label: &str,
     value: u32,
     name: &Option<String>,
 ) -> fmt::Result {
     let field = format!("{label}:");
     match name {
-        Some(name) => writeln!(f, "  {field:<13}{value} ({name})"),
-        None => writeln!(f, "  {field:<13}{value}"),
+        Some(name) => writeln!(f, "{indent}{field:<13}{value} ({name})"),
+        None => writeln!(f, "{indent}{field:<13}{value}"),
     }
 }
 
