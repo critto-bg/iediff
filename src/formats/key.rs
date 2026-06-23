@@ -61,6 +61,11 @@ pub struct ResourceEntry {
 }
 
 impl ResourceEntry {
+    /// The resref as stored in the KEY (original case).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn res_type(&self) -> u16 {
         self.res_type
     }
@@ -83,6 +88,11 @@ pub struct KeyFile {
     resources: Vec<ResourceEntry>,
     /// (UPPERCASE name, type) -> index into `resources`. Resrefs are case-insensitive.
     index: HashMap<(String, u16), usize>,
+    /// (UPPERCASE name, type) keys the KEY lists more than once. Empty for a
+    /// clean KEY; a modded one may append an entry for an existing resref. The
+    /// index keeps the last occurrence (newer wins); these are surfaced so the
+    /// caller can warn.
+    duplicates: Vec<(String, u16)>,
 }
 
 impl KeyFile {
@@ -108,14 +118,21 @@ impl KeyFile {
         let resources = Self::parse_resources(&reader, resource_count, resource_offset)?;
 
         let mut index = HashMap::with_capacity(resources.len());
+        let mut duplicates = Vec::new();
         for (i, res) in resources.iter().enumerate() {
-            index.insert((res.name.to_ascii_uppercase(), res.res_type), i);
+            let key = (res.name.to_ascii_uppercase(), res.res_type);
+            // `insert` overwrites, so a duplicate (name, type) resolves to its
+            // last occurrence. Record the collision for a caller warning.
+            if index.insert(key.clone(), i).is_some() {
+                duplicates.push(key);
+            }
         }
 
         Ok(KeyFile {
             bifs,
             resources,
             index,
+            duplicates,
         })
     }
 
@@ -160,17 +177,23 @@ impl KeyFile {
         self.index.get(&key).and_then(|&i| self.resources.get(i))
     }
 
-    /// All resources sharing a name, regardless of type. Used to disambiguate a
-    /// query given without an extension.
-    pub fn find_by_name(&self, name: &str) -> Vec<&ResourceEntry> {
+    /// All resources whose name starts with `prefix` (case-insensitive). Drives
+    /// prefix search.
+    pub fn find_by_prefix(&self, prefix: &str) -> Vec<&ResourceEntry> {
         self.resources
             .iter()
-            .filter(|res| res.name.eq_ignore_ascii_case(name))
+            .filter(|res| crate::starts_with_ignore_ascii_case(&res.name, prefix))
             .collect()
     }
 
     pub fn bif_name(&self, index: usize) -> Option<&str> {
         self.bifs.get(index).map(String::as_str)
+    }
+
+    /// (UPPERCASE name, type) pairs the KEY lists more than once. Empty for a
+    /// clean KEY.
+    pub fn duplicates(&self) -> &[(String, u16)] {
+        &self.duplicates
     }
 
     /// A high-level summary of the index: archive and resource counts, and a
@@ -312,4 +335,54 @@ pub fn extension_type(ext: &str) -> Option<u16> {
         _ => return None,
     };
     Some(res_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal one-BIF KEY from `(name, type, locator)` resource rows.
+    fn build_key(resources: &[(&str, u16, u32)]) -> Vec<u8> {
+        let name = b"x.bif\0";
+        let bif_name_offset = (0x18 + BIF_ENTRY_LEN) as u32;
+        let resource_offset = bif_name_offset + name.len() as u32;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(KEY_SIGNATURE);
+        buf.extend_from_slice(KEY_VERSION);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // bif count
+        buf.extend_from_slice(&(resources.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0x18u32.to_le_bytes()); // bif offset
+        buf.extend_from_slice(&resource_offset.to_le_bytes());
+        // BIF entry @ 0x18: length, name offset, name length, location.
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&bif_name_offset.to_le_bytes());
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(name);
+        for (n, t, loc) in resources {
+            let mut field = [0u8; 8];
+            field[..n.len()].copy_from_slice(n.as_bytes());
+            buf.extend_from_slice(&field);
+            buf.extend_from_slice(&t.to_le_bytes());
+            buf.extend_from_slice(&loc.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn detects_duplicate_and_keeps_last() {
+        let key = KeyFile::parse(&build_key(&[("FOO", 1, 1), ("BAR", 1, 9), ("FOO", 1, 2)]))
+            .expect("parse");
+        // The repeated (FOO, type 1) is reported once.
+        assert_eq!(key.duplicates(), &[("FOO".to_string(), 1)]);
+        // Resolution keeps the last occurrence (locator 2).
+        assert_eq!(key.lookup("foo", 1).expect("found").file_index(), 2);
+    }
+
+    #[test]
+    fn clean_key_has_no_duplicates() {
+        let key = KeyFile::parse(&build_key(&[("BAZ", 2, 5), ("QUX", 3, 6)])).expect("parse");
+        assert!(key.duplicates().is_empty());
+    }
 }

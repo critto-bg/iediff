@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use formats::key::{extension_type, type_extension};
-use resource::{ResourceManager, Source};
+use resource::{ResourceError, ResourceManager, SearchResults, Source};
 
 const DEFAULT_KEY_PATH: &str = "game/chitin.key";
 
@@ -96,6 +96,14 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// ASCII case-insensitive prefix test, without allocating. Resrefs are ASCII,
+/// so this is the basis of case-insensitive name and prefix matching.
+pub fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    let h = haystack.as_bytes();
+    let p = prefix.as_bytes();
+    h.len() >= p.len() && h.iter().zip(p).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
 /// Decode a NUL-terminated (and possibly NUL-padded) ASCII field. Trailing
 /// garbage after the first NUL is ignored, per the format conventions.
 pub fn parse_asciiz(bytes: &[u8]) -> String {
@@ -145,12 +153,16 @@ pub fn decrypt_text(bytes: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-/// Look up a single resource and print it, noting where it was resolved from.
-///
-/// The query may include an extension (`ABCLASRQ.2da`) to pin the type, or omit
-/// it (`ABCLASRQ`). Without an extension, an unambiguous match is loaded; an
-/// ambiguous one lists the override and archive variants so the caller can pick
-/// a type. `source` carries the `--biff` choice (skip the override layer).
+/// Maximum matches listed per group before truncating, so a short prefix can't
+/// flood the terminal.
+const SEARCH_LIMIT: usize = 200;
+
+/// Resolve a query and print it. A query loads a single resource only when it
+/// fully specifies both name and type (`AERIE6.cre`) and that resource exists;
+/// every other query — a name without an extension, or a `name.ext` with no
+/// exact match — is treated as a case-insensitive prefix search and lists the
+/// matches. An empty name (e.g. `.cre`) is an error. `source` carries the
+/// `--biff` choice (skip the override layer).
 fn lookup_and_print(
     out: &mut impl Write,
     manager: &mut ResourceManager,
@@ -163,63 +175,91 @@ fn lookup_and_print(
         None => (query, None),
     };
 
-    let res_type = match ext {
-        Some(ext) => match extension_type(&ext.to_ascii_lowercase()) {
-            Some(res_type) => res_type,
-            None => return Err(format!("unknown resource extension: .{ext}").into()),
-        },
-        // No extension: resolve the type by name. `--biff` hides the override
-        // layer; otherwise the two layers are listed separately when ambiguous.
-        None => {
-            let matches = manager.matches(stem);
-            let over: &[u16] = if source == Source::Biff {
-                &[]
-            } else {
-                &matches.over
-            };
-            let biff = &matches.biff;
-
-            let mut types: Vec<u16> = over.iter().chain(biff.iter()).copied().collect();
-            types.sort_unstable();
-            types.dedup();
-
-            match types.as_slice() {
-                [] => return Err(format!("resource not found: {query}").into()),
-                [only] => *only,
-                _ => {
-                    writeln!(out, "'{stem}' is ambiguous; specify an extension:")?;
-                    if !over.is_empty() {
-                        writeln!(out, "  override:")?;
-                        for res_type in over {
-                            writeln!(out, "    {stem}.{}", type_extension(*res_type))?;
-                        }
-                    }
-                    if !biff.is_empty() {
-                        writeln!(out, "  biff:")?;
-                        for res_type in biff {
-                            writeln!(out, "    {stem}.{}", type_extension(*res_type))?;
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    };
-
-    let loaded = manager.load(stem, res_type, source)?;
-    if raw {
-        loaded.resource.write_raw(out)?;
-    } else {
-        writeln!(
-            out,
-            "{}.{}  ({})",
-            stem,
-            type_extension(res_type),
-            loaded.origin
-        )?;
-        write!(out, "{}", loaded.resource)?;
+    if stem.is_empty() {
+        return Err(format!("no resource name in query: {query:?}").into());
     }
 
+    let type_filter = match ext {
+        None => None,
+        Some("") => return Err(format!("malformed query (empty extension): {query:?}").into()),
+        Some(ext) => match extension_type(&ext.to_ascii_lowercase()) {
+            Some(res_type) => Some(res_type),
+            None => return Err(format!("unknown resource extension: .{ext}").into()),
+        },
+    };
+
+    // An exact hit needs both name and type. Try it; a not-found falls through
+    // to prefix search (within that type). A name with no type is always a
+    // search.
+    if let Some(res_type) = type_filter {
+        match manager.load(stem, res_type, source) {
+            Ok(loaded) => {
+                if raw {
+                    loaded.resource.write_raw(out)?;
+                } else {
+                    writeln!(
+                        out,
+                        "{}.{}  ({})",
+                        stem,
+                        type_extension(res_type),
+                        loaded.origin
+                    )?;
+                    write!(out, "{}", loaded.resource)?;
+                }
+                return Ok(());
+            }
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let results = manager.search(stem, type_filter, source);
+    print_search(out, stem, type_filter, &results)
+}
+
+/// Print prefix-search results, grouped by override vs biff.
+fn print_search(
+    out: &mut impl Write,
+    prefix: &str,
+    type_filter: Option<u16>,
+    results: &SearchResults,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let suffix = match type_filter {
+        Some(res_type) => format!(".{}", type_extension(res_type)),
+        None => String::new(),
+    };
+
+    if results.total() == 0 {
+        writeln!(out, "no matches for '{prefix}*{suffix}'")?;
+        return Ok(());
+    }
+
+    writeln!(
+        out,
+        "{} match(es) for '{prefix}*{suffix}':",
+        results.total()
+    )?;
+    print_group(out, "override", &results.over)?;
+    print_group(out, "biff", &results.biff)?;
+    Ok(())
+}
+
+/// Print one group of search hits, truncated at [`SEARCH_LIMIT`].
+fn print_group(
+    out: &mut impl Write,
+    label: &str,
+    hits: &[resource::SearchHit],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "  {label}:")?;
+    for hit in hits.iter().take(SEARCH_LIMIT) {
+        writeln!(out, "    {}.{}", hit.name, type_extension(hit.res_type))?;
+    }
+    if hits.len() > SEARCH_LIMIT {
+        writeln!(out, "    … and {} more", hits.len() - SEARCH_LIMIT)?;
+    }
     Ok(())
 }
 
@@ -255,6 +295,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut manager = ResourceManager::open(Path::new(DEFAULT_KEY_PATH))?;
+    warn_duplicates(manager.key());
     match query {
         None => write!(out, "{}", manager.key().stats())?,
         // A `strref:N` query resolves a TLK string; anything else is a resource.
@@ -265,6 +306,27 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Warn (to stderr) when the KEY lists the same resource more than once — a
+/// modded `chitin.key` can do this. Resolution keeps the last entry; this just
+/// surfaces the anomaly so it isn't silent.
+fn warn_duplicates(key: &formats::key::KeyFile) {
+    const SHOWN: usize = 10;
+    let dupes = key.duplicates();
+    if dupes.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: KEY lists {} duplicate resource(s); the last entry of each wins",
+        dupes.len()
+    );
+    for (name, res_type) in dupes.iter().take(SHOWN) {
+        eprintln!("  {}.{}", name, type_extension(*res_type));
+    }
+    if dupes.len() > SHOWN {
+        eprintln!("  … and {} more", dupes.len() - SHOWN);
+    }
 }
 
 fn main() -> ExitCode {

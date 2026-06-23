@@ -256,12 +256,34 @@ pub struct Loaded {
     pub resource: Resource,
 }
 
-/// Resource types found for a name, grouped by where they live.
-pub struct NameMatches {
-    /// Types present in the override directory.
-    pub over: Vec<u16>,
-    /// Types present in the BIF archives (via the KEY).
-    pub biff: Vec<u16>,
+/// One resource matched by a prefix search: its name and type.
+pub struct SearchHit {
+    pub name: String,
+    pub res_type: u16,
+}
+
+/// Prefix-search results, grouped by where the resources live. Each group is
+/// sorted by name then type.
+pub struct SearchResults {
+    pub over: Vec<SearchHit>,
+    pub biff: Vec<SearchHit>,
+}
+
+impl SearchResults {
+    /// Total number of matches across both layers.
+    pub fn total(&self) -> usize {
+        self.over.len() + self.biff.len()
+    }
+}
+
+/// Collect (name, type) pairs into [`SearchHit`]s sorted by name then type. The
+/// KEY guarantees distinct (name, type) entries, so no deduplication is needed.
+fn sorted_hits(items: impl Iterator<Item = (String, u16)>) -> Vec<SearchHit> {
+    let mut hits: Vec<SearchHit> = items
+        .map(|(name, res_type)| SearchHit { name, res_type })
+        .collect();
+    hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.res_type.cmp(&b.res_type)));
+    hits
 }
 
 /// Loads a KEY and serves resource bytes out of the BIFs it indexes.
@@ -542,28 +564,33 @@ impl ResourceManager {
         }
     }
 
-    /// Resource types available for a name, split by where they live. Drives
-    /// disambiguation of an extension-less query.
-    pub fn matches(&self, name: &str) -> NameMatches {
-        let mut over: Vec<u16> = self
-            .over
-            .find_by_name(name)
-            .iter()
-            .map(|entry| entry.res_type)
-            .collect();
-        over.sort_unstable();
-        over.dedup();
+    /// Resources whose name starts with `prefix`, optionally filtered to a single
+    /// type, grouped by override vs biff. `--biff` (`source`) hides the override
+    /// layer. Each group is sorted by name then type.
+    pub fn search(&self, prefix: &str, type_filter: Option<u16>, source: Source) -> SearchResults {
+        let keep = |res_type: u16| type_filter.map_or(true, |t| t == res_type);
 
-        let mut biff: Vec<u16> = self
-            .key
-            .find_by_name(name)
-            .iter()
-            .map(|res| res.res_type())
-            .collect();
-        biff.sort_unstable();
-        biff.dedup();
+        let over = if source == Source::Biff {
+            Vec::new()
+        } else {
+            sorted_hits(
+                self.over
+                    .find_by_prefix(prefix)
+                    .iter()
+                    .filter(|e| keep(e.res_type))
+                    .map(|e| (e.name.clone(), e.res_type)),
+            )
+        };
 
-        NameMatches { over, biff }
+        let biff = sorted_hits(
+            self.key
+                .find_by_prefix(prefix)
+                .iter()
+                .filter(|res| keep(res.res_type()))
+                .map(|res| (res.name().to_string(), res.res_type())),
+        );
+
+        SearchResults { over, biff }
     }
 
     /// Best-effort resolve a strref to its TLK string for display. `None` for
@@ -802,11 +829,11 @@ impl Override {
             .map(|entry| entry.path.as_path())
     }
 
-    /// Every override entry sharing a name, regardless of type.
-    fn find_by_name(&self, name: &str) -> Vec<&OverrideEntry> {
+    /// Every override entry whose name starts with `prefix` (case-insensitive).
+    fn find_by_prefix(&self, prefix: &str) -> Vec<&OverrideEntry> {
         self.entries
             .iter()
-            .filter(|entry| entry.name.eq_ignore_ascii_case(name))
+            .filter(|entry| crate::starts_with_ignore_ascii_case(&entry.name, prefix))
             .collect()
     }
 }
