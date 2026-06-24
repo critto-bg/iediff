@@ -315,7 +315,7 @@ Options:
   --raw                 machine-readable key=value output (binary formats)
   --biff                bypass the override directory; read the archived original
 
-Decoded formats: 2da ids eff itm spl cre pro
+Decoded formats: 2da ids eff itm spl cre pro sto
 Other resource types are located and summarised (type, size) but not parsed.
 
 Reads game/chitin.key relative to the working directory.

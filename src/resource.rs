@@ -20,6 +20,7 @@ use crate::formats::itm::{ITM_TYPE, Itm, ItmError};
 use crate::formats::key::{KeyError, KeyFile, extension_type, type_extension};
 use crate::formats::pro::{PRO_TYPE, Pro, ProError};
 use crate::formats::spl::{SPL_TYPE, Spl, SplError};
+use crate::formats::sto::{STO_TYPE, Sto, StoError};
 use crate::formats::tlk::{TlkError, TlkFile};
 use crate::formats::twoda::{TWODA_TYPE, TwoDA, TwoDAError};
 
@@ -40,6 +41,7 @@ pub enum ResourceError {
     Spl(SplError),
     Cre(CreError),
     Pro(ProError),
+    Sto(StoError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -62,6 +64,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Spl(e) => write!(f, "{e}"),
             ResourceError::Cre(e) => write!(f, "{e}"),
             ResourceError::Pro(e) => write!(f, "{e}"),
+            ResourceError::Sto(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -85,6 +88,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Spl(e) => Some(e),
             ResourceError::Cre(e) => Some(e),
             ResourceError::Pro(e) => Some(e),
+            ResourceError::Sto(e) => Some(e),
             _ => None,
         }
     }
@@ -147,6 +151,12 @@ impl From<CreError> for ResourceError {
 impl From<ProError> for ResourceError {
     fn from(e: ProError) -> Self {
         ResourceError::Pro(e)
+    }
+}
+
+impl From<StoError> for ResourceError {
+    fn from(e: StoError) -> Self {
+        ResourceError::Sto(e)
     }
 }
 
@@ -252,6 +262,7 @@ pub enum Resource {
     Spl(Spl),
     Cre(Cre),
     Pro(Pro),
+    Sto(Sto),
     Other(ResourceInfo),
 }
 
@@ -265,6 +276,7 @@ impl fmt::Display for Resource {
             Resource::Spl(spl) => write!(f, "{spl}"),
             Resource::Cre(cre) => write!(f, "{cre}"),
             Resource::Pro(pro) => write!(f, "{pro}"),
+            Resource::Sto(sto) => write!(f, "{sto}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -281,6 +293,7 @@ impl Resource {
             Resource::Spl(spl) => spl.write_raw(out),
             Resource::Cre(cre) => cre.write_raw(out),
             Resource::Pro(pro) => pro.write_raw(out),
+            Resource::Sto(sto) => sto.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => write!(out, "{table}"),
             Resource::Other(info) => write!(out, "{info}"),
@@ -637,6 +650,38 @@ impl ResourceManager {
                 }
 
                 Resource::Pro(pro)
+            }
+            STO_TYPE => {
+                let mut sto = Sto::parse(&self.read_located(&located)?)?;
+
+                // The store's own name from the TLK.
+                let name = self.string_label(sto.name_strref());
+                sto.set_name(name);
+
+                // Sale items reference ITMs and cures reference SPLs; resolve
+                // their display names the same way creature inventories do.
+                self.resolve_refs(
+                    sto.sale_mut(),
+                    ITM_TYPE,
+                    |s| s.resource(),
+                    |s, n| s.set_name(n),
+                );
+                self.resolve_refs(
+                    sto.cures_mut(),
+                    SPL_TYPE,
+                    |c| c.resource(),
+                    |c, n| c.set_name(n),
+                );
+
+                // Each drink names itself through the TLK.
+                let strrefs: Vec<u32> = sto.drinks_mut().iter().map(|d| d.name_strref()).collect();
+                let names: Vec<Option<String>> =
+                    strrefs.into_iter().map(|s| self.string_label(s)).collect();
+                for (drink, name) in sto.drinks_mut().iter_mut().zip(names) {
+                    drink.set_name(name);
+                }
+
+                Resource::Sto(sto)
             }
             _ => Resource::Other(self.info_located(&located)?),
         };

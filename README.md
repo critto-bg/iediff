@@ -15,7 +15,7 @@ patch it, and verify the change.
 
 ## Status
 
-Parses and prints these formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO (atop the
+Parses and prints these formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO (atop the
 KEY/BIF/TLK index layer). Other resource types are located and summarised (type
 and size) but not yet decoded. Diffing is not implemented yet.
 
@@ -41,7 +41,7 @@ iediff --help         # usage guide
 Options: `--raw` (machine-readable `key=value` output), `--biff` (bypass the
 override directory and read the archived original).
 
-Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO. Other resource types are
+Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO. Other resource types are
 located and summarised (type, size) but not parsed. Runs against
 `game/chitin.key` relative to the working directory.
 
