@@ -325,7 +325,9 @@ pub struct CreItem {
 /// `eff_version`.
 enum CreEffect {
     V1(Feature),
-    V2(Eff),
+    /// Boxed: a V2 body is far larger than a V1 feature, and effects are stored
+    /// in a `Vec`, so this keeps the common V1 element small.
+    V2(Box<Eff>),
 }
 
 impl KnownSpell {
@@ -480,7 +482,7 @@ impl Cre {
         for i in 0..effects_count {
             let base = effects_off + i * eff_size;
             let effect = if header.eff_version == 1 {
-                CreEffect::V2(Eff::parse_embedded_at(&reader, base)?)
+                CreEffect::V2(Box::new(Eff::parse_embedded_at(&reader, base)?))
             } else {
                 CreEffect::V1(Feature::parse_at(&reader, base)?)
             };

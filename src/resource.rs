@@ -240,6 +240,10 @@ impl fmt::Display for OverrideStats {
 /// A loaded resource: a parsed view for formats we understand, otherwise the
 /// basic metadata. Renders itself via [`Display`](fmt::Display), so callers
 /// print it without knowing the concrete format.
+// Variants differ a lot in size (CRE is the largest), but exactly one short-lived
+// value exists per CLI invocation, so the layout doesn't matter — boxing would
+// only add indirection for no benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum Resource {
     Ids(IdsFile),
     TwoDA(TwoDA),
@@ -435,13 +439,13 @@ impl ResourceManager {
     /// Resolve a resource to a concrete location: an override file when one
     /// exists (and `source` permits it), otherwise the BIF the KEY points at.
     fn locate(&self, name: &str, res_type: u16, source: Source) -> Option<Located> {
-        if source == Source::Auto {
-            if let Some(path) = self.over.path(name, res_type) {
-                return Some(Located::Override {
-                    path: path.to_path_buf(),
-                    res_type,
-                });
-            }
+        if source == Source::Auto
+            && let Some(path) = self.over.path(name, res_type)
+        {
+            return Some(Located::Override {
+                path: path.to_path_buf(),
+                res_type,
+            });
         }
 
         let res = self.key.lookup(name, res_type)?;
@@ -686,7 +690,7 @@ impl ResourceManager {
     /// type, grouped by override vs biff. `--biff` (`source`) hides the override
     /// layer. Each group is sorted by name then type.
     pub fn search(&self, prefix: &str, type_filter: Option<u16>, source: Source) -> SearchResults {
-        let keep = |res_type: u16| type_filter.map_or(true, |t| t == res_type);
+        let keep = |res_type: u16| type_filter.is_none_or(|t| t == res_type);
 
         let over = if source == Source::Biff {
             Vec::new()

@@ -320,7 +320,8 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     warn_duplicates(manager.key());
     match query {
         None => {
-            write!(out, "{}\n", manager.key().stats())?;
+            write!(out, "{}", manager.key().stats())?;
+            writeln!(out)?;
             write!(out, "{}", manager.override_stats())?;
         }
         // A `strref:N` query resolves a TLK string; anything else is a resource.
