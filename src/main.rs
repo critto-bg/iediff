@@ -319,7 +319,10 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut manager = ResourceManager::open(Path::new(DEFAULT_KEY_PATH))?;
     warn_duplicates(manager.key());
     match query {
-        None => write!(out, "{}", manager.key().stats())?,
+        None => {
+            write!(out, "{}\n", manager.key().stats())?;
+            write!(out, "{}", manager.override_stats())?;
+        }
         // A `strref:N` query resolves a TLK string; anything else is a resource.
         Some(query) => match query.strip_prefix("strref:") {
             Some(number) => print_string(out, &mut manager, number)?,

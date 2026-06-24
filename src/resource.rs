@@ -193,6 +193,50 @@ impl fmt::Display for ResourceInfo {
     }
 }
 
+/// Summary of the override directory. See [`ResourceManager::override_stats`].
+pub struct OverrideStats {
+    /// Whether the `override` directory exists at all.
+    pub present: bool,
+    /// Addressable resources found (files whose extension names a known type).
+    pub resources: usize,
+    /// How many of those shadow a resource the KEY also lists.
+    pub shadowing: usize,
+    /// (resource type, count), most common first.
+    pub by_type: Vec<(u16, usize)>,
+}
+
+impl fmt::Display for OverrideStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.present {
+            return writeln!(f, "override: not present");
+        }
+
+        if self.resources == 0 {
+            return writeln!(f, "override: empty");
+        }
+
+        let fresh = self.resources - self.shadowing;
+        writeln!(
+            f,
+            "override: {} resources ({} new, {} shadowing archived)",
+            self.resources, fresh, self.shadowing
+        )?;
+
+        writeln!(f, "override by type:")?;
+        for (res_type, count) in &self.by_type {
+            writeln!(
+                f,
+                "  {:<5} (0x{:04x})  {:>6}",
+                type_extension(*res_type),
+                res_type,
+                count
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
 /// A loaded resource: a parsed view for formats we understand, otherwise the
 /// basic metadata. Renders itself via [`Display`](fmt::Display), so callers
 /// print it without knowing the concrete format.
@@ -364,6 +408,28 @@ impl ResourceManager {
     /// The underlying KEY index.
     pub fn key(&self) -> &KeyFile {
         &self.key
+    }
+
+    /// A summary of the override directory: how many addressable resources it
+    /// holds, how many shadow an archived copy, and a per-type breakdown.
+    pub fn override_stats(&self) -> OverrideStats {
+        let mut counts: HashMap<u16, usize> = HashMap::new();
+        let mut shadowing = 0;
+        for entry in &self.over.entries {
+            *counts.entry(entry.res_type).or_insert(0) += 1;
+            if self.key.lookup(&entry.name, entry.res_type).is_some() {
+                shadowing += 1;
+            }
+        }
+        let mut by_type: Vec<(u16, usize)> = counts.into_iter().collect();
+        by_type.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        OverrideStats {
+            present: self.over.present,
+            resources: self.over.entries.len(),
+            shadowing,
+            by_type,
+        }
     }
 
     /// Resolve a resource to a concrete location: an override file when one
@@ -824,6 +890,8 @@ struct OverrideEntry {
 /// An index of the override directory. Files are named `<resref>.<ext>`; one
 /// whose extension maps to a known type shadows the same resource in the BIFs.
 struct Override {
+    /// Whether the `override` directory exists at all (vs. present but empty).
+    present: bool,
     entries: Vec<OverrideEntry>,
     /// (UPPERCASE resref, type) -> index into `entries`. First file wins.
     index: HashMap<(String, u16), usize>,
@@ -838,7 +906,13 @@ impl Override {
 
         let read_dir = match std::fs::read_dir(game_dir.join("override")) {
             Ok(read_dir) => read_dir,
-            Err(_) => return Override { entries, index },
+            Err(_) => {
+                return Override {
+                    present: false,
+                    entries,
+                    index,
+                };
+            }
         };
 
         for entry in read_dir.flatten() {
@@ -869,7 +943,11 @@ impl Override {
             });
         }
 
-        Override { entries, index }
+        Override {
+            present: true,
+            entries,
+            index,
+        }
     }
 
     /// Path of the override file for this name and type, if present.
