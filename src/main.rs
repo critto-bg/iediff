@@ -84,9 +84,21 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    /// Read a fixed `N`-byte array at `offset` (e.g. a 4-byte tag or a packed
+    /// colour run). Bounds-checked via [`slice`](Reader::slice), so the
+    /// `copy_from_slice` can never panic.
+    pub fn array_at<const N: usize>(
+        &self,
+        offset: usize,
+        context: &'static str,
+    ) -> Result<[u8; N], Truncated> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.slice(offset, N, context)?);
+        Ok(out)
+    }
+
     pub fn tag_at(&self, offset: usize, context: &'static str) -> Result<[u8; 4], Truncated> {
-        let b = self.slice(offset, 4, context)?;
-        Ok([b[0], b[1], b[2], b[3]])
+        self.array_at(offset, context)
     }
 
     /// Read an 8-byte resref field (a NUL-padded resource name), trimming its
@@ -128,6 +140,16 @@ pub fn describe_tag(tag: &[u8; 4]) -> String {
         .collect();
     let hex: Vec<String> = tag.iter().map(|b| format!("{b:02x}")).collect();
     format!("\"{printable}\" ({})", hex.join(" "))
+}
+
+/// Render a byte slice as comma-separated decimals, for raw field output of
+/// packed byte runs (e.g. a projectile's colour indices).
+pub fn join_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The 64-byte key used to XOR-encrypt some text resources (mainly IDS, and

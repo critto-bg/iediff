@@ -18,6 +18,7 @@ use crate::formats::eff::{EFF_TYPE, Eff, EffError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
 use crate::formats::itm::{ITM_TYPE, Itm, ItmError};
 use crate::formats::key::{KeyError, KeyFile, extension_type, type_extension};
+use crate::formats::pro::{PRO_TYPE, Pro, ProError};
 use crate::formats::spl::{SPL_TYPE, Spl, SplError};
 use crate::formats::tlk::{TlkError, TlkFile};
 use crate::formats::twoda::{TWODA_TYPE, TwoDA, TwoDAError};
@@ -38,6 +39,7 @@ pub enum ResourceError {
     Itm(ItmError),
     Spl(SplError),
     Cre(CreError),
+    Pro(ProError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -59,6 +61,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Itm(e) => write!(f, "{e}"),
             ResourceError::Spl(e) => write!(f, "{e}"),
             ResourceError::Cre(e) => write!(f, "{e}"),
+            ResourceError::Pro(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -81,6 +84,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Itm(e) => Some(e),
             ResourceError::Spl(e) => Some(e),
             ResourceError::Cre(e) => Some(e),
+            ResourceError::Pro(e) => Some(e),
             _ => None,
         }
     }
@@ -140,6 +144,12 @@ impl From<CreError> for ResourceError {
     }
 }
 
+impl From<ProError> for ResourceError {
+    fn from(e: ProError) -> Self {
+        ResourceError::Pro(e)
+    }
+}
+
 /// Where to resolve a resource from. `Auto` prefers an override file over the
 /// archived original; `Biff` ignores the override entirely (the `--biff` flag).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -193,6 +203,7 @@ pub enum Resource {
     Itm(Itm),
     Spl(Spl),
     Cre(Cre),
+    Pro(Pro),
     Other(ResourceInfo),
 }
 
@@ -205,6 +216,7 @@ impl fmt::Display for Resource {
             Resource::Itm(itm) => write!(f, "{itm}"),
             Resource::Spl(spl) => write!(f, "{spl}"),
             Resource::Cre(cre) => write!(f, "{cre}"),
+            Resource::Pro(pro) => write!(f, "{pro}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -220,6 +232,7 @@ impl Resource {
             Resource::Itm(itm) => itm.write_raw(out),
             Resource::Spl(spl) => spl.write_raw(out),
             Resource::Cre(cre) => cre.write_raw(out),
+            Resource::Pro(pro) => pro.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => write!(out, "{table}"),
             Resource::Other(info) => write!(out, "{info}"),
@@ -515,6 +528,45 @@ impl ResourceManager {
                 );
 
                 Resource::Cre(cre)
+            }
+            PRO_TYPE => {
+                let mut pro = Pro::parse(&self.read_located(&located)?)?;
+
+                // Header-level lookups: particle color (SPRKLCLR.2DA), the
+                // targeting message (TLK), and the miss/success spell names.
+                let particle = self.dictionary_label("SPRKLCLR", pro.particle_color() as u32);
+                let message = self.string_label(pro.message_strref());
+                let default = pro.default_spell().to_string();
+                let success = pro.success_spell().to_string();
+                let default_name = self
+                    .resource_names(&default, SPL_TYPE)
+                    .display()
+                    .map(str::to_string);
+                let success_name = self
+                    .resource_names(&success, SPL_TYPE)
+                    .display()
+                    .map(str::to_string);
+                pro.set_header_names(particle, message, default_name, success_name);
+
+                // Travel struct: the smoke animation indexes animate.ids.
+                if let Some(code) = pro.travel_smoke() {
+                    let name = self.ids_label("ANIMATE", code as i64);
+                    pro.set_travel_smoke_name(name);
+                }
+
+                // Area struct: fragment/smoke via animate.ids, the two
+                // projectiles via projectl.ids (the secondary off by one, like
+                // an SPL ext-header), the explosion effect via fireball.ids.
+                if let Some(codes) = pro.area_codes() {
+                    let fragment = self.ids_label("ANIMATE", codes.fragment_animation as i64);
+                    let secondary =
+                        self.ids_label("PROJECTL", codes.secondary_projectile as i64 - 1);
+                    let explosion = self.ids_label("PROJECTL", codes.explosion_projectile as i64);
+                    let effect = self.ids_label("FIREBALL", codes.explosion_effect as i64);
+                    pro.set_area_names(fragment, secondary, explosion, effect);
+                }
+
+                Resource::Pro(pro)
             }
             _ => Resource::Other(self.info_located(&located)?),
         };

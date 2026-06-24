@@ -12,6 +12,7 @@ pub mod ids;
 pub mod itm;
 pub mod key;
 pub mod opcode;
+pub mod pro;
 pub mod spl;
 pub mod tlk;
 pub mod twoda;
