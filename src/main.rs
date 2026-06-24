@@ -300,10 +300,33 @@ fn print_string(
     Ok(())
 }
 
+/// Short usage guide. `--help` and a bare invocation print this; it needs no
+/// game data, so it works without a readable KEY.
+const USAGE: &str = "\
+iediff — inspect Infinity Engine resources (BG2:EE)
+
+Usage:
+  iediff <name>[.ext]   print a resource; a bare name or an inexact match runs a prefix search
+  iediff strref:<n>     resolve a dialog.tlk string by index
+  iediff --stats        summarise the KEY index and override directory
+  iediff [--help|-h]    show this help
+
+Options:
+  --raw                 machine-readable key=value output (binary formats)
+  --biff                bypass the override directory; read the archived original
+
+Decoded formats: 2da ids eff itm spl cre pro
+Other resource types are located and summarised (type, size) but not parsed.
+
+Reads game/chitin.key relative to the working directory.
+";
+
 fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut query: Option<String> = None;
     let mut source = Source::Auto;
     let mut raw = false;
+    let mut stats = false;
+    let mut help = false;
 
     for arg in env::args().skip(1) {
         match arg.as_str() {
@@ -311,24 +334,37 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
             "--biff" => source = Source::Biff,
             // Emit the machine-readable `key=value` view instead of the human one.
             "--raw" => raw = true,
+            // Summarise the KEY index and override directory.
+            "--stats" => stats = true,
+            "--help" | "-h" => help = true,
             _ if query.is_none() => query = Some(arg),
             _ => return Err(format!("unexpected argument: {arg}").into()),
         }
     }
 
+    if help || (query.is_none() && !stats) {
+        write!(out, "{USAGE}")?;
+        return Ok(());
+    }
+
     let mut manager = ResourceManager::open(Path::new(DEFAULT_KEY_PATH))?;
     warn_duplicates(manager.key());
-    match query {
-        None => {
-            write!(out, "{}", manager.key().stats())?;
-            writeln!(out)?;
-            write!(out, "{}", manager.override_stats())?;
-        }
+
+    if stats {
+        write!(out, "{}", manager.key().stats())?;
+        writeln!(out)?;
+        write!(out, "{}", manager.override_stats())?;
+        return Ok(());
+    }
+
+    // The guard above guarantees a query here; the `None` arm is an inert
+    // fallback rather than a panic.
+    if let Some(query) = query {
         // A `strref:N` query resolves a TLK string; anything else is a resource.
-        Some(query) => match query.strip_prefix("strref:") {
+        match query.strip_prefix("strref:") {
             Some(number) => print_string(out, &mut manager, number)?,
             None => lookup_and_print(out, &mut manager, &query, source, raw)?,
-        },
+        }
     }
 
     Ok(())

@@ -15,7 +15,9 @@ patch it, and verify the change.
 
 ## Status
 
-Early bootstrap. No commands implemented yet.
+Parses and prints these formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO (atop the
+KEY/BIF/TLK index layer). Other resource types are located and summarised (type
+and size) but not yet decoded. Diffing is not implemented yet.
 
 ## Build
 
@@ -26,6 +28,22 @@ cargo run
 
 Rust only, standard library only — no external crates (this is an educational
 project).
+
+## Usage
+
+```sh
+iediff <name>[.ext]   # print a resource; a bare name or inexact match runs a prefix search
+iediff strref:<n>     # resolve a dialog.tlk string by index
+iediff --stats        # summarise the KEY index and override directory
+iediff --help         # usage guide
+```
+
+Options: `--raw` (machine-readable `key=value` output), `--biff` (bypass the
+override directory and read the archived original).
+
+Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO. Other resource types are
+located and summarised (type, size) but not parsed. Runs against
+`game/chitin.key` relative to the working directory.
 
 ## Local setup
 
