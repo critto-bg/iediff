@@ -34,16 +34,20 @@ project).
 ```sh
 iediff <name>[.ext]   # print a resource; a bare name or inexact match runs a prefix search
 iediff strref:<n>     # resolve a dialog.tlk string by index
+iediff --file <path>  # print a discrete file by path, bypassing the index
 iediff --stats        # summarise the KEY index and override directory
 iediff --help         # usage guide
 ```
 
 Options: `--raw` (machine-readable `key=value` output), `--biff` (bypass the
-override directory and read the archived original).
+override directory and read the archived original), `--file` (read the argument
+as a filesystem path, taking the type from its extension; referenced names still
+resolve against the game directory — handy for inspecting modded resources before
+they are copied into `override`).
 
 Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO. Other resource types are
-located and summarised (type, size) but not parsed. Runs against
-`game/chitin.key` relative to the working directory.
+located and summarised (type, size) but not parsed. Runs against `./chitin.key`
+when present (so it works from a game root), else `game/chitin.key`.
 
 ## Local setup
 

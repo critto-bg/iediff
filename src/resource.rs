@@ -174,6 +174,8 @@ pub enum Origin {
     Override(PathBuf),
     /// A BIF archive, by the name the KEY lists.
     Bif(String),
+    /// A discrete file read straight from disk (`--file`), bypassing the index.
+    File(PathBuf),
 }
 
 impl fmt::Display for Origin {
@@ -181,6 +183,7 @@ impl fmt::Display for Origin {
         match self {
             Origin::Override(path) => write!(f, "override: {}", path.display()),
             Origin::Bif(bif) => write!(f, "biff: {bif}"),
+            Origin::File(path) => write!(f, "file: {}", path.display()),
         }
     }
 }
@@ -305,7 +308,6 @@ impl Resource {
 enum Located {
     Override {
         path: PathBuf,
-        res_type: u16,
     },
     Bif {
         source: usize,
@@ -457,7 +459,6 @@ impl ResourceManager {
         {
             return Some(Located::Override {
                 path: path.to_path_buf(),
-                res_type,
             });
         }
 
@@ -488,11 +489,33 @@ impl ResourceManager {
                 })?;
 
         let origin = located.origin();
+        let data = self.read_located(&located)?;
+        let resource = self.decode(res_type, &data)?;
+        Ok(Loaded { origin, resource })
+    }
+
+    /// Load a discrete file straight from disk (the `--file` flag), bypassing
+    /// the KEY/override index entirely. Reference resolution still runs against
+    /// the established game directory, so a modded resource sitting in a mod
+    /// tree resolves its links against the install it will be copied into.
+    pub fn load_file(&mut self, path: &Path, res_type: u16) -> Result<Loaded, ResourceError> {
+        let data = std::fs::read(path)?;
+        let resource = self.decode(res_type, &data)?;
+        Ok(Loaded {
+            origin: Origin::File(path.to_path_buf()),
+            resource,
+        })
+    }
+
+    /// Parse a resource from its raw bytes and resolve its referenced names,
+    /// independent of where the bytes came from (BIF, override, or a discrete
+    /// file). Unsupported types fall back to a type/size summary.
+    fn decode(&mut self, res_type: u16, data: &[u8]) -> Result<Resource, ResourceError> {
         let resource = match res_type {
-            IDS_TYPE => Resource::Ids(IdsFile::parse(&self.read_located(&located)?)),
-            TWODA_TYPE => Resource::TwoDA(TwoDA::parse(&self.read_located(&located)?)?),
+            IDS_TYPE => Resource::Ids(IdsFile::parse(data)),
+            TWODA_TYPE => Resource::TwoDA(TwoDA::parse(data)?),
             EFF_TYPE => {
-                let mut eff = Eff::parse(&self.read_located(&located)?)?;
+                let mut eff = Eff::parse(data)?;
                 // The primary/secondary types index dictionary tables; resolve
                 // them to symbolic names for the human-readable view.
                 let primary = self.dictionary_label("MSCHOOL", eff.primary_type());
@@ -501,7 +524,7 @@ impl ResourceManager {
                 Resource::Eff(eff)
             }
             ITM_TYPE => {
-                let mut itm = Itm::parse(&self.read_located(&located)?)?;
+                let mut itm = Itm::parse(data)?;
                 // Each ability's primary/secondary type indexes the same
                 // dictionary tables as an EFF; resolve them per ability.
                 let codes: Vec<(u32, u32)> = itm
@@ -531,7 +554,7 @@ impl ResourceManager {
                 Resource::Itm(itm)
             }
             SPL_TYPE => {
-                let mut spl = Spl::parse(&self.read_located(&located)?)?;
+                let mut spl = Spl::parse(data)?;
 
                 let primary = self.dictionary_label("MSCHOOL", spl.primary_type());
                 let secondary = self.dictionary_label("MSECTYPE", spl.secondary_type());
@@ -565,7 +588,7 @@ impl ResourceManager {
                 Resource::Spl(spl)
             }
             CRE_TYPE => {
-                let mut cre = Cre::parse(&self.read_located(&located)?)?;
+                let mut cre = Cre::parse(data)?;
 
                 // Identity: names from the TLK, the IDS octet and animation from
                 // their IDS tables.
@@ -613,7 +636,7 @@ impl ResourceManager {
                 Resource::Cre(cre)
             }
             PRO_TYPE => {
-                let mut pro = Pro::parse(&self.read_located(&located)?)?;
+                let mut pro = Pro::parse(data)?;
 
                 // Header-level lookups: particle color (SPRKLCLR.2DA), the
                 // targeting message (TLK), and the miss/success spell names.
@@ -652,7 +675,7 @@ impl ResourceManager {
                 Resource::Pro(pro)
             }
             STO_TYPE => {
-                let mut sto = Sto::parse(&self.read_located(&located)?)?;
+                let mut sto = Sto::parse(data)?;
 
                 // The store's own name from the TLK.
                 let name = self.string_label(sto.name_strref());
@@ -683,10 +706,13 @@ impl ResourceManager {
 
                 Resource::Sto(sto)
             }
-            _ => Resource::Other(self.info_located(&located)?),
+            _ => Resource::Other(ResourceInfo {
+                res_type,
+                size: data.len() as u32,
+            }),
         };
 
-        Ok(Loaded { origin, resource })
+        Ok(resource)
     }
 
     /// Read a located resource's raw bytes — from disk (override) or the archive.
@@ -701,32 +727,6 @@ impl ResourceManager {
             } => {
                 let archive = self.archive_for(*source)?;
                 Ok(archive.read_resource(*file_index, *res_type)?)
-            }
-        }
-    }
-
-    /// Report a located resource's type and size without reading its bulk data.
-    fn info_located(&mut self, located: &Located) -> Result<ResourceInfo, ResourceError> {
-        match located {
-            Located::Override { path, res_type } => {
-                let size = std::fs::metadata(path)?.len() as u32;
-                Ok(ResourceInfo {
-                    res_type: *res_type,
-                    size,
-                })
-            }
-            Located::Bif {
-                source,
-                file_index,
-                res_type,
-                ..
-            } => {
-                let archive = self.archive_for(*source)?;
-                let size = archive.resource_size(*file_index, *res_type)?;
-                Ok(ResourceInfo {
-                    res_type: *res_type,
-                    size,
-                })
             }
         }
     }

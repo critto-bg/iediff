@@ -253,6 +253,35 @@ fn lookup_and_print(
     print_search(out, stem, type_filter, &results)
 }
 
+/// Print a discrete file given by path (`--file`), bypassing the KEY/override
+/// index. The resource type comes from the file's extension; referenced names
+/// still resolve against the game directory, so a modded file staged in a mod
+/// tree renders against the install it will be copied into.
+fn print_file(
+    out: &mut impl Write,
+    manager: &mut ResourceManager,
+    path: &str,
+    raw: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = Path::new(path);
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| format!("no extension to identify the resource type: {path:?}"))?;
+    let res_type = extension_type(&ext.to_ascii_lowercase())
+        .ok_or_else(|| format!("unknown resource extension: .{ext}"))?;
+
+    let loaded = manager.load_file(file, res_type)?;
+    if raw {
+        loaded.resource.write_raw(out)?;
+    } else {
+        let name = file.file_name().and_then(|n| n.to_str()).unwrap_or(path);
+        writeln!(out, "{name}  ({})", loaded.origin)?;
+        write!(out, "{}", loaded.resource)?;
+    }
+    Ok(())
+}
+
 /// Print prefix-search results, grouped by override vs biff.
 fn print_search(
     out: &mut impl Write,
@@ -322,12 +351,14 @@ iediff — inspect Infinity Engine resources (BG2:EE)
 Usage:
   iediff <name>[.ext]   print a resource; a bare name or an inexact match runs a prefix search
   iediff strref:<n>     resolve a dialog.tlk string by index
+  iediff --file <path>  print a discrete file by path, bypassing the index
   iediff --stats        summarise the KEY index and override directory
   iediff [--help|-h]    show this help
 
 Options:
   --raw                 machine-readable key=value output (binary formats)
   --biff                bypass the override directory; read the archived original
+  --file                read the argument as a filesystem path (type from its extension)
 
 Decoded formats: 2da ids eff itm spl cre pro sto
 Other resource types are located and summarised (type, size) but not parsed.
@@ -340,6 +371,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut source = Source::Auto;
     let mut raw = false;
     let mut stats = false;
+    let mut file = false;
     let mut help = false;
 
     for arg in env::args().skip(1) {
@@ -350,6 +382,8 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
             "--raw" => raw = true,
             // Summarise the KEY index and override directory.
             "--stats" => stats = true,
+            // Read the query as a filesystem path, bypassing the KEY/override index.
+            "--file" => file = true,
             "--help" | "-h" => help = true,
             _ if query.is_none() => query = Some(arg),
             _ => return Err(format!("unexpected argument: {arg}").into()),
@@ -363,6 +397,13 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut manager = ResourceManager::open(key_path())?;
     warn_duplicates(manager.key());
+
+    // `--file` reads a discrete file off disk; the index isn't consulted, but
+    // referenced names still resolve against the game directory.
+    if file {
+        let path = query.ok_or("--file needs a path to a resource file")?;
+        return print_file(out, &mut manager, &path, raw);
+    }
 
     if stats {
         write!(out, "{}", manager.key().stats())?;

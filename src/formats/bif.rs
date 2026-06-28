@@ -208,12 +208,6 @@ impl BifArchive {
         Ok(entry)
     }
 
-    /// Size in bytes of a resource, read from the entry table without touching
-    /// the bulk data.
-    pub fn resource_size(&self, file_index: u32, expected_type: u16) -> Result<u32, BifError> {
-        Ok(self.entry_for(file_index, expected_type)?.size)
-    }
-
     /// Extract a resource's raw bytes by its file index (locator bits 0-13).
     /// `expected_type` is the resource type the KEY recorded; it's cross-checked
     /// against the BIF's own type field.
