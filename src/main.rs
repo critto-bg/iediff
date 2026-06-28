@@ -17,7 +17,21 @@ use std::process::ExitCode;
 use formats::key::{extension_type, type_extension};
 use resource::{ResourceError, ResourceManager, SearchResults, Source};
 
+/// Looked for in the working directory first, so the binary can be dropped into
+/// (or `PATH`-invoked from) a game root. Falls back to the development install.
+const LOCAL_KEY_PATH: &str = "chitin.key";
 const DEFAULT_KEY_PATH: &str = "game/chitin.key";
+
+/// The `chitin.key` to open: the one in the working directory if it exists (a
+/// real game root), otherwise the development copy under `game/`.
+fn key_path() -> &'static Path {
+    let local = Path::new(LOCAL_KEY_PATH);
+    if local.is_file() {
+        local
+    } else {
+        Path::new(DEFAULT_KEY_PATH)
+    }
+}
 
 /// A read that ran past the end of the available bytes. Shared by all parsers;
 /// each format's error type wraps this via `From`.
@@ -318,7 +332,7 @@ Options:
 Decoded formats: 2da ids eff itm spl cre pro sto
 Other resource types are located and summarised (type, size) but not parsed.
 
-Reads game/chitin.key relative to the working directory.
+Reads ./chitin.key if present (run from a game root), else game/chitin.key.
 ";
 
 fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
@@ -347,7 +361,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut manager = ResourceManager::open(Path::new(DEFAULT_KEY_PATH))?;
+    let mut manager = ResourceManager::open(key_path())?;
     warn_duplicates(manager.key());
 
     if stats {
