@@ -16,11 +16,12 @@ patch it, and verify the change.
 ## Status
 
 Parses and prints these formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE
-(atop the KEY/BIF/TLK index layer). ARE decodes its content sections (actors,
-regions, containers/items, spawns, doors, ambients, animations, automap notes,
-variables); its geometry and a few save-only sections are only summarised. Other
-resource types are located and summarised (type and size) but not yet decoded.
-Diffing is not implemented yet.
+(atop the KEY/BIF/TLK index layer). ARE decodes every section — actors, regions,
+containers/items, spawns, doors, ambients, animations, automap notes, variables,
+tiled objects, projectile traps, songs, rest interruptions and the vertex pool;
+only the opaque explored-cell bitmap is reported by size alone. Other resource
+types are located and summarised (type and size) but not yet decoded. Diffing is
+not implemented yet.
 
 ## Build
 

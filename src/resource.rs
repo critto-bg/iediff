@@ -737,6 +737,16 @@ impl ResourceManager {
                     |it, n| it.set_name(n),
                 );
 
+                // Actor animations index animate.ids.
+                let anims: Vec<u32> = are.actors_mut().iter().map(|a| a.animation()).collect();
+                let names: Vec<Option<String>> = anims
+                    .into_iter()
+                    .map(|code| self.ids_label("ANIMATE", code as i64))
+                    .collect();
+                for (actor, name) in are.actors_mut().iter_mut().zip(names) {
+                    actor.set_animation_name(name);
+                }
+
                 // Each spawn point names up to ten creatures (or spawngrp.2da
                 // entries, which simply won't resolve).
                 for spawn in are.spawns_mut() {
@@ -746,6 +756,27 @@ impl ResourceManager {
                         |c| c.resource(),
                         |c, n| c.set_name(n),
                     );
+                }
+
+                // The rest-interruption table names its own creatures.
+                if let Some(rest) = are.rest_mut() {
+                    self.resolve_refs(
+                        rest.creatures_mut(),
+                        CRE_TYPE,
+                        |c| c.resource(),
+                        |c, n| c.set_name(n),
+                    );
+                }
+
+                // A projectile trap's missile indexes projectl.ids; the stored
+                // value is the ids number less one.
+                let missiles: Vec<u16> = are.proj_traps_mut().iter().map(|t| t.missile()).collect();
+                let names: Vec<Option<String>> = missiles
+                    .into_iter()
+                    .map(|m| self.ids_label("PROJECTL", m as i64 + 1))
+                    .collect();
+                for (trap, name) in are.proj_traps_mut().iter_mut().zip(names) {
+                    trap.set_missile_name(name);
                 }
 
                 // Strref-labelled sections: region info text, door speakers,

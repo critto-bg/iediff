@@ -37,6 +37,11 @@ const VARIABLE_SIZE: usize = 0x54;
 const DOOR_SIZE: usize = 0xc8;
 const ANIM_SIZE: usize = 0x4c;
 const AUTOMAP_SIZE: usize = 0x34;
+const VERTEX_SIZE: usize = 0x04;
+const TILED_SIZE: usize = 0x68;
+const PTRAP_SIZE: usize = 0x1c;
+const SONG_SIZE: usize = 0x90;
+const REST_SIZE: usize = 0xe4;
 
 /// Anything that can go wrong while parsing an ARE file.
 #[derive(Debug)]
@@ -112,10 +117,8 @@ struct AreHeader {
     east: Neighbor,
     south: Neighbor,
     west: Neighbor,
-    // Sections not decoded in phase 1, surfaced as counts/sizes.
-    vertices: u16,
-    tiled_objects: u32,
-    proj_traps: u32,
+    /// Size in bytes of the explored bitmask — an opaque per-cell bitmap that is
+    /// reported but not decoded.
     explored_size: u32,
 }
 
@@ -135,9 +138,6 @@ impl AreHeader {
             fog: reader.u16_at(0x4e, "fog probability")?,
             lightning: reader.u16_at(0x50, "lightning probability")?,
             script: reader.resref_at(0x94, "area script")?,
-            vertices: reader.u16_at(0x80, "vertex count")?,
-            tiled_objects: reader.u32_at(0xb4, "tiled object count")?,
-            proj_traps: reader.u32_at(0xd0, "projectile trap count")?,
             explored_size: reader.u32_at(0x9c, "explored bitmask size")?,
         })
     }
@@ -148,13 +148,20 @@ pub struct Actor {
     name: String,
     x: u16,
     y: u16,
+    dest_x: u16,
+    dest_y: u16,
     flags: u32,
+    animation: u32,
     orientation: u16,
+    removal_timer: i32,
+    appearance_schedule: u32,
     dialog: String,
     scripts: [String; 6],
     cre_file: String,
     /// CRE display name, resolved by the manager.
     name_text: Option<String>,
+    /// animate.ids symbol for `animation`, resolved by the manager.
+    animation_name: Option<String>,
 }
 
 impl Actor {
@@ -163,8 +170,13 @@ impl Actor {
             name: name_at(reader, base, "actor name")?,
             x: reader.u16_at(base + 0x20, "actor x")?,
             y: reader.u16_at(base + 0x22, "actor y")?,
+            dest_x: reader.u16_at(base + 0x24, "actor dest x")?,
+            dest_y: reader.u16_at(base + 0x26, "actor dest y")?,
             flags: reader.u32_at(base + 0x28, "actor flags")?,
+            animation: reader.u32_at(base + 0x30, "actor animation")?,
             orientation: reader.u16_at(base + 0x34, "actor orientation")?,
+            removal_timer: reader.u32_at(base + 0x38, "actor removal timer")? as i32,
+            appearance_schedule: reader.u32_at(base + 0x40, "actor appearance schedule")?,
             dialog: reader.resref_at(base + 0x48, "actor dialog")?,
             scripts: [
                 reader.resref_at(base + 0x50, "actor script override")?,
@@ -176,6 +188,7 @@ impl Actor {
             ],
             cre_file: reader.resref_at(base + 0x80, "actor CRE file")?,
             name_text: None,
+            animation_name: None,
         })
     }
 
@@ -187,6 +200,16 @@ impl Actor {
     /// Attach the resolved CRE display name.
     pub fn set_name(&mut self, name: Option<String>) {
         self.name_text = name;
+    }
+
+    /// The animate.ids value, for the manager to resolve a symbol.
+    pub fn animation(&self) -> u32 {
+        self.animation
+    }
+
+    /// Attach the resolved animate.ids symbol.
+    pub fn set_animation_name(&mut self, name: Option<String>) {
+        self.animation_name = name;
     }
 }
 
@@ -351,8 +374,15 @@ pub struct Spawn {
     x: u16,
     y: u16,
     creatures: Vec<SpawnCreature>,
+    base_number: u16,
     frequency: u16,
+    method: u16,
+    removal_timer: i32,
+    max_spawn: u16,
     enabled: u16,
+    appearance_schedule: u32,
+    prob_day: u16,
+    prob_night: u16,
 }
 
 impl Spawn {
@@ -373,8 +403,15 @@ impl Spawn {
             x: reader.u16_at(base + 0x20, "spawn x")?,
             y: reader.u16_at(base + 0x22, "spawn y")?,
             creatures,
+            base_number: reader.u16_at(base + 0x76, "spawn base number")?,
             frequency: reader.u16_at(base + 0x78, "spawn frequency")?,
+            method: reader.u16_at(base + 0x7a, "spawn method")?,
+            removal_timer: reader.u32_at(base + 0x7c, "spawn removal timer")? as i32,
+            max_spawn: reader.u16_at(base + 0x84, "spawn max")?,
             enabled: reader.u16_at(base + 0x86, "spawn enabled")?,
+            appearance_schedule: reader.u32_at(base + 0x88, "spawn appearance schedule")?,
+            prob_day: reader.u16_at(base + 0x8c, "spawn probability day")?,
+            prob_night: reader.u16_at(base + 0x8e, "spawn probability night")?,
         })
     }
 
@@ -540,6 +577,143 @@ impl Automap {
     }
 }
 
+/// A tiled object: a WED tile whose state the area scripts can toggle (0x68
+/// bytes). Rarely used and, per the spec, not fully supported by the engine.
+pub struct TiledObject {
+    name: String,
+    tile_id: String,
+    flags: u32,
+}
+
+impl TiledObject {
+    fn parse_at(reader: &Reader, base: usize) -> Result<TiledObject, Truncated> {
+        Ok(TiledObject {
+            name: name_at(reader, base, "tiled object name")?,
+            tile_id: reader.resref_at(base + 0x20, "tiled object id")?,
+            flags: reader.u32_at(base + 0x28, "tiled object flags")?,
+        })
+    }
+}
+
+/// A saved in-flight projectile (e.g. a Skull Trap). Present essentially only
+/// in save games (0x1C bytes).
+pub struct ProjectileTrap {
+    projectile: String,
+    missile: u16,
+    x: u16,
+    y: u16,
+    owner: u8,
+    /// projectl.ids symbol for the missile, resolved by the manager.
+    missile_name: Option<String>,
+}
+
+impl ProjectileTrap {
+    fn parse_at(reader: &Reader, base: usize) -> Result<ProjectileTrap, Truncated> {
+        Ok(ProjectileTrap {
+            projectile: reader.resref_at(base, "trap projectile")?,
+            missile: reader.u16_at(base + 0x0e, "trap missile")?,
+            x: reader.u16_at(base + 0x14, "trap x")?,
+            y: reader.u16_at(base + 0x16, "trap y")?,
+            owner: reader.u8_at(base + 0x1b, "trap owner")?,
+            missile_name: None,
+        })
+    }
+
+    /// The missile.ids reference (stored as `projectl.ids - 1`), for the manager
+    /// to resolve a symbol.
+    pub fn missile(&self) -> u16 {
+        self.missile
+    }
+
+    /// Attach the resolved projectl.ids symbol.
+    pub fn set_missile_name(&mut self, name: Option<String>) {
+        self.missile_name = name;
+    }
+}
+
+/// The area's music and background-ambient assignments — a single fixed struct,
+/// not an array (0x90 bytes). Song numbers index songlist.2da, with a few
+/// sentinels (0 = silence, -1 = last master area, -2 = day/night).
+pub struct Song {
+    day: u32,
+    night: u32,
+    win: u32,
+    battle: u32,
+    lose: u32,
+    day_ambient: [String; 2],
+    day_volume: u32,
+    night_ambient: [String; 2],
+    night_volume: u32,
+}
+
+impl Song {
+    fn parse_at(reader: &Reader, base: usize) -> Result<Song, Truncated> {
+        Ok(Song {
+            day: reader.u32_at(base, "day song")?,
+            night: reader.u32_at(base + 0x04, "night song")?,
+            win: reader.u32_at(base + 0x08, "win song")?,
+            battle: reader.u32_at(base + 0x0c, "battle song")?,
+            lose: reader.u32_at(base + 0x10, "lose song")?,
+            day_ambient: [
+                reader.resref_at(base + 0x28, "day ambient 1")?,
+                reader.resref_at(base + 0x30, "day ambient 2")?,
+            ],
+            day_volume: reader.u32_at(base + 0x38, "day ambient volume")?,
+            night_ambient: [
+                reader.resref_at(base + 0x3c, "night ambient 1")?,
+                reader.resref_at(base + 0x44, "night ambient 2")?,
+            ],
+            night_volume: reader.u32_at(base + 0x4c, "night ambient volume")?,
+        })
+    }
+}
+
+/// A rest-interruption table: creatures that can break the party's rest in this
+/// area — a single fixed struct, not an array (0xE4 bytes).
+pub struct RestInterruption {
+    name: String,
+    creatures: Vec<SpawnCreature>,
+    difficulty: u16,
+    max_spawn: u16,
+    enabled: u16,
+    prob_day: u16,
+    prob_night: u16,
+}
+
+impl RestInterruption {
+    fn parse_at(reader: &Reader, base: usize) -> Result<RestInterruption, Truncated> {
+        let mut creatures = Vec::new();
+        for i in 0..10 {
+            let resource = reader.resref_at(base + 0x48 + i * 8, "rest creature")?;
+            if !resource.is_empty() {
+                creatures.push(SpawnCreature {
+                    resource,
+                    name: None,
+                });
+            }
+        }
+        Ok(RestInterruption {
+            name: name_at(reader, base, "rest name")?,
+            creatures,
+            difficulty: reader.u16_at(base + 0x9a, "rest difficulty")?,
+            max_spawn: reader.u16_at(base + 0xa4, "rest max spawn")?,
+            enabled: reader.u16_at(base + 0xa6, "rest enabled")?,
+            prob_day: reader.u16_at(base + 0xa8, "rest probability day")?,
+            prob_night: reader.u16_at(base + 0xaa, "rest probability night")?,
+        })
+    }
+
+    /// The creature slots, for the manager to resolve their CRE names.
+    pub fn creatures_mut(&mut self) -> &mut [SpawnCreature] {
+        &mut self.creatures
+    }
+
+    /// Whether the table carries any interruption content worth rendering.
+    fn is_populated(&self) -> bool {
+        !self.name.is_empty() || !self.creatures.is_empty()
+    }
+}
+
 /// A parsed ARE file: the header plus the decoded content sections, with names
 /// the manager has resolved attached.
 pub struct Are {
@@ -555,6 +729,11 @@ pub struct Are {
     doors: Vec<Door>,
     animations: Vec<Animation>,
     automap: Vec<Automap>,
+    vertices: Vec<(u16, u16)>,
+    tiled_objects: Vec<TiledObject>,
+    proj_traps: Vec<ProjectileTrap>,
+    song: Option<Song>,
+    rest: Option<RestInterruption>,
 }
 
 impl Are {
@@ -655,6 +834,43 @@ impl Are {
             Automap::parse_at,
         )?;
 
+        // The vertex pool: a flat array of (x, y) words that regions, containers
+        // and doors index into.
+        let vertices = Self::read_records(
+            &reader,
+            reader.u32_at(0x7c, "vertex offset")? as usize,
+            reader.u16_at(0x80, "vertex count")? as usize,
+            VERTEX_SIZE,
+            |r, base| Ok((r.u16_at(base, "vertex x")?, r.u16_at(base + 2, "vertex y")?)),
+        )?;
+        let tiled_objects = Self::read_records(
+            &reader,
+            reader.u32_at(0xb8, "tiled object offset")? as usize,
+            reader.u32_at(0xb4, "tiled object count")? as usize,
+            TILED_SIZE,
+            TiledObject::parse_at,
+        )?;
+        let proj_traps = Self::read_records(
+            &reader,
+            reader.u32_at(0xcc, "projectile trap offset")? as usize,
+            reader.u32_at(0xd0, "projectile trap count")? as usize,
+            PTRAP_SIZE,
+            ProjectileTrap::parse_at,
+        )?;
+
+        // Song entries and rest interruptions are each a single fixed struct
+        // located by offset, with no count. Parse when the offset points at a
+        // struct that fits within the file; otherwise treat as absent.
+        let song = Self::read_struct(&reader, data.len(), 0xbc, SONG_SIZE, Song::parse_at)?;
+        let rest = Self::read_struct(
+            &reader,
+            data.len(),
+            0xc0,
+            REST_SIZE,
+            RestInterruption::parse_at,
+        )?
+        .filter(RestInterruption::is_populated);
+
         Ok(Are {
             header,
             actors,
@@ -668,7 +884,29 @@ impl Are {
             doors,
             animations,
             automap,
+            vertices,
+            tiled_objects,
+            proj_traps,
+            song,
+            rest,
         })
+    }
+
+    /// Read a single fixed struct located by an offset word at `offset_at`, with
+    /// no count. Returns `None` when the offset is zero or the struct would run
+    /// past the end of the file (the section is absent).
+    fn read_struct<T>(
+        reader: &Reader,
+        len: usize,
+        offset_at: usize,
+        size: usize,
+        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
+    ) -> Result<Option<T>, Truncated> {
+        let offset = reader.u32_at(offset_at, "struct offset")? as usize;
+        if offset == 0 || offset.saturating_add(size) > len {
+            return Ok(None);
+        }
+        Ok(Some(parse_at(reader, offset)?))
     }
 
     /// Read a fixed-size record array from a header-declared section. A zero
@@ -719,6 +957,17 @@ impl Are {
         &mut self.automap
     }
 
+    /// The projectile traps, for the manager to resolve their missile symbols.
+    pub fn proj_traps_mut(&mut self) -> &mut [ProjectileTrap] {
+        &mut self.proj_traps
+    }
+
+    /// The rest-interruption table, if present, for the manager to resolve its
+    /// creature names.
+    pub fn rest_mut(&mut self) -> Option<&mut RestInterruption> {
+        self.rest.as_mut()
+    }
+
     /// Write the whole area as flat `key=value` lines: header fields bare, each
     /// section under `<section>.<n>.`.
     pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
@@ -741,10 +990,6 @@ impl Are {
             writeln!(out, "{label}={}", n.area)?;
             writeln!(out, "{label}_flags={}", n.flags)?;
         }
-        writeln!(out, "vertices={}", h.vertices)?;
-        writeln!(out, "tiled_objects={}", h.tiled_objects)?;
-        writeln!(out, "proj_traps={}", h.proj_traps)?;
-        writeln!(out, "explored_size={}", h.explored_size)?;
 
         for (i, a) in self.actors.iter().enumerate() {
             writeln!(out, "actor.{i}.name={}", a.name)?;
@@ -752,6 +997,15 @@ impl Are {
             writeln!(out, "actor.{i}.y={}", a.y)?;
             writeln!(out, "actor.{i}.flags={}", a.flags)?;
             writeln!(out, "actor.{i}.orientation={}", a.orientation)?;
+            writeln!(out, "actor.{i}.animation={}", a.animation)?;
+            writeln!(
+                out,
+                "actor.{i}.appearance_schedule={}",
+                a.appearance_schedule
+            )?;
+            writeln!(out, "actor.{i}.removal_timer={}", a.removal_timer)?;
+            writeln!(out, "actor.{i}.dest_x={}", a.dest_x)?;
+            writeln!(out, "actor.{i}.dest_y={}", a.dest_y)?;
             writeln!(out, "actor.{i}.cre={}", a.cre_file)?;
             writeln!(out, "actor.{i}.dialog={}", a.dialog)?;
             for (slot, script) in SCRIPT_SLOTS.iter().zip(&a.scripts) {
@@ -767,7 +1021,7 @@ impl Are {
             writeln!(out, "region.{i}.destination={}", r.destination)?;
             writeln!(out, "region.{i}.entrance={}", r.entrance)?;
             writeln!(out, "region.{i}.flags={}", r.flags)?;
-            writeln!(out, "region.{i}.info_text={}", r.info_text)?;
+            writeln!(out, "region.{i}.info_text={}", strref_raw(r.info_text))?;
             writeln!(out, "region.{i}.trapped={}", r.trapped)?;
             writeln!(out, "region.{i}.key_item={}", r.key_item)?;
             writeln!(out, "region.{i}.script={}", r.script)?;
@@ -807,6 +1061,17 @@ impl Are {
             writeln!(out, "spawn.{i}.y={}", s.y)?;
             writeln!(out, "spawn.{i}.frequency={}", s.frequency)?;
             writeln!(out, "spawn.{i}.enabled={}", s.enabled)?;
+            writeln!(out, "spawn.{i}.max_spawn={}", s.max_spawn)?;
+            writeln!(out, "spawn.{i}.probability_day={}", s.prob_day)?;
+            writeln!(out, "spawn.{i}.probability_night={}", s.prob_night)?;
+            writeln!(out, "spawn.{i}.method={}", s.method)?;
+            writeln!(out, "spawn.{i}.base_number={}", s.base_number)?;
+            writeln!(out, "spawn.{i}.removal_timer={}", s.removal_timer)?;
+            writeln!(
+                out,
+                "spawn.{i}.appearance_schedule={}",
+                s.appearance_schedule
+            )?;
             for (j, c) in s.creatures.iter().enumerate() {
                 writeln!(out, "spawn.{i}.creature.{j}={}", c.resource)?;
             }
@@ -842,7 +1107,11 @@ impl Are {
             writeln!(out, "door.{i}.key_item={}", d.key_item)?;
             writeln!(out, "door.{i}.script={}", d.script)?;
             writeln!(out, "door.{i}.lock={}", d.lock_difficulty)?;
-            writeln!(out, "door.{i}.dialog_speaker={}", d.dialog_speaker)?;
+            writeln!(
+                out,
+                "door.{i}.dialog_speaker={}",
+                strref_raw(d.dialog_speaker)
+            )?;
             writeln!(out, "door.{i}.dialog={}", d.dialog)?;
         }
 
@@ -858,9 +1127,54 @@ impl Are {
         for (i, n) in self.automap.iter().enumerate() {
             writeln!(out, "automap.{i}.x={}", n.x)?;
             writeln!(out, "automap.{i}.y={}", n.y)?;
-            writeln!(out, "automap.{i}.text={}", n.text)?;
+            writeln!(out, "automap.{i}.text={}", strref_raw(n.text))?;
             writeln!(out, "automap.{i}.color={}", n.color)?;
         }
+
+        for (i, t) in self.tiled_objects.iter().enumerate() {
+            writeln!(out, "tiled.{i}.name={}", t.name)?;
+            writeln!(out, "tiled.{i}.id={}", t.tile_id)?;
+            writeln!(out, "tiled.{i}.flags={}", t.flags)?;
+        }
+
+        for (i, t) in self.proj_traps.iter().enumerate() {
+            writeln!(out, "trap.{i}.projectile={}", t.projectile)?;
+            writeln!(out, "trap.{i}.missile={}", t.missile)?;
+            writeln!(out, "trap.{i}.x={}", t.x)?;
+            writeln!(out, "trap.{i}.y={}", t.y)?;
+            writeln!(out, "trap.{i}.owner={}", t.owner)?;
+        }
+
+        if let Some(s) = &self.song {
+            writeln!(out, "song.day={}", s.day)?;
+            writeln!(out, "song.night={}", s.night)?;
+            writeln!(out, "song.win={}", s.win)?;
+            writeln!(out, "song.battle={}", s.battle)?;
+            writeln!(out, "song.lose={}", s.lose)?;
+            writeln!(out, "song.day_ambient_1={}", s.day_ambient[0])?;
+            writeln!(out, "song.day_ambient_2={}", s.day_ambient[1])?;
+            writeln!(out, "song.day_volume={}", s.day_volume)?;
+            writeln!(out, "song.night_ambient_1={}", s.night_ambient[0])?;
+            writeln!(out, "song.night_ambient_2={}", s.night_ambient[1])?;
+            writeln!(out, "song.night_volume={}", s.night_volume)?;
+        }
+
+        if let Some(r) = &self.rest {
+            writeln!(out, "rest.name={}", r.name)?;
+            writeln!(out, "rest.difficulty={}", r.difficulty)?;
+            writeln!(out, "rest.max_spawn={}", r.max_spawn)?;
+            writeln!(out, "rest.enabled={}", r.enabled)?;
+            writeln!(out, "rest.probability_day={}", r.prob_day)?;
+            writeln!(out, "rest.probability_night={}", r.prob_night)?;
+            for (j, c) in r.creatures.iter().enumerate() {
+                writeln!(out, "rest.creature.{j}={}", c.resource)?;
+            }
+        }
+
+        for (i, (x, y)) in self.vertices.iter().enumerate() {
+            writeln!(out, "vertex.{i}={x},{y}")?;
+        }
+        writeln!(out, "explored_size={}", self.header.explored_size)?;
 
         Ok(())
     }
@@ -924,6 +1238,12 @@ impl fmt::Display for Are {
                     write!(f, " ({name})")?;
                 }
                 write!(f, " @{},{}  cre={}", a.x, a.y, a.cre_file)?;
+                if let Some(anim) = &a.animation_name {
+                    write!(f, " anim={anim}")?;
+                }
+                if let Some(sched) = schedule_label(a.appearance_schedule) {
+                    write!(f, " [{sched}]")?;
+                }
                 if !a.dialog.is_empty() {
                     write!(f, " dialog={}", a.dialog)?;
                 }
@@ -1066,22 +1386,120 @@ impl fmt::Display for Are {
             }
         }
 
-        // Sections not yet decoded, reported so their presence isn't hidden.
-        let other = [
-            ("vertices", h.vertices as u32),
-            ("tiled objects", h.tiled_objects),
-            ("projectile traps", h.proj_traps),
-        ];
-        if other.iter().any(|(_, n)| *n != 0) {
-            let parts: Vec<String> = other
+        if !self.tiled_objects.is_empty() {
+            writeln!(f, "\n  tiled objects: ({})", self.tiled_objects.len())?;
+            for t in &self.tiled_objects {
+                writeln!(f, "    {} id={}", t.name, t.tile_id)?;
+            }
+        }
+
+        if !self.proj_traps.is_empty() {
+            writeln!(f, "\n  projectile traps: ({})", self.proj_traps.len())?;
+            for t in &self.proj_traps {
+                write!(f, "    {} @{},{}", t.projectile, t.x, t.y)?;
+                if let Some(name) = &t.missile_name {
+                    write!(f, " ({name})")?;
+                }
+                writeln!(f)?;
+            }
+        }
+
+        if let Some(s) = &self.song {
+            let songs = [
+                ("day", s.day),
+                ("night", s.night),
+                ("battle", s.battle),
+                ("win", s.win),
+                ("lose", s.lose),
+            ];
+            let parts: Vec<String> = songs
                 .iter()
-                .filter(|(_, n)| *n != 0)
-                .map(|(label, n)| format!("{n} {label}"))
+                .map(|(label, n)| format!("{label}={}", song_ref(*n)))
                 .collect();
-            writeln!(f, "\n  other: {}", parts.join(", "))?;
+            writeln!(f, "\n  songs: {}", parts.join("  "))?;
+            for (when, ambient, volume) in [
+                ("day", &s.day_ambient, s.day_volume),
+                ("night", &s.night_ambient, s.night_volume),
+            ] {
+                let sounds: Vec<&str> = ambient
+                    .iter()
+                    .filter(|a| !a.is_empty())
+                    .map(String::as_str)
+                    .collect();
+                if !sounds.is_empty() {
+                    writeln!(f, "    ambient({when}): {} {volume}%", sounds.join(" "))?;
+                }
+            }
+        }
+
+        if let Some(r) = &self.rest {
+            writeln!(f, "\n  rest interruptions: {}", r.name)?;
+            writeln!(
+                f,
+                "    difficulty {}  max {}  prob day {}% night {}%{}",
+                r.difficulty,
+                r.max_spawn,
+                r.prob_day,
+                r.prob_night,
+                if r.enabled == 0 { "  (inactive)" } else { "" }
+            )?;
+            for c in &r.creatures {
+                match &c.name {
+                    Some(name) => writeln!(f, "    {} ({name})", c.resource)?,
+                    None => writeln!(f, "    {}", c.resource)?,
+                }
+            }
+        }
+
+        // The vertex pool and explored bitmask are geometry/bitmap blobs; report
+        // their extent rather than dumping coordinates.
+        if !self.vertices.is_empty() || h.explored_size != 0 {
+            writeln!(
+                f,
+                "\n  geometry: {} vertices, explored {} bytes",
+                self.vertices.len(),
+                h.explored_size
+            )?;
         }
 
         Ok(())
+    }
+}
+
+/// Render a strref for the machine view, mapping the `0xFFFFFFFF` "no string"
+/// sentinel to `-1` for readability.
+fn strref_raw(value: u32) -> String {
+    if value == u32::MAX {
+        "-1".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// The hours (schedule bits 0-23) that count as daytime; the rest are night.
+/// Matches the day/night split the engine and editors use.
+const DAY_HOURS: u32 = 0x1f_ffc0;
+const NIGHT_HOURS: u32 = 0x00ff_ffff & !DAY_HOURS;
+
+/// Classify an appearance schedule (bits 0-23) for the human view. Only the
+/// clean day/night cases are named; "always" and mixed schedules stay quiet to
+/// avoid cluttering the common case.
+fn schedule_label(mask: u32) -> Option<&'static str> {
+    match mask & 0x00ff_ffff {
+        DAY_HOURS => Some("day"),
+        NIGHT_HOURS => Some("night"),
+        _ => None,
+    }
+}
+
+/// Render a song reference, naming the sentinel values (songlist.2da numbers
+/// are shown bare).
+fn song_ref(value: u32) -> String {
+    match value as i32 {
+        0 => "silent".to_string(),
+        -1 => "last-area".to_string(),
+        -2 => "day/night".to_string(),
+        n => n.to_string(),
     }
 }
 
@@ -1257,5 +1675,114 @@ mod tests {
         put_u32(&mut data, 0x54, 0x1000);
         put_u16(&mut data, 0x58, 1);
         assert!(matches!(Are::parse(&data), Err(AreError::Truncated(_))));
+    }
+
+    #[test]
+    fn reads_actor_and_spawn_detail_fields() {
+        let mut data = build_are();
+        let actor_off = data.len();
+        data.resize(actor_off + ACTOR_SIZE, 0);
+        put_u16(&mut data, actor_off + 0x24, 111); // dest x
+        put_u16(&mut data, actor_off + 0x26, 222); // dest y
+        put_u32(&mut data, actor_off + 0x30, 0x6000); // animation
+        put_u32(&mut data, actor_off + 0x38, u32::MAX); // removal timer = -1
+        put_u32(&mut data, actor_off + 0x40, 0xffffff); // schedule = always
+        let spawn_off = data.len();
+        data.resize(spawn_off + SPAWN_SIZE, 0);
+        put_u16(&mut data, spawn_off + 0x84, 5); // max spawn
+        put_u16(&mut data, spawn_off + 0x8c, 30); // prob day
+        put_u16(&mut data, spawn_off + 0x8e, 70); // prob night
+
+        put_u32(&mut data, 0x54, actor_off as u32);
+        put_u16(&mut data, 0x58, 1);
+        put_u32(&mut data, 0x60, spawn_off as u32);
+        put_u32(&mut data, 0x64, 1);
+
+        let are = Are::parse(&data).expect("parse");
+        let a = &are.actors[0];
+        assert_eq!((a.dest_x, a.dest_y), (111, 222));
+        assert_eq!(a.animation, 0x6000);
+        assert_eq!(a.removal_timer, -1);
+        assert_eq!(a.appearance_schedule, 0xffffff);
+        let s = &are.spawns[0];
+        assert_eq!(s.max_spawn, 5);
+        assert_eq!((s.prob_day, s.prob_night), (30, 70));
+    }
+
+    #[test]
+    fn strref_sentinel_renders_as_negative_one() {
+        assert_eq!(strref_raw(u32::MAX), "-1");
+        assert_eq!(strref_raw(42), "42");
+    }
+
+    #[test]
+    fn reads_vertex_pool() {
+        let mut data = build_are();
+        let off = data.len();
+        data.resize(off + 3 * VERTEX_SIZE, 0);
+        for (i, (x, y)) in [(10u16, 20u16), (30, 40), (50, 60)].iter().enumerate() {
+            put_u16(&mut data, off + i * VERTEX_SIZE, *x);
+            put_u16(&mut data, off + i * VERTEX_SIZE + 2, *y);
+        }
+        put_u32(&mut data, 0x7c, off as u32);
+        put_u16(&mut data, 0x80, 3);
+
+        let are = Are::parse(&data).expect("parse");
+        assert_eq!(are.vertices, vec![(10, 20), (30, 40), (50, 60)]);
+    }
+
+    #[test]
+    fn reads_tiled_objects_and_traps() {
+        let mut data = build_are();
+        let tiled_off = data.len();
+        data.resize(tiled_off + TILED_SIZE, 0);
+        data[tiled_off..tiled_off + 4].copy_from_slice(b"Door");
+        let trap_off = data.len();
+        data.resize(trap_off + PTRAP_SIZE, 0);
+        data[trap_off..trap_off + 4].copy_from_slice(b"SKUL");
+
+        put_u32(&mut data, 0xb8, tiled_off as u32);
+        put_u32(&mut data, 0xb4, 1);
+        put_u32(&mut data, 0xcc, trap_off as u32);
+        put_u32(&mut data, 0xd0, 1);
+
+        let are = Are::parse(&data).expect("parse");
+        assert_eq!(are.tiled_objects.len(), 1);
+        assert_eq!(are.tiled_objects[0].name, "Door");
+        assert_eq!(are.proj_traps.len(), 1);
+        assert_eq!(are.proj_traps[0].projectile, "SKUL");
+    }
+
+    #[test]
+    fn reads_song_and_rest_structs() {
+        let mut data = build_are();
+        let song_off = data.len();
+        data.resize(song_off + SONG_SIZE, 0);
+        put_u32(&mut data, song_off, 7); // day song
+        let rest_off = data.len();
+        data.resize(rest_off + REST_SIZE, 0);
+        data[rest_off..rest_off + 4].copy_from_slice(b"Sold");
+        data[rest_off + 0x48..rest_off + 0x4c].copy_from_slice(b"GUAR"); // 1st creature
+
+        put_u32(&mut data, 0xbc, song_off as u32);
+        put_u32(&mut data, 0xc0, rest_off as u32);
+
+        let are = Are::parse(&data).expect("parse");
+        let song = are.song.as_ref().expect("song");
+        assert_eq!(song.day, 7);
+        let rest = are.rest.as_ref().expect("rest");
+        assert_eq!(rest.name, "Sold");
+        assert_eq!(rest.creatures.len(), 1);
+        assert_eq!(rest.creatures[0].resource, "GUAR");
+    }
+
+    #[test]
+    fn single_struct_absent_when_offset_out_of_bounds() {
+        let mut data = build_are();
+        // A song offset past the end of the file reads as absent, not an error.
+        put_u32(&mut data, 0xbc, 0x9000);
+        let are = Are::parse(&data).expect("parse");
+        assert!(are.song.is_none());
+        assert!(are.rest.is_none());
     }
 }
