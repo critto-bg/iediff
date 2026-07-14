@@ -73,3 +73,5 @@ first three are needed to find and name anything.
 - `cargo build` / `cargo run` to compile and run.
 - Verify binary parsing against the real files under `game/` and cross-check
   field offsets with the matching doc in `md/`.
+- Commit messages are a single one-line summary — no body, no `Co-Authored-By`
+  or other trailers.

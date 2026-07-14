@@ -15,9 +15,12 @@ patch it, and verify the change.
 
 ## Status
 
-Parses and prints these formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO (atop the
-KEY/BIF/TLK index layer). Other resource types are located and summarised (type
-and size) but not yet decoded. Diffing is not implemented yet.
+Parses and prints these formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE
+(atop the KEY/BIF/TLK index layer). ARE decodes its content sections (actors,
+regions, containers/items, spawns, doors, ambients, animations, automap notes,
+variables); its geometry and a few save-only sections are only summarised. Other
+resource types are located and summarised (type and size) but not yet decoded.
+Diffing is not implemented yet.
 
 ## Build
 
@@ -45,7 +48,7 @@ as a filesystem path, taking the type from its extension; referenced names still
 resolve against the game directory — handy for inspecting modded resources before
 they are copied into `override`).
 
-Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO. Other resource types are
+Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE. Other resource types are
 located and summarised (type, size) but not parsed. Runs against `./chitin.key`
 when present (so it works from a game root), else `game/chitin.key`.
 

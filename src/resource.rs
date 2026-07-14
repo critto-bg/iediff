@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::Reader;
+use crate::formats::are::{ARE_TYPE, Are, AreError};
 use crate::formats::bif::{BifArchive, BifError};
 use crate::formats::cre::{CRE_TYPE, Cre, CreError, CreNames};
 use crate::formats::eff::{EFF_TYPE, Eff, EffError};
@@ -42,6 +43,7 @@ pub enum ResourceError {
     Cre(CreError),
     Pro(ProError),
     Sto(StoError),
+    Are(AreError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -65,6 +67,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Cre(e) => write!(f, "{e}"),
             ResourceError::Pro(e) => write!(f, "{e}"),
             ResourceError::Sto(e) => write!(f, "{e}"),
+            ResourceError::Are(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -89,6 +92,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Cre(e) => Some(e),
             ResourceError::Pro(e) => Some(e),
             ResourceError::Sto(e) => Some(e),
+            ResourceError::Are(e) => Some(e),
             _ => None,
         }
     }
@@ -157,6 +161,12 @@ impl From<ProError> for ResourceError {
 impl From<StoError> for ResourceError {
     fn from(e: StoError) -> Self {
         ResourceError::Sto(e)
+    }
+}
+
+impl From<AreError> for ResourceError {
+    fn from(e: AreError) -> Self {
+        ResourceError::Are(e)
     }
 }
 
@@ -266,6 +276,7 @@ pub enum Resource {
     Cre(Cre),
     Pro(Pro),
     Sto(Sto),
+    Are(Are),
     Other(ResourceInfo),
 }
 
@@ -280,6 +291,7 @@ impl fmt::Display for Resource {
             Resource::Cre(cre) => write!(f, "{cre}"),
             Resource::Pro(pro) => write!(f, "{pro}"),
             Resource::Sto(sto) => write!(f, "{sto}"),
+            Resource::Are(are) => write!(f, "{are}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -297,6 +309,7 @@ impl Resource {
             Resource::Cre(cre) => cre.write_raw(out),
             Resource::Pro(pro) => pro.write_raw(out),
             Resource::Sto(sto) => sto.write_raw(out),
+            Resource::Are(are) => are.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => write!(out, "{table}"),
             Resource::Other(info) => write!(out, "{info}"),
@@ -706,6 +719,43 @@ impl ResourceManager {
 
                 Resource::Sto(sto)
             }
+            ARE_TYPE => {
+                let mut are = Are::parse(data)?;
+
+                // Actors reference CRE files; the flat item pool references
+                // ITMs — resolve their display names like inventories do.
+                self.resolve_refs(
+                    are.actors_mut(),
+                    CRE_TYPE,
+                    |a| a.resource(),
+                    |a, n| a.set_name(n),
+                );
+                self.resolve_refs(
+                    are.items_mut(),
+                    ITM_TYPE,
+                    |it| it.resource(),
+                    |it, n| it.set_name(n),
+                );
+
+                // Each spawn point names up to ten creatures (or spawngrp.2da
+                // entries, which simply won't resolve).
+                for spawn in are.spawns_mut() {
+                    self.resolve_refs(
+                        spawn.creatures_mut(),
+                        CRE_TYPE,
+                        |c| c.resource(),
+                        |c, n| c.set_name(n),
+                    );
+                }
+
+                // Strref-labelled sections: region info text, door speakers,
+                // automap notes.
+                self.resolve_strrefs(are.regions_mut(), |r| r.strref(), |r, n| r.set_label(n));
+                self.resolve_strrefs(are.doors_mut(), |d| d.strref(), |d, n| d.set_label(n));
+                self.resolve_strrefs(are.automap_mut(), |n| n.strref(), |n, l| n.set_label(l));
+
+                Resource::Are(are)
+            }
             _ => Resource::Other(ResourceInfo {
                 res_type,
                 size: data.len() as u32,
@@ -844,6 +894,22 @@ impl ResourceManager {
                     .map(str::to_string)
             })
             .collect();
+        for (t, name) in items.iter_mut().zip(names) {
+            set(t, name);
+        }
+    }
+
+    /// Resolve TLK strings for a slice of records that each carry a strref (e.g.
+    /// a region's info text or an automap note). `get` reads the strref, `set`
+    /// stores the resolved label back.
+    fn resolve_strrefs<T>(
+        &mut self,
+        items: &mut [T],
+        get: impl Fn(&T) -> u32,
+        set: impl Fn(&mut T, Option<String>),
+    ) {
+        let refs: Vec<u32> = items.iter().map(&get).collect();
+        let names: Vec<Option<String>> = refs.into_iter().map(|s| self.string_label(s)).collect();
         for (t, name) in items.iter_mut().zip(names) {
             set(t, name);
         }

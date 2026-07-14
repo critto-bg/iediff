@@ -360,7 +360,7 @@ Options:
   --biff                bypass the override directory; read the archived original
   --file                read the argument as a filesystem path (type from its extension)
 
-Decoded formats: 2da ids eff itm spl cre pro sto
+Decoded formats: 2da ids eff itm spl cre pro sto are
 Other resource types are located and summarised (type, size) but not parsed.
 
 Reads ./chitin.key if present (run from a game root), else game/chitin.key.
