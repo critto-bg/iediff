@@ -36,11 +36,12 @@ project).
 ## Usage
 
 ```sh
-iediff <name>[.ext]   # print a resource; a bare name or inexact match runs a prefix search
-iediff strref:<n>     # resolve a dialog.tlk string by index
-iediff --file <path>  # print a discrete file by path, bypassing the index
-iediff --stats        # summarise the KEY index and override directory
-iediff --help         # usage guide
+iediff <name>[.ext]       # print a resource; a bare name or inexact match runs a prefix search
+iediff strref:<n>         # resolve a dialog.tlk string by index
+iediff strref:<n> --uses  # list the resources that reference the string
+iediff --file <path>      # print a discrete file by path, bypassing the index
+iediff --stats            # summarise the KEY index and override directory
+iediff --help             # usage guide
 ```
 
 Options: `--raw` (machine-readable `key=value` output), `--biff` (bypass the
@@ -52,6 +53,15 @@ they are copied into `override`).
 The 2DA view labels each column with its 0-based index as WeiDU counts it —
 column 0 is the row label — so `SET_2DA_ENTRY`/`READ_2DA_ENTRY` numbers read
 straight off the dump.
+
+`strref:<n> --uses` reports every resource that references string `<n>`, with the
+field(s) that carry it and where each resource resolved from (`--biff` and
+`--type <ext>` narrow the scan). The typed scan covers the decoded strref-bearing
+formats (EFF, ITM, SPL, CRE, PRO, STO, ARE), including strrefs buried in item /
+spell / creature effects (the "display string" opcodes). 2DA and IDS text tables
+are also scanned heuristically — any line where `<n>` appears as a number is
+reported separately as a candidate to judge, since nothing types it as a strref.
+DLG and scripts, which hold most string references, are not yet parsed.
 
 Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE. Other resource types are
 located and summarised (type, size) but not parsed. Runs against `./chitin.key`

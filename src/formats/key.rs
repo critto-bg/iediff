@@ -171,6 +171,11 @@ impl KeyFile {
         Ok(resources)
     }
 
+    /// Every resource entry the KEY lists, in file order.
+    pub fn resources(&self) -> &[ResourceEntry] {
+        &self.resources
+    }
+
     /// Resolve a resource by name and type (case-insensitive name).
     pub fn lookup(&self, name: &str, res_type: u16) -> Option<&ResourceEntry> {
         let key = (name.to_ascii_uppercase(), res_type);

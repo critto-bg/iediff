@@ -14,6 +14,37 @@ pub fn opcode_name(opcode: u32) -> Option<&'static str> {
     OPCODE_NAMES.get(opcode as usize).copied()
 }
 
+/// An effect field that can hold a TLK strref, for the opcodes that display a
+/// string. [`Param1`](StrrefSlot::Param1) is the first parameter (V1 0x04 /
+/// V2 body 0x14); [`Special`](StrrefSlot::Special) is the Special field (V1 0x2c
+/// / V2 body 0x40).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrrefSlot {
+    Param1,
+    Special,
+}
+
+/// Which effect field(s) *unconditionally* carry a TLK strref for `opcode`, in
+/// the EE engine — the key to finding strrefs buried in item/spell/creature
+/// effects, since the parser stores every parameter as an untyped dword.
+///
+/// Most string opcodes put the strref in Parameter #1; a couple (EE) use the
+/// Special field. Value-dependent cases can't be expressed here (this keys only
+/// on the opcode) and are handled by the caller: op319's Parameter #1 is a
+/// strref when Parameter #2 is 10 (see [`effect_strref_uses`](super::eff)). One
+/// case is deferred entirely — op330's Parameter #3 is the start of a `Count`
+/// (Special)-long *range* of strrefs, only under the EFF-invocation path.
+///
+/// Derived from IESDP (`md/opcodes/bgee.md`); opcodes 13 and 68 are excluded —
+/// their "Text Notification" Parameter #1 is a 0/1 flag, not a strref.
+pub fn opcode_strref_slots(opcode: u32) -> &'static [StrrefSlot] {
+    match opcode {
+        103 | 139 | 180 | 206 | 253 | 254 | 267 | 290 | 330 | 338 => &[StrrefSlot::Param1],
+        181 | 319 => &[StrrefSlot::Special],
+        _ => &[],
+    }
+}
+
 /// Opcode → name, indexed directly by opcode number.
 static OPCODE_NAMES: [&str; 368] = [
     "Stat: AC vs. Damage Type Modifier",               // 0
@@ -385,3 +416,29 @@ static OPCODE_NAMES: [&str; 368] = [
     "Spell: Apply Spell On Move",                      // 366
     "Minimum base stats",                              // 367
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strref_slots_match_the_iesdp_audit() {
+        // Parameter #1 string opcodes.
+        for op in [103, 139, 180, 206, 253, 254, 267, 290, 330, 338] {
+            assert_eq!(opcode_strref_slots(op), [StrrefSlot::Param1], "opcode {op}");
+        }
+        // Special-field string opcodes (EE).
+        for op in [181, 319] {
+            assert_eq!(
+                opcode_strref_slots(op),
+                [StrrefSlot::Special],
+                "opcode {op}"
+            );
+        }
+        // Excluded false positives (13/68 "Text Notification" is a 0/1 flag) and
+        // ordinary numeric opcodes carry no strref.
+        for op in [0, 1, 13, 68, 367, 999] {
+            assert!(opcode_strref_slots(op).is_empty(), "opcode {op}");
+        }
+    }
+}

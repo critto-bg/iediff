@@ -14,7 +14,7 @@ use std::io::{self, Write};
 
 use crate::formats::eff::Feature;
 use crate::formats::fields::{set_flags, write_bitfield};
-use crate::{Reader, Truncated, describe_tag, parse_asciiz};
+use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for SPL files.
 pub const SPL_TYPE: u16 = 0x03ee;
@@ -349,6 +349,32 @@ impl Spl {
         )
     }
 
+    /// Every TLK strref this spell references, tagged with its field. The four
+    /// header strings (names and descriptions); embedded-effect string opcodes
+    /// are not yet decoded.
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        let h = &self.header;
+        let mut uses = vec![
+            StrrefUse::new(h.unidentified_name, "unidentified_name"),
+            StrrefUse::new(h.identified_name, "identified_name"),
+            StrrefUse::new(h.unidentified_description, "unidentified_description"),
+            StrrefUse::new(h.identified_description, "identified_description"),
+        ];
+        // Effects can carry a strref (a "display string" opcode): the on-cast
+        // effects, then each ability's own effects.
+        for (i, feat) in self.casting.iter().enumerate() {
+            let at = format!("casting[{i}]");
+            uses.extend(feat.strref_uses().into_iter().map(|u| u.prefixed(&at)));
+        }
+        for (j, ext) in self.ext_headers.iter().enumerate() {
+            for (k, feat) in ext.features.iter().enumerate() {
+                let at = format!("ability[{j}].effect[{k}]");
+                uses.extend(feat.strref_uses().into_iter().map(|u| u.prefixed(&at)));
+            }
+        }
+        uses
+    }
+
     /// The primary type (school), an index into MSCHOOL.2DA.
     pub fn primary_type(&self) -> u32 {
         self.header.primary_type as u32
@@ -630,5 +656,37 @@ fn casting_graphics_name(value: u16) -> &'static str {
         16 => "divination",
         17..=34 => "sparks",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal SPL V1 file: a full header with both array counts zeroed.
+    fn build_spl() -> Vec<u8> {
+        let mut data = vec![0u8; 0x74];
+        data[0x00..0x04].copy_from_slice(SPL_SIGNATURE);
+        data[0x04..0x08].copy_from_slice(SPL_VERSION);
+        data
+    }
+
+    #[test]
+    fn strref_uses_lists_the_four_header_strings() {
+        let mut data = build_spl();
+        for (at, value) in [(0x08, 10u32), (0x0c, 11), (0x50, 20), (0x54, 21)] {
+            data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let uses = Spl::parse(&data).expect("parse").strref_uses();
+        let got: Vec<(u32, &str)> = uses.iter().map(|u| (u.value, u.path.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (10, "unidentified_name"),
+                (11, "identified_name"),
+                (20, "unidentified_description"),
+                (21, "identified_description"),
+            ]
+        );
     }
 }

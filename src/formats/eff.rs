@@ -13,8 +13,8 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crate::formats::opcode::opcode_name;
-use crate::{Reader, Truncated, describe_tag, parse_asciiz};
+use crate::formats::opcode::{StrrefSlot, opcode_name, opcode_strref_slots};
+use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for EFF files.
 pub const EFF_TYPE: u16 = 0x03f8;
@@ -232,6 +232,13 @@ impl Eff {
         self.secondary_name = secondary;
     }
 
+    /// TLK strrefs this effect references, tagged `op<n>.<field>`. Empty for the
+    /// vast majority of opcodes; non-empty for the string-display opcodes whose
+    /// `param1`/`special` field holds a strref. See [`effect_strref_uses`].
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        effect_strref_uses(self.opcode, self.param1, self.param2, self.special)
+    }
+
     /// Write the effect's fields as `key=value` lines, in disk order, exactly as
     /// stored (unsigned, undecoded). Each key carries `prefix` so the line is
     /// self-locating when embedded (e.g. `"effect.3."` in a CRE); the standalone
@@ -420,6 +427,30 @@ impl fmt::Display for Eff {
     }
 }
 
+/// The strref field uses for an effect with these field values, tagged
+/// `op<n>.<field>`. Shared by the standalone/CRE-embedded V2 [`Eff`] and the
+/// ITM/SPL/CRE V1 [`Feature`], which store the same effect at different widths.
+/// Table-driven from [`opcode_strref_slots`], plus op319's value-dependent
+/// Parameter #1 — a strref (the actor name to match) when Parameter #2, the IDS
+/// file, selects "Actor's name" (10). The embedding resource prefixes the paths
+/// with the effect's location (e.g. `equipping[0].`).
+fn effect_strref_uses(opcode: u32, param1: u32, param2: u32, special: u32) -> Vec<StrrefUse> {
+    let mut uses: Vec<StrrefUse> = opcode_strref_slots(opcode)
+        .iter()
+        .map(|slot| {
+            let (value, field) = match slot {
+                StrrefSlot::Param1 => (param1, "param1"),
+                StrrefSlot::Special => (special, "special"),
+            };
+            StrrefUse::new(value, format!("op{opcode}.{field}"))
+        })
+        .collect();
+    if opcode == 319 && param2 == 10 {
+        uses.push(StrrefUse::new(param1, format!("op{opcode}.param1")));
+    }
+    uses
+}
+
 /// Size of one EFF V1 feature block on disk.
 pub const FEATURE_SIZE: usize = 48;
 
@@ -492,6 +523,12 @@ impl Feature {
             save_bonus: reader.u32_at(base + 0x28, "save bonus")?,
             special: reader.u32_at(base + 0x2c, "special")?,
         })
+    }
+
+    /// TLK strrefs this feature references, tagged `op<n>.<field>`. Non-empty only
+    /// for string-display opcodes. See [`effect_strref_uses`].
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        effect_strref_uses(self.opcode as u32, self.param1, self.param2, self.special)
     }
 
     /// Render the feature in the human-readable view, each line prefixed with
@@ -661,5 +698,61 @@ fn save_type(value: u32) -> String {
         "none".to_string()
     } else {
         names.join("|")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 48-byte V1 feature block with the fields a strref test cares about.
+    fn feature(opcode: u16, param1: u32, param2: u32, special: u32) -> Feature {
+        let mut data = vec![0u8; FEATURE_SIZE];
+        data[0x00..0x02].copy_from_slice(&opcode.to_le_bytes());
+        data[0x04..0x08].copy_from_slice(&param1.to_le_bytes());
+        data[0x08..0x0c].copy_from_slice(&param2.to_le_bytes());
+        data[0x2c..0x30].copy_from_slice(&special.to_le_bytes());
+        Feature::parse_at(&Reader::new(&data), 0).expect("parse feature")
+    }
+
+    fn pairs(uses: &[StrrefUse]) -> Vec<(u32, &str)> {
+        uses.iter().map(|u| (u.value, u.path.as_str())).collect()
+    }
+
+    #[test]
+    fn display_string_opcode_uses_param1() {
+        assert_eq!(
+            pairs(&feature(139, 6831, 0, 0).strref_uses()),
+            vec![(6831, "op139.param1")]
+        );
+    }
+
+    #[test]
+    fn item_usability_uses_special_plus_conditional_param1() {
+        // Special is always a strref; Parameter #1 only when the IDS file is 10.
+        assert_eq!(
+            pairs(&feature(319, 100, 9, 200).strref_uses()),
+            vec![(200, "op319.special")]
+        );
+        assert_eq!(
+            pairs(&feature(319, 100, 10, 200).strref_uses()),
+            vec![(200, "op319.special"), (100, "op319.param1")]
+        );
+    }
+
+    #[test]
+    fn non_string_opcode_has_no_strrefs() {
+        assert!(feature(1, 5, 5, 5).strref_uses().is_empty());
+    }
+
+    #[test]
+    fn standalone_eff_shares_the_slot_table() {
+        let mut data = vec![0u8; 0x110];
+        data[0x00..0x04].copy_from_slice(EFF_SIGNATURE);
+        data[0x04..0x08].copy_from_slice(EFF_VERSION);
+        data[0x10..0x14].copy_from_slice(&139u32.to_le_bytes()); // opcode (body 0x08)
+        data[0x1c..0x20].copy_from_slice(&4242u32.to_le_bytes()); // param1 (body 0x14)
+        let eff = Eff::parse(&data).expect("parse eff");
+        assert_eq!(pairs(&eff.strref_uses()), vec![(4242, "op139.param1")]);
     }
 }

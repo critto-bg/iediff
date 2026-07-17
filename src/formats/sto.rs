@@ -19,7 +19,7 @@ use std::io::{self, Write};
 
 use crate::formats::fields::{set_flags, write_bitfield};
 use crate::formats::item_category_name;
-use crate::{Reader, Truncated, describe_tag};
+use crate::{Reader, StrrefUse, Truncated, describe_tag};
 
 /// Resource type code for STO files.
 pub const STO_TYPE: u16 = 0x03f6;
@@ -305,6 +305,19 @@ impl Sto {
     /// The store's name strref, for the manager to resolve against the TLK.
     pub fn name_strref(&self) -> u32 {
         self.header.name
+    }
+
+    /// Every TLK strref this store references, tagged with its field: the store
+    /// name, then each drink's name.
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        let mut uses = vec![StrrefUse::new(self.header.name, "name")];
+        for (i, drink) in self.drinks.iter().enumerate() {
+            uses.push(StrrefUse::new(
+                drink.name_strref(),
+                format!("drink[{i}].name"),
+            ));
+        }
+        uses
     }
 
     /// Attach the resolved store name.
@@ -647,6 +660,30 @@ mod tests {
         assert_eq!(sto.drinks.len(), 1);
         assert_eq!(sto.cures.len(), 2);
         assert_eq!(sto.header.store_type, 2);
+    }
+
+    #[test]
+    fn strref_uses_covers_store_and_drink_names() {
+        // Header only precedes the drinks (no purchased/sale), so they start at
+        // the 0x9c header length.
+        let mut data = build_sto(0, &[], 0, 2, 0);
+        let put = |data: &mut [u8], at: usize, value: u32| {
+            data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut data, 0x0c, 100); // store name
+        put(&mut data, 0x9c + 0x08, 201); // drink[0].name
+        put(&mut data, 0x9c + DRINK_SIZE + 0x08, 202); // drink[1].name
+
+        let uses = Sto::parse(&data).expect("parse").strref_uses();
+        let got: Vec<(u32, &str)> = uses.iter().map(|u| (u.value, u.path.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (100, "name"),
+                (201, "drink[0].name"),
+                (202, "drink[1].name"),
+            ]
+        );
     }
 
     #[test]

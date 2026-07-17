@@ -15,7 +15,7 @@ use std::io::{self, Write};
 
 use crate::formats::eff::{EFF_V2_BODY_SIZE, Eff, FEATURE_SIZE, Feature};
 use crate::formats::fields::set_bits;
-use crate::{Reader, Truncated, describe_tag, parse_asciiz};
+use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for CRE files.
 pub const CRE_TYPE: u16 = 0x03f1;
@@ -515,6 +515,31 @@ impl Cre {
     /// The header strrefs for the creature's long and short names.
     pub fn name_strrefs(&self) -> (u32, u32) {
         (self.header.long_name, self.header.short_name)
+    }
+
+    /// Every TLK strref this creature references, tagged with its field: the long
+    /// and short names, then the 100-entry soundset block. Embedded-effect string
+    /// opcodes are not yet decoded.
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        let h = &self.header;
+        let mut uses = vec![
+            StrrefUse::new(h.long_name, "long_name"),
+            StrrefUse::new(h.short_name, "short_name"),
+        ];
+        for (i, &s) in h.soundset.iter().enumerate() {
+            uses.push(StrrefUse::new(s, format!("soundset[{i}]")));
+        }
+        // Effects can carry a strref (a "display string" opcode), in either the
+        // V1 (feature) or V2 (eff) form.
+        for (i, effect) in self.effects.iter().enumerate() {
+            let inner = match effect {
+                CreEffect::V1(feat) => feat.strref_uses(),
+                CreEffect::V2(eff) => eff.strref_uses(),
+            };
+            let at = format!("effect[{i}]");
+            uses.extend(inner.into_iter().map(|u| u.prefixed(&at)));
+        }
+        uses
     }
 
     /// The IDS-mapped identity codes (EA, general, race, class, specific,
@@ -1132,3 +1157,63 @@ static SLOT_NAMES: [&str; SLOT_COUNT] = [
     "inventory 16",
     "magic weapon",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal CRE V1.0 file: a full header with every section count zeroed,
+    /// the item-slot section pointed at a zeroed tail (38 slots + 2 words).
+    fn build_cre() -> Vec<u8> {
+        let mut data = vec![0u8; 0x2d4];
+        data[0x00..0x04].copy_from_slice(CRE_SIGNATURE);
+        data[0x04..0x08].copy_from_slice(CRE_VERSION);
+        let slots_off = data.len();
+        data.resize(slots_off + (SLOT_COUNT + 2) * 2, 0);
+        data[0x2b8..0x2bc].copy_from_slice(&(slots_off as u32).to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn strref_uses_lists_names_then_soundset() {
+        let mut data = build_cre();
+        let put = |data: &mut [u8], at: usize, value: u32| {
+            data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut data, 0x08, 10); // long_name
+        put(&mut data, 0x0c, 11); // short_name
+        put(&mut data, 0xa4, 100); // soundset[0]
+        put(&mut data, 0xa4 + 99 * 4, 199); // soundset[99]
+
+        let uses = Cre::parse(&data).expect("parse").strref_uses();
+        assert_eq!(uses.len(), 2 + 100);
+        assert_eq!((uses[0].value, uses[0].path.as_str()), (10, "long_name"));
+        assert_eq!((uses[1].value, uses[1].path.as_str()), (11, "short_name"));
+        assert_eq!((uses[2].value, uses[2].path.as_str()), (100, "soundset[0]"));
+        assert_eq!(
+            (uses[101].value, uses[101].path.as_str()),
+            (199, "soundset[99]")
+        );
+    }
+
+    #[test]
+    fn strref_uses_includes_display_string_effects() {
+        // build_cre leaves eff_version 0, so effects are V1 features. Append one
+        // with a Display String opcode (139) whose param1 is a strref.
+        let mut data = build_cre();
+        let eff_off = data.len();
+        data.resize(eff_off + FEATURE_SIZE, 0);
+        data[eff_off..eff_off + 2].copy_from_slice(&139u16.to_le_bytes());
+        data[eff_off + 0x04..eff_off + 0x08].copy_from_slice(&777u32.to_le_bytes());
+        data[0x2c4..0x2c8].copy_from_slice(&(eff_off as u32).to_le_bytes());
+        data[0x2c8..0x2cc].copy_from_slice(&1u32.to_le_bytes());
+
+        let uses = Cre::parse(&data).expect("parse").strref_uses();
+        assert!(
+            uses.iter()
+                .any(|u| u.value == 777 && u.path == "effect[0].op139.param1"),
+            "missing effect strref; got {:?}",
+            uses.iter().map(|u| u.path.as_str()).collect::<Vec<_>>()
+        );
+    }
+}

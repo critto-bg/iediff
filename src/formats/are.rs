@@ -17,7 +17,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::formats::fields::{set_bits, set_flags, write_bitfield};
-use crate::{Reader, Truncated, describe_tag, parse_asciiz};
+use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for ARE files.
 pub const ARE_TYPE: u16 = 0x03f2;
@@ -231,6 +231,9 @@ pub struct Region {
     trapped: u16,
     key_item: String,
     script: String,
+    /// Speaker name for a region that starts dialogue (PST/PSTEE only; `-1`
+    /// elsewhere). A strref, but not resolved for the human view.
+    speaker_name: u32,
     /// Info-point text, resolved by the manager from the TLK.
     info_label: Option<String>,
 }
@@ -249,6 +252,7 @@ impl Region {
             trapped: reader.u16_at(base + 0x6c, "region trapped")?,
             key_item: reader.resref_at(base + 0x74, "region key item")?,
             script: reader.resref_at(base + 0x7c, "region script")?,
+            speaker_name: reader.u32_at(base + 0xb8, "region speaker name")?,
             info_label: None,
         })
     }
@@ -296,6 +300,9 @@ pub struct Container {
     item_index: u32,
     item_count: u32,
     key_item: String,
+    /// Message shown when the lock resists (a strref); not resolved for the
+    /// human view.
+    lockpick_string: u32,
 }
 
 impl Container {
@@ -311,6 +318,7 @@ impl Container {
             item_index: reader.u32_at(base + 0x40, "container item index")?,
             item_count: reader.u32_at(base + 0x44, "container item count")?,
             key_item: reader.resref_at(base + 0x78, "container key item")?,
+            lockpick_string: reader.u32_at(base + 0x84, "container lockpick string")?,
         })
     }
 }
@@ -485,6 +493,9 @@ pub struct Door {
     key_item: String,
     script: String,
     lock_difficulty: u32,
+    /// Message shown when the lock resists (a strref); not resolved for the
+    /// human view.
+    lockpick_string: u32,
     dialog_speaker: u32,
     dialog: String,
     /// Dialog speaker name, resolved by the manager from the TLK.
@@ -505,6 +516,7 @@ impl Door {
             key_item: reader.resref_at(base + 0x78, "door key item")?,
             script: reader.resref_at(base + 0x80, "door script")?,
             lock_difficulty: reader.u32_at(base + 0x8c, "door lock")?,
+            lockpick_string: reader.u32_at(base + 0x98, "door lockpick string")?,
             dialog_speaker: reader.u32_at(base + 0xb4, "door dialog speaker")?,
             dialog: reader.resref_at(base + 0xb8, "door dialog")?,
             speaker_label: None,
@@ -957,6 +969,43 @@ impl Are {
         &mut self.automap
     }
 
+    /// Every TLK strref this area references, tagged with its field: region info
+    /// text and speaker name, container and door lockpick strings, door dialog
+    /// speakers, and automap note text.
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        let mut uses = Vec::new();
+        for (i, r) in self.regions.iter().enumerate() {
+            uses.push(StrrefUse::new(
+                r.info_text,
+                format!("region[{i}].info_text"),
+            ));
+            uses.push(StrrefUse::new(
+                r.speaker_name,
+                format!("region[{i}].speaker_name"),
+            ));
+        }
+        for (i, c) in self.containers.iter().enumerate() {
+            uses.push(StrrefUse::new(
+                c.lockpick_string,
+                format!("container[{i}].lockpick_string"),
+            ));
+        }
+        for (i, d) in self.doors.iter().enumerate() {
+            uses.push(StrrefUse::new(
+                d.lockpick_string,
+                format!("door[{i}].lockpick_string"),
+            ));
+            uses.push(StrrefUse::new(
+                d.dialog_speaker,
+                format!("door[{i}].dialog_speaker"),
+            ));
+        }
+        for (i, n) in self.automap.iter().enumerate() {
+            uses.push(StrrefUse::new(n.strref(), format!("automap[{i}].text")));
+        }
+        uses
+    }
+
     /// The projectile traps, for the manager to resolve their missile symbols.
     pub fn proj_traps_mut(&mut self) -> &mut [ProjectileTrap] {
         &mut self.proj_traps
@@ -1025,6 +1074,11 @@ impl Are {
             writeln!(out, "region.{i}.trapped={}", r.trapped)?;
             writeln!(out, "region.{i}.key_item={}", r.key_item)?;
             writeln!(out, "region.{i}.script={}", r.script)?;
+            writeln!(
+                out,
+                "region.{i}.speaker_name={}",
+                strref_raw(r.speaker_name)
+            )?;
         }
 
         for (i, e) in self.entrances.iter().enumerate() {
@@ -1045,6 +1099,11 @@ impl Are {
             writeln!(out, "container.{i}.item_index={}", c.item_index)?;
             writeln!(out, "container.{i}.item_count={}", c.item_count)?;
             writeln!(out, "container.{i}.key_item={}", c.key_item)?;
+            writeln!(
+                out,
+                "container.{i}.lockpick_string={}",
+                strref_raw(c.lockpick_string)
+            )?;
         }
 
         for (i, it) in self.items.iter().enumerate() {
@@ -1107,6 +1166,11 @@ impl Are {
             writeln!(out, "door.{i}.key_item={}", d.key_item)?;
             writeln!(out, "door.{i}.script={}", d.script)?;
             writeln!(out, "door.{i}.lock={}", d.lock_difficulty)?;
+            writeln!(
+                out,
+                "door.{i}.lockpick_string={}",
+                strref_raw(d.lockpick_string)
+            )?;
             writeln!(
                 out,
                 "door.{i}.dialog_speaker={}",
@@ -1652,6 +1716,48 @@ mod tests {
         let are = Are::parse(&data).expect("parse");
         assert_eq!(are.containers.len(), 1);
         assert!(are.container_items(&are.containers[0]).is_empty());
+    }
+
+    #[test]
+    fn strref_uses_labels_each_section() {
+        let mut data = build_are();
+        let region_off = data.len();
+        data.resize(region_off + REGION_SIZE, 0);
+        put_u32(&mut data, region_off + 0x64, 100); // region info text
+        put_u32(&mut data, region_off + 0xb8, 101); // region speaker name
+        let cont_off = data.len();
+        data.resize(cont_off + CONTAINER_SIZE, 0);
+        put_u32(&mut data, cont_off + 0x84, 400); // container lockpick string
+        let door_off = data.len();
+        data.resize(door_off + DOOR_SIZE, 0);
+        put_u32(&mut data, door_off + 0x98, 201); // door lockpick string
+        put_u32(&mut data, door_off + 0xb4, 200); // door dialog speaker
+        let note_off = data.len();
+        data.resize(note_off + AUTOMAP_SIZE, 0);
+        put_u32(&mut data, note_off + 0x04, 300); // automap note text
+
+        put_u32(&mut data, 0x5c, region_off as u32);
+        put_u16(&mut data, 0x5a, 1);
+        put_u32(&mut data, 0x70, cont_off as u32);
+        put_u16(&mut data, 0x74, 1);
+        put_u32(&mut data, 0xa8, door_off as u32);
+        put_u32(&mut data, 0xa4, 1);
+        put_u32(&mut data, 0xc4, note_off as u32);
+        put_u32(&mut data, 0xc8, 1);
+
+        let uses = Are::parse(&data).expect("parse").strref_uses();
+        let got: Vec<(u32, &str)> = uses.iter().map(|u| (u.value, u.path.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (100, "region[0].info_text"),
+                (101, "region[0].speaker_name"),
+                (400, "container[0].lockpick_string"),
+                (201, "door[0].lockpick_string"),
+                (200, "door[0].dialog_speaker"),
+                (300, "automap[0].text"),
+            ]
+        );
     }
 
     #[test]

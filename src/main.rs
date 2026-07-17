@@ -130,6 +130,33 @@ pub fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
     h.len() >= p.len() && h.iter().zip(p).all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
+/// One place a resource references a TLK string: the `strref` value and a short
+/// path naming the field it came from (e.g. `"identified_name"`,
+/// `"soundset[42]"`, `"region[3].info_text"`). Each parsed format yields these
+/// via its `strref_uses`; a reverse search filters them by value.
+pub struct StrrefUse {
+    pub value: u32,
+    pub path: String,
+}
+
+impl StrrefUse {
+    pub fn new(value: u32, path: impl Into<String>) -> StrrefUse {
+        StrrefUse {
+            value,
+            path: path.into(),
+        }
+    }
+
+    /// Prepend a location to the path (`op139.param1` → `equipping[0].op139.param1`),
+    /// for a strref found in an effect nested inside a resource.
+    pub fn prefixed(self, prefix: &str) -> StrrefUse {
+        StrrefUse {
+            value: self.value,
+            path: format!("{prefix}.{}", self.path),
+        }
+    }
+}
+
 /// Decode a NUL-terminated (and possibly NUL-padded) ASCII field. Trailing
 /// garbage after the first NUL is ignored, per the format conventions.
 pub fn parse_asciiz(bytes: &[u8]) -> String {
@@ -343,22 +370,106 @@ fn print_string(
     Ok(())
 }
 
+/// Report every resource that references a strref (`strref:<n> --uses`), honouring
+/// `--biff` and an optional `--type` filter. Each hit shows where it resolved from
+/// and which of its fields carry the strref. The typed scan covers the decoded
+/// strref-bearing formats (EFF, ITM, SPL, CRE, PRO, STO, ARE) — not DLG or
+/// scripts. 2DA/IDS text tables are scanned heuristically (a numeric token match)
+/// and reported separately as candidates to judge.
+fn print_strref_uses(
+    out: &mut impl Write,
+    manager: &mut ResourceManager,
+    number: &str,
+    source: Source,
+    type_ext: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let strref: u32 = number
+        .parse()
+        .map_err(|_| format!("invalid strref: {number}"))?;
+    if strref == u32::MAX {
+        return Err(
+            "strref -1 (0xffffffff) is the \"no string\" sentinel, not a searchable index".into(),
+        );
+    }
+    let type_filter = match type_ext {
+        None => None,
+        Some(ext) => Some(
+            extension_type(&ext.to_ascii_lowercase())
+                .ok_or_else(|| format!("unknown resource extension: .{ext}"))?,
+        ),
+    };
+
+    // Lead with the string itself for context, when it resolves.
+    match manager.string(strref) {
+        Ok(s) => writeln!(out, "strref {strref}: {s:?}")?,
+        Err(_) => writeln!(out, "strref {strref}:")?,
+    }
+
+    let hits = manager.find_strref(strref, source, type_filter);
+    let (hard, soft): (Vec<_>, Vec<_>) = hits.iter().partition(|h| !h.soft);
+
+    if hard.is_empty() && soft.is_empty() {
+        writeln!(out, "no references found")?;
+        return Ok(());
+    }
+
+    if !hard.is_empty() {
+        writeln!(out, "{} resource(s) reference it:", hard.len())?;
+        print_strref_hits(out, &hard)?;
+    }
+    if !soft.is_empty() {
+        writeln!(
+            out,
+            "{} possible text match(es) in 2DA/IDS (verify — the number may not be a strref):",
+            soft.len()
+        )?;
+        print_strref_hits(out, &soft)?;
+    }
+    Ok(())
+}
+
+/// Print strref hits, one line each (`NAME.ext  (origin)  fields`), truncated at
+/// [`SEARCH_LIMIT`].
+fn print_strref_hits(
+    out: &mut impl Write,
+    hits: &[&resource::StrrefHit],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for hit in hits.iter().take(SEARCH_LIMIT) {
+        writeln!(
+            out,
+            "  {}.{}  ({})  {}",
+            hit.name,
+            type_extension(hit.res_type),
+            hit.origin,
+            hit.fields.join(", "),
+        )?;
+    }
+    if hits.len() > SEARCH_LIMIT {
+        writeln!(out, "  … and {} more", hits.len() - SEARCH_LIMIT)?;
+    }
+    Ok(())
+}
+
 /// Short usage guide. `--help` and a bare invocation print this; it needs no
 /// game data, so it works without a readable KEY.
 const USAGE: &str = "\
 iediff — inspect Infinity Engine resources (BG2:EE)
 
 Usage:
-  iediff <name>[.ext]   print a resource; a bare name or an inexact match runs a prefix search
-  iediff strref:<n>     resolve a dialog.tlk string by index
-  iediff --file <path>  print a discrete file by path, bypassing the index
-  iediff --stats        summarise the KEY index and override directory
-  iediff [--help|-h]    show this help
+  iediff <name>[.ext]      print a resource; a bare name or an inexact match runs a prefix search
+  iediff strref:<n>        resolve a dialog.tlk string by index
+  iediff strref:<n> --uses list the resources that reference the string
+  iediff --file <path>     print a discrete file by path, bypassing the index
+  iediff --stats           summarise the KEY index and override directory
+  iediff [--help|-h]       show this help
 
 Options:
   --raw                 machine-readable key=value output (binary formats)
   --biff                bypass the override directory; read the archived original
   --file                read the argument as a filesystem path (type from its extension)
+  --uses                with strref:<n>, find where the string is referenced
+                        (typed fields, plus heuristic 2DA/IDS text matches)
+  --type <ext>          with --uses, scan only one resource type (e.g. itm)
 
 Decoded formats: 2da ids eff itm spl cre pro sto are
 Other resource types are located and summarised (type, size) but not parsed.
@@ -373,8 +484,11 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut stats = false;
     let mut file = false;
     let mut help = false;
+    let mut uses = false;
+    let mut type_ext: Option<String> = None;
 
-    for arg in env::args().skip(1) {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             // Skip the override layer and read straight from the archives.
             "--biff" => source = Source::Biff,
@@ -384,6 +498,15 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
             "--stats" => stats = true,
             // Read the query as a filesystem path, bypassing the KEY/override index.
             "--file" => file = true,
+            // Report where a `strref:<n>` query's string is referenced.
+            "--uses" => uses = true,
+            // Narrow `--uses` to a single resource type (e.g. `--type itm`).
+            "--type" => {
+                type_ext = Some(
+                    args.next()
+                        .ok_or("--type needs a resource extension (e.g. itm)")?,
+                );
+            }
             "--help" | "-h" => help = true,
             _ if query.is_none() => query = Some(arg),
             _ => return Err(format!("unexpected argument: {arg}").into()),
@@ -415,8 +538,16 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     // The guard above guarantees a query here; the `None` arm is an inert
     // fallback rather than a panic.
     if let Some(query) = query {
-        // A `strref:N` query resolves a TLK string; anything else is a resource.
-        match query.strip_prefix("strref:") {
+        let strref = query.strip_prefix("strref:");
+        if (uses || type_ext.is_some()) && strref.is_none() {
+            return Err("--uses and --type apply only to a strref:<n> query".into());
+        }
+        // A `strref:N` query resolves a TLK string, or — with `--uses` — reports
+        // where that string is referenced; anything else is a resource.
+        match strref {
+            Some(number) if uses => {
+                print_strref_uses(out, &mut manager, number, source, type_ext.as_deref())?
+            }
             Some(number) => print_string(out, &mut manager, number)?,
             None => lookup_and_print(out, &mut manager, &query, source, raw)?,
         }

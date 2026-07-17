@@ -17,7 +17,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::formats::fields::{set_flags, write_bitfield};
-use crate::{Reader, Truncated, describe_tag, join_bytes};
+use crate::{Reader, StrrefUse, Truncated, describe_tag, join_bytes};
 
 /// Resource type code for PRO files.
 pub const PRO_TYPE: u16 = 0x03fd;
@@ -342,6 +342,11 @@ impl Pro {
     /// Strref of the displayed targeting message.
     pub fn message_strref(&self) -> u32 {
         self.header.message
+    }
+
+    /// Every TLK strref this projectile references: just the targeting message.
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        vec![StrrefUse::new(self.header.message, "message")]
     }
 
     /// Resref of the spell cast when the projectile misses (`Default spell`).
@@ -951,6 +956,15 @@ mod tests {
         let pro = Pro::parse(&build_pro(3, 768)).expect("parse");
         assert!(pro.travel_smoke().is_some());
         assert!(pro.area_codes().is_some());
+    }
+
+    #[test]
+    fn strref_uses_reports_the_message() {
+        let mut data = build_pro(0, 256);
+        data[0x30..0x34].copy_from_slice(&42u32.to_le_bytes());
+        let uses = Pro::parse(&data).expect("parse").strref_uses();
+        assert_eq!(uses.len(), 1);
+        assert_eq!((uses[0].value, uses[0].path.as_str()), (42, "message"));
     }
 
     #[test]
