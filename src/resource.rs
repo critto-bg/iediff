@@ -300,7 +300,7 @@ impl fmt::Display for Resource {
 impl Resource {
     /// Write the machine-readable view: flat `key=value` lines for the binary
     /// formats. The text formats (IDS, 2DA) are already field-oriented, so they
-    /// reuse their normal rendering.
+    /// keep their tabular rendering, minus the human view's reading aids.
     pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
         match self {
             Resource::Eff(eff) => eff.write_raw(out, ""),
@@ -311,7 +311,7 @@ impl Resource {
             Resource::Sto(sto) => sto.write_raw(out),
             Resource::Are(are) => are.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
-            Resource::TwoDA(table) => write!(out, "{table}"),
+            Resource::TwoDA(table) => table.write_raw(out),
             Resource::Other(info) => write!(out, "{info}"),
         }
     }

@@ -49,6 +49,10 @@ as a filesystem path, taking the type from its extension; referenced names still
 resolve against the game directory — handy for inspecting modded resources before
 they are copied into `override`).
 
+The 2DA view labels each column with its 0-based index as WeiDU counts it —
+column 0 is the row label — so `SET_2DA_ENTRY`/`READ_2DA_ENTRY` numbers read
+straight off the dump.
+
 Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE. Other resource types are
 located and summarised (type, size) but not parsed. Runs against `./chitin.key`
 when present (so it works from a game root), else `game/chitin.key`.
