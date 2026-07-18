@@ -373,9 +373,10 @@ fn print_string(
 /// Report every resource that references a strref (`strref:<n> --uses`), honouring
 /// `--biff` and an optional `--type` filter. Each hit shows where it resolved from
 /// and which of its fields carry the strref. The typed scan covers the decoded
-/// strref-bearing formats (EFF, ITM, SPL, CRE, PRO, STO, ARE) — not DLG or
-/// scripts. 2DA/IDS text tables are scanned heuristically (a numeric token match)
-/// and reported separately as candidates to judge.
+/// strref-bearing formats (EFF, ITM, SPL, CRE, PRO, STO, ARE, DLG). 2DA/IDS text
+/// tables and DLG action scripts (the engine's strref-bearing actions, e.g.
+/// DisplayString / journal entries) are scanned heuristically and reported
+/// separately as candidates. BCS/BAF scripts are not scanned.
 fn print_strref_uses(
     out: &mut impl Write,
     manager: &mut ResourceManager,
@@ -420,7 +421,7 @@ fn print_strref_uses(
     if !soft.is_empty() {
         writeln!(
             out,
-            "{} possible text match(es) in 2DA/IDS (verify — the number may not be a strref):",
+            "{} possible match(es) in 2DA/IDS text or DLG scripts (verify — the number may not be a strref):",
             soft.len()
         )?;
         print_strref_hits(out, &soft)?;
@@ -468,10 +469,10 @@ Options:
   --biff                bypass the override directory; read the archived original
   --file                read the argument as a filesystem path (type from its extension)
   --uses                with strref:<n>, find where the string is referenced
-                        (typed fields, plus heuristic 2DA/IDS text matches)
+                        (typed fields, plus heuristic 2DA/IDS + DLG-script matches)
   --type <ext>          with --uses, scan only one resource type (e.g. itm)
 
-Decoded formats: 2da ids eff itm spl cre pro sto are
+Decoded formats: 2da ids eff itm spl cre pro sto are dlg
 Other resource types are located and summarised (type, size) but not parsed.
 
 Reads ./chitin.key if present (run from a game root), else game/chitin.key.

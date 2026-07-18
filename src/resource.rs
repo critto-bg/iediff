@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::formats::are::{ARE_TYPE, Are, AreError};
 use crate::formats::bif::{BifArchive, BifError};
 use crate::formats::cre::{CRE_TYPE, Cre, CreError, CreNames};
+use crate::formats::dlg::{DLG_TYPE, Dlg, DlgError};
 use crate::formats::eff::{EFF_TYPE, Eff, EffError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
 use crate::formats::itm::{ITM_TYPE, Itm, ItmError};
@@ -44,6 +45,7 @@ pub enum ResourceError {
     Pro(ProError),
     Sto(StoError),
     Are(AreError),
+    Dlg(DlgError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -68,6 +70,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Pro(e) => write!(f, "{e}"),
             ResourceError::Sto(e) => write!(f, "{e}"),
             ResourceError::Are(e) => write!(f, "{e}"),
+            ResourceError::Dlg(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -93,6 +96,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Pro(e) => Some(e),
             ResourceError::Sto(e) => Some(e),
             ResourceError::Are(e) => Some(e),
+            ResourceError::Dlg(e) => Some(e),
             _ => None,
         }
     }
@@ -167,6 +171,12 @@ impl From<StoError> for ResourceError {
 impl From<AreError> for ResourceError {
     fn from(e: AreError) -> Self {
         ResourceError::Are(e)
+    }
+}
+
+impl From<DlgError> for ResourceError {
+    fn from(e: DlgError) -> Self {
+        ResourceError::Dlg(e)
     }
 }
 
@@ -277,6 +287,7 @@ pub enum Resource {
     Pro(Pro),
     Sto(Sto),
     Are(Are),
+    Dlg(Dlg),
     Other(ResourceInfo),
 }
 
@@ -292,6 +303,7 @@ impl fmt::Display for Resource {
             Resource::Pro(pro) => write!(f, "{pro}"),
             Resource::Sto(sto) => write!(f, "{sto}"),
             Resource::Are(are) => write!(f, "{are}"),
+            Resource::Dlg(dlg) => write!(f, "{dlg}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -310,6 +322,7 @@ impl Resource {
             Resource::Pro(pro) => pro.write_raw(out),
             Resource::Sto(sto) => sto.write_raw(out),
             Resource::Are(are) => are.write_raw(out),
+            Resource::Dlg(dlg) => dlg.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => table.write_raw(out),
             Resource::Other(info) => write!(out, "{info}"),
@@ -367,19 +380,28 @@ impl SearchResults {
 
 /// Resource types with a *typed* strref field, which a reverse search matches
 /// exactly. These are the binary formats we decode.
-const STRREF_TYPES: [u16; 7] = [
-    EFF_TYPE, ITM_TYPE, SPL_TYPE, CRE_TYPE, PRO_TYPE, STO_TYPE, ARE_TYPE,
+const STRREF_TYPES: [u16; 8] = [
+    EFF_TYPE, ITM_TYPE, SPL_TYPE, CRE_TYPE, PRO_TYPE, STO_TYPE, ARE_TYPE, DLG_TYPE,
 ];
 
-/// Text formats searched heuristically ("soft"): a strref may appear as a cell
-/// value (2DA) or table value (IDS), but nothing types it as one, so a numeric
-/// match is only a candidate. Opt-in, since small numbers match everywhere.
+/// Text formats with no typed strref field of their own, pulled into the search
+/// universe purely for the heuristic ("soft") scan: a strref may appear as a
+/// cell value (2DA) or table value (IDS), but nothing types it as one, so a
+/// numeric match is only a candidate. DLG is soft-scanned too (its action
+/// scripts), but already appears in [`STRREF_TYPES`] for its typed fields.
 const SOFT_TYPES: [u16; 2] = [TWODA_TYPE, IDS_TYPE];
 
-/// Whether `res_type` is soft-searched (a text table) rather than matched by a
-/// typed field.
-fn is_soft_type(res_type: u16) -> bool {
-    SOFT_TYPES.contains(&res_type)
+/// Heuristic ("soft") matches for a strref in a resource whose references
+/// aren't fully typed: the line numbers of a 2DA/IDS text table where the number
+/// appears, or the strref-bearing action calls in a DLG's scripts.
+fn soft_matches(res_type: u16, data: &[u8], target: u32) -> Vec<String> {
+    match res_type {
+        TWODA_TYPE | IDS_TYPE => soft_text_matches(data, target),
+        DLG_TYPE => Dlg::parse(data)
+            .map(|d| d.script_strref_candidates(target))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// One resource that references the searched-for strref, and the field(s) or
@@ -451,6 +473,9 @@ fn extract_strrefs(res_type: u16, data: &[u8]) -> Vec<StrrefUse> {
             .unwrap_or_default(),
         ARE_TYPE => Are::parse(data)
             .map(|a| a.strref_uses())
+            .unwrap_or_default(),
+        DLG_TYPE => Dlg::parse(data)
+            .map(|d| d.strref_uses())
             .unwrap_or_default(),
         _ => Vec::new(),
     }
@@ -895,6 +920,25 @@ impl ResourceManager {
 
                 Resource::Are(are)
             }
+            DLG_TYPE => {
+                let mut dlg = Dlg::parse(data)?;
+
+                // Resolve the actor lines and the player/journal text of each
+                // transition against the TLK for the human view.
+                self.resolve_strrefs(dlg.states_mut(), |s| s.strref(), |s, l| s.set_label(l));
+                self.resolve_strrefs(
+                    dlg.transitions_mut(),
+                    |t| t.player_strref().unwrap_or(u32::MAX),
+                    |t, l| t.set_player_label(l),
+                );
+                self.resolve_strrefs(
+                    dlg.transitions_mut(),
+                    |t| t.journal_strref().unwrap_or(u32::MAX),
+                    |t, l| t.set_journal_label(l),
+                );
+
+                Resource::Dlg(dlg)
+            }
             _ => Resource::Other(ResourceInfo {
                 res_type,
                 size: data.len() as u32,
@@ -986,27 +1030,35 @@ impl ResourceManager {
             let Some(located) = self.locate(&name, res_type, source) else {
                 continue;
             };
-            let origin = located.origin();
             let Ok(bytes) = self.read_located(&located) else {
                 continue;
             };
-            let soft_hit = is_soft_type(res_type);
-            let fields: Vec<String> = if soft_hit {
-                soft_text_matches(&bytes, target)
-            } else {
-                extract_strrefs(res_type, &bytes)
-                    .into_iter()
-                    .filter(|u| u.value == target)
-                    .map(|u| u.path)
-                    .collect()
-            };
-            if !fields.is_empty() {
+
+            // Exact matches on typed strref fields, and — for DLG scripts and
+            // 2DA/IDS text — heuristic candidates.
+            let hard: Vec<String> = extract_strrefs(res_type, &bytes)
+                .into_iter()
+                .filter(|u| u.value == target)
+                .map(|u| u.path)
+                .collect();
+            if !hard.is_empty() {
+                hits.push(StrrefHit {
+                    name: name.clone(),
+                    res_type,
+                    origin: located.origin(),
+                    fields: hard,
+                    soft: false,
+                });
+            }
+
+            let soft = soft_matches(res_type, &bytes, target);
+            if !soft.is_empty() {
                 hits.push(StrrefHit {
                     name,
                     res_type,
-                    origin,
-                    fields,
-                    soft: soft_hit,
+                    origin: located.origin(),
+                    fields: soft,
+                    soft: true,
                 });
             }
         }

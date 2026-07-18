@@ -7,6 +7,7 @@
 pub mod are;
 pub mod bif;
 pub mod cre;
+pub mod dlg;
 pub mod eff;
 pub mod fields;
 pub mod ids;

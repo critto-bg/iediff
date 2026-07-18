@@ -15,13 +15,14 @@ patch it, and verify the change.
 
 ## Status
 
-Parses and prints these formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE
-(atop the KEY/BIF/TLK index layer). ARE decodes every section — actors, regions,
-containers/items, spawns, doors, ambients, animations, automap notes, variables,
-tiled objects, projectile traps, songs, rest interruptions and the vertex pool;
-only the opaque explored-cell bitmap is reported by size alone. Other resource
-types are located and summarised (type and size) but not yet decoded. Diffing is
-not implemented yet.
+Parses and prints these formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE,
+DLG (atop the KEY/BIF/TLK index layer). ARE decodes every section — actors,
+regions, containers/items, spawns, doors, ambients, animations, automap notes,
+variables, tiled objects, projectile traps, songs, rest interruptions and the
+vertex pool; only the opaque explored-cell bitmap is reported by size alone. DLG
+decodes the state machine — actor lines, player transitions, and the trigger and
+action scripts. Other resource types are located and summarised (type and size)
+but not yet decoded. Diffing is not implemented yet.
 
 ## Build
 
@@ -57,13 +58,15 @@ straight off the dump.
 `strref:<n> --uses` reports every resource that references string `<n>`, with the
 field(s) that carry it and where each resource resolved from (`--biff` and
 `--type <ext>` narrow the scan). The typed scan covers the decoded strref-bearing
-formats (EFF, ITM, SPL, CRE, PRO, STO, ARE), including strrefs buried in item /
-spell / creature effects (the "display string" opcodes). 2DA and IDS text tables
-are also scanned heuristically — any line where `<n>` appears as a number is
-reported separately as a candidate to judge, since nothing types it as a strref.
-DLG and scripts, which hold most string references, are not yet parsed.
+formats (EFF, ITM, SPL, CRE, PRO, STO, ARE, DLG), including strrefs buried in item
+/ spell / creature effects (the "display string" opcodes) and the actor lines,
+player replies and journal entries of dialogues. Two sources are also scanned
+heuristically and reported separately as candidates to judge (since nothing types
+the number as a strref): 2DA/IDS text tables — any line where `<n>` appears as a
+number — and DLG action scripts, where `<n>` is an argument to one of the
+engine's strref-bearing actions (`DisplayString*`, journal entries, etc.). BCS/BAF scripts are not scanned.
 
-Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE. Other resource types are
+Decoded formats: 2DA, IDS, EFF, ITM, SPL, CRE, PRO, STO, ARE, DLG. Other resource types are
 located and summarised (type, size) but not parsed. Runs against `./chitin.key`
 when present (so it works from a game root), else `game/chitin.key`.
 
