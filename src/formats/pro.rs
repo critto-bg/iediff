@@ -17,7 +17,9 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::formats::fields::{set_flags, write_bitfield};
-use crate::{Reader, StrrefUse, Truncated, describe_tag, join_bytes};
+use crate::formats::spl::SPL_TYPE;
+use crate::formats::{BAM_TYPE, BMP_TYPE, WAV_TYPE};
+use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, join_bytes};
 
 /// Resource type code for PRO files.
 pub const PRO_TYPE: u16 = 0x03fd;
@@ -347,6 +349,58 @@ impl Pro {
     /// Every TLK strref this projectile references: just the targeting message.
     pub fn strref_uses(&self) -> Vec<StrrefUse> {
         vec![StrrefUse::new(self.header.message, "message")]
+    }
+
+    /// Every resource this projectile names, tagged with the type it names: its
+    /// sounds, animations, palette, and the two spells it can cast. The
+    /// animations the engine resolves through a VEF → VVC → BAM fallback chain
+    /// are tagged BAM but marked soft, since any of the three can satisfy them.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let h = &self.header;
+        let mut uses = vec![
+            ResrefUse::new(WAV_TYPE, &h.fire_sound, "fire_sound"),
+            ResrefUse::new(WAV_TYPE, &h.impact_sound, "impact_sound"),
+            ResrefUse::new(BAM_TYPE, &h.source_animation, "source_animation").soft(),
+            ResrefUse::new(SPL_TYPE, &h.default_spell, "default_spell"),
+            ResrefUse::new(SPL_TYPE, &h.success_spell, "success_spell"),
+        ];
+        if let Some(t) = &self.travel {
+            uses.push(ResrefUse::new(
+                BAM_TYPE,
+                &t.projectile_animation,
+                "travel.projectile_animation",
+            ));
+            uses.push(ResrefUse::new(
+                BAM_TYPE,
+                &t.shadow_animation,
+                "travel.shadow_animation",
+            ));
+            uses.push(ResrefUse::new(BMP_TYPE, &t.palette, "travel.palette"));
+            for (i, anim) in t.trailing_animation.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    BAM_TYPE,
+                    anim,
+                    format!("travel.trailing_animation[{i}]"),
+                ));
+            }
+        }
+        if let Some(a) = &self.area {
+            uses.push(ResrefUse::new(
+                WAV_TYPE,
+                &a.explosion_sound,
+                "area.explosion_sound",
+            ));
+            uses.push(ResrefUse::new(WAV_TYPE, &a.area_sound, "area.area_sound"));
+            uses.push(
+                ResrefUse::new(BAM_TYPE, &a.explosion_animation, "area.explosion_animation").soft(),
+            );
+            uses.push(
+                ResrefUse::new(BAM_TYPE, &a.spread_animation, "area.spread_animation").soft(),
+            );
+            uses.push(ResrefUse::new(BAM_TYPE, &a.ring_animation, "area.ring_animation").soft());
+        }
+        uses.retain(|u| !u.value.is_empty());
+        uses
     }
 
     /// Resref of the spell cast when the projectile misses (`Default spell`).
@@ -956,6 +1010,48 @@ mod tests {
         let pro = Pro::parse(&build_pro(3, 768)).expect("parse");
         assert!(pro.travel_smoke().is_some());
         assert!(pro.area_codes().is_some());
+    }
+
+    #[test]
+    fn resref_uses_grow_with_the_substructs_and_mark_fallbacks_soft() {
+        // A type-0 projectile has neither substruct, so only header refs appear.
+        let mut data = build_pro(0, 256);
+        data[0x10..0x14].copy_from_slice(b"FIRE"); // fire sound
+        data[0x20..0x24].copy_from_slice(b"SRCA"); // source animation
+        data[0x44..0x48].copy_from_slice(b"SPWI"); // default spell
+        let pro = Pro::parse(&data).expect("parse");
+        let uses = pro.resref_uses();
+        let got: Vec<(u16, &str, &str, bool)> = uses
+            .iter()
+            .map(|u| (u.kind, u.value, u.path.as_str(), u.soft))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (WAV_TYPE, "FIRE", "fire_sound", false),
+                // VEF → VVC → BAM fallback chain: tagged BAM, but only a guess.
+                (BAM_TYPE, "SRCA", "source_animation", true),
+                (SPL_TYPE, "SPWI", "default_spell", false),
+            ]
+        );
+
+        // A type-2 projectile adds the travel struct, whose refs are unambiguous.
+        let mut data = build_pro(2, 512);
+        data[TRAVEL_BASE + 0x04..TRAVEL_BASE + 0x08].copy_from_slice(b"TRVL");
+        data[TRAVEL_BASE + 0x1c..TRAVEL_BASE + 0x20].copy_from_slice(b"PLTT");
+        let pro = Pro::parse(&data).expect("parse");
+        let uses = pro.resref_uses();
+        let got: Vec<(u16, &str, &str, bool)> = uses
+            .iter()
+            .map(|u| (u.kind, u.value, u.path.as_str(), u.soft))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (BAM_TYPE, "TRVL", "travel.projectile_animation", false),
+                (BMP_TYPE, "PLTT", "travel.palette", false),
+            ]
+        );
     }
 
     #[test]

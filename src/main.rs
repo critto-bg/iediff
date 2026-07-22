@@ -4,8 +4,12 @@
 //! format-agnostic building blocks (the byte [`Reader`] and the [`Truncated`]
 //! error) plus the CLI driver.
 
+#[cfg(test)]
+mod fixture;
 mod formats;
 mod resource;
+mod script;
+mod search;
 
 use std::borrow::Cow;
 use std::env;
@@ -15,7 +19,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use formats::key::{extension_type, type_extension};
-use resource::{ResourceError, ResourceManager, SearchResults, Source};
+use resource::{ResourceError, ResourceManager, Source};
+use search::SearchResults;
 
 /// Looked for in the working directory first, so the binary can be dropped into
 /// (or `PATH`-invoked from) a game root. Falls back to the development install.
@@ -157,6 +162,50 @@ impl StrrefUse {
     }
 }
 
+/// One place a resource names another: the resref, the type it names, and a
+/// path locating the field (`"container[3].key_item"`). Each format yields
+/// these via its `resref_uses`.
+///
+/// `value` borrows rather than owning: a scan builds these for every field of
+/// every resource and discards all but a handful, so cloning would double the
+/// allocations for nothing.
+pub struct ResrefUse<'a> {
+    /// The resource type the resref names (`ITM_TYPE`, `BCS_TYPE`, …).
+    pub kind: u16,
+    pub value: &'a str,
+    pub path: String,
+    /// Typed only by convention: the engine accepts more than one kind here,
+    /// so a consumer must judge it.
+    pub soft: bool,
+}
+
+impl<'a> ResrefUse<'a> {
+    pub fn new(kind: u16, value: &'a str, path: impl Into<String>) -> ResrefUse<'a> {
+        ResrefUse {
+            kind,
+            value,
+            path: path.into(),
+            soft: false,
+        }
+    }
+
+    /// Mark the reference as untyped-by-convention (see [`soft`](ResrefUse::soft)).
+    pub fn soft(mut self) -> ResrefUse<'a> {
+        self.soft = true;
+        self
+    }
+
+    /// Prepend a location to the path (`op122.resource` →
+    /// `equipping[0].op122.resource`), for a resref found in an effect nested
+    /// inside a resource.
+    pub fn prefixed(self, prefix: &str) -> ResrefUse<'a> {
+        ResrefUse {
+            path: format!("{prefix}.{}", self.path),
+            ..self
+        }
+    }
+}
+
 /// Decode a NUL-terminated (and possibly NUL-padded) ASCII field. Trailing
 /// garbage after the first NUL is ignored, per the format conventions.
 pub fn parse_asciiz(bytes: &[u8]) -> String {
@@ -220,6 +269,11 @@ pub fn decrypt_text(bytes: &[u8]) -> Cow<'_, [u8]> {
 /// flood the terminal.
 const SEARCH_LIMIT: usize = 200;
 
+/// Maximum field paths listed per hit. One resource can reference another from
+/// hundreds of places — nearly every transition of a dialogue points at its own
+/// file — and a count answers "how often" better than an unreadable list.
+const FIELD_LIMIT: usize = 8;
+
 /// Resolve a query and print it. A query loads a single resource only when it
 /// fully specifies both name and type (`AERIE6.cre`) and that resource exists;
 /// every other query — a name without an extension, or a `name.ext` with no
@@ -276,7 +330,7 @@ fn lookup_and_print(
         }
     }
 
-    let results = manager.search(stem, type_filter, source);
+    let results = search::search(manager, stem, type_filter, source);
     print_search(out, stem, type_filter, &results)
 }
 
@@ -340,7 +394,7 @@ fn print_search(
 fn print_group(
     out: &mut impl Write,
     label: &str,
-    hits: &[resource::SearchHit],
+    hits: &[search::SearchHit],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if hits.is_empty() {
         return Ok(());
@@ -406,7 +460,7 @@ fn print_strref_uses(
         Err(_) => writeln!(out, "strref {strref}:")?,
     }
 
-    let hits = manager.find_strref(strref, source, type_filter);
+    let hits = search::find_strref(manager, strref, source, type_filter);
     let (hard, soft): (Vec<_>, Vec<_>) = hits.iter().partition(|h| !h.soft);
 
     if hard.is_empty() && soft.is_empty() {
@@ -416,7 +470,7 @@ fn print_strref_uses(
 
     if !hard.is_empty() {
         writeln!(out, "{} resource(s) reference it:", hard.len())?;
-        print_strref_hits(out, &hard)?;
+        print_hits(out, &hard)?;
     }
     if !soft.is_empty() {
         writeln!(
@@ -424,25 +478,106 @@ fn print_strref_uses(
             "{} possible match(es) in 2DA/IDS text or DLG scripts (verify — the number may not be a strref):",
             soft.len()
         )?;
-        print_strref_hits(out, &soft)?;
+        print_hits(out, &soft)?;
     }
     Ok(())
 }
 
-/// Print strref hits, one line each (`NAME.ext  (origin)  fields`), truncated at
-/// [`SEARCH_LIMIT`].
-fn print_strref_hits(
+/// Report every resource that names another (`<name>.<ext> --uses`), honouring
+/// `--biff` and `--type`. Typed fields are matched exactly; 2DA/IDS text and DLG
+/// scripts are scanned heuristically and reported separately as candidates.
+///
+/// The query must name a type, since one resref can exist as several. The
+/// target need not exist — a dangling reference is worth searching for.
+fn print_resref_uses(
     out: &mut impl Write,
-    hits: &[&resource::StrrefHit],
+    manager: &mut ResourceManager,
+    query: &str,
+    source: Source,
+    type_ext: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((name, ext)) = query.rsplit_once('.') else {
+        return Err(
+            format!("--uses needs a resource type: {query}.<ext> (e.g. sw1h01.itm)").into(),
+        );
+    };
+    if name.is_empty() {
+        return Err(format!("no resource name in query: {query:?}").into());
+    }
+    // A resref is 8 bytes on disk, so a longer name can never be stored in one.
+    if name.len() > 8 {
+        return Err(format!("not a resref (over 8 characters): {name:?}").into());
+    }
+    let kind = extension_type(&ext.to_ascii_lowercase())
+        .ok_or_else(|| format!("unknown resource extension: .{ext}"))?;
+    let type_filter = match type_ext {
+        None => None,
+        Some(ext) => Some(
+            extension_type(&ext.to_ascii_lowercase())
+                .ok_or_else(|| format!("unknown resource extension: .{ext}"))?,
+        ),
+    };
+
+    // Lead with where the target itself resolves, for context — and say so when
+    // it resolves nowhere, since that changes how to read the results.
+    match manager.load(name, kind, source) {
+        Ok(loaded) => writeln!(out, "{name}.{ext}  ({})", loaded.origin)?,
+        Err(_) => writeln!(out, "{name}.{ext}  (not in the index)")?,
+    }
+
+    // Say so rather than scanning: "no references found" would read as a
+    // finding when it is a blind spot.
+    if !search::REFERENCEABLE_KINDS.contains(&kind) {
+        writeln!(
+            out,
+            "no decoded format names a .{} in a typed field — nothing to search",
+            type_extension(kind)
+        )?;
+        return Ok(());
+    }
+
+    let hits = search::find_resref(manager, name, kind, source, type_filter);
+    let (hard, soft): (Vec<_>, Vec<_>) = hits.iter().partition(|h| !h.soft);
+
+    if hard.is_empty() && soft.is_empty() {
+        writeln!(out, "no references found")?;
+        return Ok(());
+    }
+
+    if !hard.is_empty() {
+        writeln!(out, "{} resource(s) reference it:", hard.len())?;
+        print_hits(out, &hard)?;
+    }
+    if !soft.is_empty() {
+        writeln!(
+            out,
+            "{} possible match(es) in text tables, scripts, or multi-type fields (verify):",
+            soft.len()
+        )?;
+        print_hits(out, &soft)?;
+    }
+    Ok(())
+}
+
+/// Print reverse-search hits, one line each (`NAME.ext  (origin)  fields`),
+/// truncated at [`SEARCH_LIMIT`] hits and [`FIELD_LIMIT`] fields per hit.
+fn print_hits(
+    out: &mut impl Write,
+    hits: &[&search::RefHit],
 ) -> Result<(), Box<dyn std::error::Error>> {
     for hit in hits.iter().take(SEARCH_LIMIT) {
+        let shown = hit.fields.len().min(FIELD_LIMIT);
+        let mut fields = hit.fields[..shown].join(", ");
+        if let Some(hidden) = hit.fields.len().checked_sub(FIELD_LIMIT).filter(|&n| n > 0) {
+            fields.push_str(&format!(" (+{hidden} more)"));
+        }
         writeln!(
             out,
             "  {}.{}  ({})  {}",
             hit.name,
             type_extension(hit.res_type),
             hit.origin,
-            hit.fields.join(", "),
+            fields,
         )?;
     }
     if hits.len() > SEARCH_LIMIT {
@@ -458,6 +593,7 @@ iediff — inspect Infinity Engine resources (BG2:EE)
 
 Usage:
   iediff <name>[.ext]      print a resource; a bare name or an inexact match runs a prefix search
+  iediff <name>.ext --uses list the resources that reference this resource
   iediff strref:<n>        resolve a dialog.tlk string by index
   iediff strref:<n> --uses list the resources that reference the string
   iediff --file <path>     print a discrete file by path, bypassing the index
@@ -468,12 +604,19 @@ Options:
   --raw                 machine-readable key=value output (binary formats)
   --biff                bypass the override directory; read the archived original
   --file                read the argument as a filesystem path (type from its extension)
-  --uses                with strref:<n>, find where the string is referenced
-                        (typed fields, plus heuristic 2DA/IDS + DLG-script matches)
+  --uses                find where a resource or string is referenced; the query
+                        must name a type (sw1h01.itm, strref:8000)
   --type <ext>          with --uses, scan only one resource type (e.g. itm)
 
 Decoded formats: 2da ids eff itm spl cre pro sto are dlg
 Other resource types are located and summarised (type, size) but not parsed.
+
+--uses searches the decoded binary formats (eff itm spl cre pro sto are dlg) for
+typed references, so it can find these as targets:
+  itm spl cre dlg are pro eff bcs 2da bam vvc wav wed bmp mve
+Effect opcodes are covered in full: every resource an effect names is resolved to
+its type. 2DA/IDS tables and DLG trigger/action scripts are also scanned, as
+text, and reported separately as candidates. BCS/BAF scripts are not scanned.
 
 Reads ./chitin.key if present (run from a game root), else game/chitin.key.
 ";
@@ -539,17 +682,20 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     // The guard above guarantees a query here; the `None` arm is an inert
     // fallback rather than a panic.
     if let Some(query) = query {
-        let strref = query.strip_prefix("strref:");
-        if (uses || type_ext.is_some()) && strref.is_none() {
-            return Err("--uses and --type apply only to a strref:<n> query".into());
+        if type_ext.is_some() && !uses {
+            return Err("--type applies only to a --uses query".into());
         }
         // A `strref:N` query resolves a TLK string, or — with `--uses` — reports
-        // where that string is referenced; anything else is a resource.
-        match strref {
+        // where that string is referenced; anything else is a resource, printed
+        // or (with `--uses`) searched for as the target of other resources.
+        match query.strip_prefix("strref:") {
             Some(number) if uses => {
                 print_strref_uses(out, &mut manager, number, source, type_ext.as_deref())?
             }
             Some(number) => print_string(out, &mut manager, number)?,
+            None if uses => {
+                print_resref_uses(out, &mut manager, &query, source, type_ext.as_deref())?
+            }
             None => lookup_and_print(out, &mut manager, &query, source, raw)?,
         }
     }
@@ -597,5 +743,25 @@ fn is_broken_pipe(e: &(dyn std::error::Error + 'static)) -> bool {
     match e.downcast_ref::<io::Error>() {
         Some(io_err) => io_err.kind() == io::ErrorKind::BrokenPipe,
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The usage guide lists the target types by hand so it reads well; fail
+    /// loudly if it and `REFERENCEABLE_KINDS` drift apart.
+    #[test]
+    fn usage_lists_every_referenceable_kind() {
+        let expected: Vec<&str> = search::REFERENCEABLE_KINDS
+            .iter()
+            .map(|&kind| type_extension(kind))
+            .collect();
+        assert!(
+            USAGE.contains(&expected.join(" ")),
+            "usage must list the referenceable kinds, in order: {}",
+            expected.join(" ")
+        );
     }
 }

@@ -13,9 +13,13 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::formats::dlg::DLG_TYPE;
 use crate::formats::eff::{EFF_V2_BODY_SIZE, Eff, FEATURE_SIZE, Feature};
 use crate::formats::fields::set_bits;
-use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::formats::itm::ITM_TYPE;
+use crate::formats::spl::SPL_TYPE;
+use crate::formats::{BCS_TYPE, BMP_TYPE};
+use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for CRE files.
 pub const CRE_TYPE: u16 = 0x03f1;
@@ -535,6 +539,56 @@ impl Cre {
             let inner = match effect {
                 CreEffect::V1(feat) => feat.strref_uses(),
                 CreEffect::V2(eff) => eff.strref_uses(),
+            };
+            let at = format!("effect[{i}]");
+            uses.extend(inner.into_iter().map(|u| u.prefixed(&at)));
+        }
+        uses
+    }
+
+    /// Every resource this creature names, tagged with the type it names: the
+    /// two portraits, the five script slots, the dialogue, and the SPL/ITM of
+    /// every known spell, memorized spell, and carried item. Effect resources
+    /// are not yet decoded.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let h = &self.header;
+        let mut uses = vec![
+            ResrefUse::new(BMP_TYPE, &h.small_portrait, "small_portrait"),
+            ResrefUse::new(BMP_TYPE, &h.large_portrait, "large_portrait"),
+            ResrefUse::new(BCS_TYPE, &h.script_override, "script_override"),
+            ResrefUse::new(BCS_TYPE, &h.script_class, "script_class"),
+            ResrefUse::new(BCS_TYPE, &h.script_race, "script_race"),
+            ResrefUse::new(BCS_TYPE, &h.script_general, "script_general"),
+            ResrefUse::new(BCS_TYPE, &h.script_default, "script_default"),
+            ResrefUse::new(DLG_TYPE, &h.dialog, "dialog"),
+        ];
+        for (i, spell) in self.known_spells.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                SPL_TYPE,
+                &spell.resource,
+                format!("known_spell[{i}]"),
+            ));
+        }
+        for (i, spell) in self.memorized_spells.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                SPL_TYPE,
+                &spell.resource,
+                format!("memorized_spell[{i}]"),
+            ));
+        }
+        for (i, item) in self.items.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &item.resource,
+                format!("item[{i}]"),
+            ));
+        }
+        uses.retain(|u| !u.value.is_empty());
+        // Effects can name a resource, in either the V1 (feature) or V2 form.
+        for (i, effect) in self.effects.iter().enumerate() {
+            let inner = match effect {
+                CreEffect::V1(feat) => feat.resref_uses(),
+                CreEffect::V2(eff) => eff.resref_uses(),
             };
             let at = format!("effect[{i}]");
             uses.extend(inner.into_iter().map(|u| u.prefixed(&at)));
@@ -1194,6 +1248,58 @@ mod tests {
             (uses[101].value, uses[101].path.as_str()),
             (199, "soundset[99]")
         );
+    }
+
+    #[test]
+    fn resref_uses_covers_portraits_scripts_dialog_and_items() {
+        let mut data = build_cre();
+        data[0x34..0x38].copy_from_slice(b"PORS"); // small portrait
+        data[0x3c..0x40].copy_from_slice(b"PORL"); // large portrait
+        // All five script slots are live: the engine runs each one, so a search
+        // for a BCS has to find it whichever slot holds it.
+        data[0x248..0x24c].copy_from_slice(b"OVER"); // override
+        data[0x250..0x254].copy_from_slice(b"CLAS"); // class
+        data[0x258..0x25c].copy_from_slice(b"RACE"); // race
+        data[0x260..0x264].copy_from_slice(b"GENL"); // general
+        data[0x268..0x26c].copy_from_slice(b"DFLT"); // default
+        data[0x2cc..0x2d0].copy_from_slice(b"CHAT"); // dialog
+
+        let items_off = data.len();
+        data.resize(items_off + 2 * ITEM_SIZE, 0);
+        data[items_off..items_off + 4].copy_from_slice(b"SW1H");
+        data[items_off + ITEM_SIZE..items_off + ITEM_SIZE + 4].copy_from_slice(b"BOW1");
+        data[0x2bc..0x2c0].copy_from_slice(&(items_off as u32).to_le_bytes());
+        data[0x2c0..0x2c4].copy_from_slice(&2u32.to_le_bytes());
+
+        let cre = Cre::parse(&data).expect("parse");
+        let uses = cre.resref_uses();
+        let got: Vec<(u16, &str, &str)> = uses
+            .iter()
+            .map(|u| (u.kind, u.value, u.path.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (BMP_TYPE, "PORS", "small_portrait"),
+                (BMP_TYPE, "PORL", "large_portrait"),
+                (BCS_TYPE, "OVER", "script_override"),
+                (BCS_TYPE, "CLAS", "script_class"),
+                (BCS_TYPE, "RACE", "script_race"),
+                (BCS_TYPE, "GENL", "script_general"),
+                (BCS_TYPE, "DFLT", "script_default"),
+                (DLG_TYPE, "CHAT", "dialog"),
+                (ITM_TYPE, "SW1H", "item[0]"),
+                (ITM_TYPE, "BOW1", "item[1]"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resref_uses_drops_unset_fields() {
+        // Every resref in the bare fixture is NUL, and an empty resref names
+        // nothing — it must be dropped, not reported as a reference to "".
+        let cre = Cre::parse(&build_cre()).expect("parse");
+        assert!(cre.resref_uses().is_empty());
     }
 
     #[test]

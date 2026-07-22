@@ -17,9 +17,12 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::formats::dlg::DLG_TYPE;
 use crate::formats::fields::{set_flags, write_bitfield};
 use crate::formats::item_category_name;
-use crate::{Reader, StrrefUse, Truncated, describe_tag};
+use crate::formats::itm::ITM_TYPE;
+use crate::formats::spl::SPL_TYPE;
+use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag};
 
 /// Resource type code for STO files.
 pub const STO_TYPE: u16 = 0x03f6;
@@ -317,6 +320,41 @@ impl Sto {
                 format!("drink[{i}].name"),
             ));
         }
+        uses
+    }
+
+    /// Every resource this store names, tagged with the type it names: the two
+    /// rumour dialogues, the ITM of each item for sale, the DLG of each drink's
+    /// rumour, and the SPL of each cure. The "items purchased" section holds
+    /// item *categories*, not resrefs, so it contributes nothing.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let h = &self.header;
+        let mut uses = vec![
+            ResrefUse::new(DLG_TYPE, &h.rumours_tavern, "rumours_tavern"),
+            ResrefUse::new(DLG_TYPE, &h.rumours_temple, "rumours_temple"),
+        ];
+        for (i, item) in self.sale.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &item.resource,
+                format!("sale[{i}]"),
+            ));
+        }
+        for (i, drink) in self.drinks.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                DLG_TYPE,
+                &drink.rumour,
+                format!("drink[{i}].rumour"),
+            ));
+        }
+        for (i, cure) in self.cures.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                SPL_TYPE,
+                &cure.resource,
+                format!("cure[{i}]"),
+            ));
+        }
+        uses.retain(|u| !u.value.is_empty());
         uses
     }
 
@@ -660,6 +698,36 @@ mod tests {
         assert_eq!(sto.drinks.len(), 1);
         assert_eq!(sto.cures.len(), 2);
         assert_eq!(sto.header.store_type, 2);
+    }
+
+    #[test]
+    fn resref_uses_separates_sale_items_from_drinks_and_cures() {
+        let mut data = build_sto(0, &[], 2, 1, 1);
+        data[0x44..0x48].copy_from_slice(b"TAVR"); // tavern rumours (DLG)
+        let sale_off = 0x9c;
+        data[sale_off..sale_off + 4].copy_from_slice(b"SW1H");
+        data[sale_off + SALE_SIZE..sale_off + SALE_SIZE + 4].copy_from_slice(b"BOW1");
+        let drink_off = sale_off + 2 * SALE_SIZE;
+        data[drink_off..drink_off + 4].copy_from_slice(b"RUMR");
+        let cure_off = drink_off + DRINK_SIZE;
+        data[cure_off..cure_off + 4].copy_from_slice(b"CURE");
+
+        let sto = Sto::parse(&data).expect("parse");
+        let uses = sto.resref_uses();
+        let got: Vec<(u16, &str, &str)> = uses
+            .iter()
+            .map(|u| (u.kind, u.value, u.path.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (DLG_TYPE, "TAVR", "rumours_tavern"),
+                (ITM_TYPE, "SW1H", "sale[0]"),
+                (ITM_TYPE, "BOW1", "sale[1]"),
+                (DLG_TYPE, "RUMR", "drink[0].rumour"),
+                (SPL_TYPE, "CURE", "cure[0]"),
+            ]
+        );
     }
 
     #[test]

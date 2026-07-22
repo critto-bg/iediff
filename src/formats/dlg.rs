@@ -13,7 +13,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crate::{Reader, StrrefUse, Truncated, describe_tag};
+use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag};
 
 /// Resource type code for DLG files.
 pub const DLG_TYPE: u16 = 0x03f3;
@@ -339,6 +339,51 @@ impl Dlg {
         uses
     }
 
+    /// Every resource this dialogue names in a typed field: the DLG each
+    /// transition hands off to. Resrefs named inside the trigger and action
+    /// scripts are text, not typed fields, and are found by the soft scan.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let mut uses = Vec::new();
+        for (i, t) in self.transitions.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                DLG_TYPE,
+                &t.next_dlg,
+                format!("transition[{i}].next_dlg"),
+            ));
+        }
+        uses.retain(|u| !u.value.is_empty());
+        uses
+    }
+
+    /// Soft resref matches in the scripts: each slot naming `target` as a
+    /// quoted argument, tagged with the slot and the calling function.
+    ///
+    /// All three tables are scanned, triggers included — unlike strrefs, resrefs
+    /// are all over the trigger vocabulary (`PartyHasItem`, `Contains`, …).
+    ///
+    /// [`script`](crate::script) drops a match whose argument names some other
+    /// type. `AR0602` exists as both an area and a script, and only the call
+    /// says which is meant.
+    pub fn script_resref_candidates(&self, target: &str, kind: u16) -> Vec<String> {
+        let vocabulary = crate::script::engine();
+        let tables = [
+            ("state_trigger", &self.state_triggers),
+            ("trans_trigger", &self.trans_triggers),
+            ("action", &self.actions),
+        ];
+        let mut out = Vec::new();
+        for (label, scripts) in tables {
+            for (i, script) in scripts.iter().enumerate() {
+                for (caller, arg) in matched_calls(script, target) {
+                    if vocabulary.could_name(&caller, arg, kind) {
+                        out.push(format!("{label}[{i}] {caller}"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Soft ("candidate") strref matches inside the action scripts: each action
     /// slot that calls a [`STRREF_ACTIONS`] function with `target` as its integer
     /// argument, tagged with the slot and the calling action.
@@ -476,6 +521,76 @@ impl fmt::Display for Dlg {
     }
 }
 
+/// The functions in `script` passing `target` as a quoted argument, each with
+/// that argument's position.
+///
+/// No allowlist, unlike the strref scan: a resref is a distinctive 6–8 character
+/// token rather than a bare integer, so a quoted match is already strong
+/// evidence and the caller does the typing.
+///
+/// Names are pushed at `identifier(` and popped at the matching `)`, so a
+/// nested call's argument is attributed to it rather than its parent. Compared
+/// case-insensitively; each distinct call reported once per script.
+fn matched_calls(script: &str, target: &str) -> Vec<(String, usize)> {
+    let bytes = script.as_bytes();
+    // (call name, index of the argument currently being read).
+    let mut stack: Vec<(&str, usize)> = Vec::new();
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut i = 0;
+
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            // A call when followed by `(`, otherwise an object or constant.
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while matches!(bytes.get(i), Some(b) if b.is_ascii_alphanumeric() || *b == b'_') {
+                    i += 1;
+                }
+                if bytes.get(i) == Some(&b'(') {
+                    stack.push((script.get(start..i).unwrap_or_default(), 0));
+                    i += 1;
+                }
+            }
+            b'(' => {
+                // An anonymous parenthesis still nests, keeping the stack
+                // aligned with the `)` that closes it.
+                stack.push(("", 0));
+                i += 1;
+            }
+            b')' => {
+                stack.pop();
+                i += 1;
+            }
+            b',' => {
+                // A comma separates the arguments of the innermost call only.
+                if let Some((_, arg)) = stack.last_mut() {
+                    *arg += 1;
+                }
+                i += 1;
+            }
+            b'"' => {
+                let start = i + 1;
+                i = start;
+                while matches!(bytes.get(i), Some(b) if *b != b'"') {
+                    i += 1;
+                }
+                let literal = script.get(start..i).unwrap_or_default();
+                i += 1; // step past the closing quote (or off the end)
+                if literal.eq_ignore_ascii_case(target)
+                    && let Some(&(caller, arg)) = stack.last().filter(|(c, _)| !c.is_empty())
+                    && !out
+                        .iter()
+                        .any(|(f, a)| f.eq_ignore_ascii_case(caller) && *a == arg)
+                {
+                    out.push((caller.to_string(), arg));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 /// The [`STRREF_ACTIONS`] functions whose call in `script` passes `target` as a
 /// bare integer argument. Nested calls are found too (the scan doesn't stop at
 /// the first call), so a strref action buried in an `ActionOverride(...)` still
@@ -582,6 +697,9 @@ fn strref_raw(value: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::BCS_TYPE;
+    use crate::formats::are::ARE_TYPE;
+    use crate::formats::itm::ITM_TYPE;
 
     /// Build a minimal one-state DLG: the state offers two transitions (one with
     /// player text + journal + action + terminates, one bare/no-text), guarded by
@@ -701,6 +819,22 @@ mod tests {
     }
 
     #[test]
+    fn resref_uses_report_each_transition_handoff() {
+        // The fixture's two transitions have an empty next_dlg; name one.
+        let mut data = build_dlg();
+        let t1 = 0x34 + STATE_SIZE + TRANSITION_SIZE;
+        data[t1 + 0x14..t1 + 0x18].copy_from_slice(b"NEXT");
+
+        let dlg = Dlg::parse(&data).expect("parse");
+        let uses = dlg.resref_uses();
+        let got: Vec<(u16, &str, &str)> = uses
+            .iter()
+            .map(|u| (u.kind, u.value, u.path.as_str()))
+            .collect();
+        assert_eq!(got, vec![(DLG_TYPE, "NEXT", "transition[1].next_dlg")]);
+    }
+
+    #[test]
     fn strref_uses_are_gated_by_flag_bits() {
         let dlg = Dlg::parse(&build_dlg()).expect("parse");
         let uses: Vec<(u32, String)> = dlg
@@ -725,5 +859,147 @@ mod tests {
         let mut d = build_dlg();
         d[0] = b'X';
         assert!(matches!(Dlg::parse(&d), Err(DlgError::BadSignature(_))));
+    }
+
+    /// A DLG carrying one state trigger and one action, for the script scan.
+    fn build_scripted_dlg(trigger: &str, action: &str) -> Dlg {
+        let state_off = 0x34usize;
+        let trans_off = state_off + STATE_SIZE;
+        let strig_off = trans_off + TRANSITION_SIZE;
+        let action_off = strig_off + STRING_ENTRY_SIZE;
+        let text_off = action_off + STRING_ENTRY_SIZE;
+
+        let mut d = vec![0u8; text_off];
+        d[0x00..0x04].copy_from_slice(DLG_SIGNATURE);
+        d[0x04..0x08].copy_from_slice(DLG_VERSION);
+        let put = |d: &mut [u8], at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(&mut d, 0x08, 1); // states
+        put(&mut d, 0x0c, state_off as u32);
+        put(&mut d, 0x10, 1); // transitions
+        put(&mut d, 0x14, trans_off as u32);
+        put(&mut d, 0x18, strig_off as u32);
+        put(&mut d, 0x1c, 1); // one state trigger
+        put(&mut d, 0x20, text_off as u32);
+        put(&mut d, 0x24, 0); // no transition triggers
+        put(&mut d, 0x28, action_off as u32);
+        put(&mut d, 0x2c, 1); // one action
+
+        put(&mut d, strig_off, text_off as u32);
+        put(&mut d, strig_off + 4, trigger.len() as u32);
+        put(&mut d, action_off, (text_off + trigger.len()) as u32);
+        put(&mut d, action_off + 4, action.len() as u32);
+        d.extend_from_slice(trigger.as_bytes());
+        d.extend_from_slice(action.as_bytes());
+        Dlg::parse(&d).expect("parse scripted dlg")
+    }
+
+    #[test]
+    fn matched_calls_attributes_a_quoted_resref_to_its_innermost_call() {
+        let one = |call: &str, arg: usize| vec![(call.to_string(), arg)];
+
+        assert_eq!(
+            matched_calls("PartyHasItem(\"SW1H01\")", "SW1H01"),
+            one("PartyHasItem", 0)
+        );
+
+        // Nested: the item belongs to the inner call, not to ActionOverride,
+        // and the argument index restarts inside that call.
+        assert_eq!(
+            matched_calls(
+                "ActionOverride(Player1,GiveItemCreate(\"SW1H01\",0,0,0))",
+                "SW1H01"
+            ),
+            one("GiveItemCreate", 0)
+        );
+
+        // Positions are counted per call: the second string argument of
+        // TakeItemReplace is index 1, and a comma inside a nested call does not
+        // advance the outer one.
+        assert_eq!(
+            matched_calls("TakeItemReplace(\"GIVEN\",\"TAKEN\",Myself)", "TAKEN"),
+            one("TakeItemReplace", 1)
+        );
+        assert_eq!(
+            matched_calls("SetGlobal(\"done\",\"AR0602\",1)", "AR0602"),
+            one("SetGlobal", 1)
+        );
+
+        // Two calls in one script; a repeat at the same position once.
+        assert_eq!(
+            matched_calls(
+                "PartyHasItem(\"SW1H01\")\nTakePartyItem(\"SW1H01\")",
+                "SW1H01"
+            ),
+            vec![
+                ("PartyHasItem".to_string(), 0),
+                ("TakePartyItem".to_string(), 0)
+            ]
+        );
+        assert_eq!(
+            matched_calls(
+                "HasItem(\"SW1H01\",Myself)\nHasItem(\"SW1H01\",Player2)",
+                "SW1H01"
+            ),
+            one("HasItem", 0)
+        );
+
+        // Case-insensitive on both the call and the literal.
+        assert_eq!(
+            matched_calls("hasitem(\"sw1h01\",Myself)", "SW1H01"),
+            one("hasitem", 0)
+        );
+
+        // A different resref, a prefix of a real one, and an unquoted
+        // identifier of the same spelling all fail to match.
+        assert!(matched_calls("PartyHasItem(\"SW1H01\")", "SW1H02").is_empty());
+        assert!(matched_calls("PartyHasItem(\"SW1H01A\")", "SW1H01").is_empty());
+        assert!(matched_calls("PartyHasItem(SW1H01)", "SW1H01").is_empty());
+    }
+
+    #[test]
+    fn matched_calls_survives_malformed_scripts() {
+        // Scripts come from untrusted bytes, so every degenerate shape has to
+        // terminate rather than run off the end or spin.
+        assert!(matched_calls("", "SW1H01").is_empty());
+        assert!(matched_calls("\"SW1H01\"", "SW1H01").is_empty()); // no enclosing call
+        assert!(matched_calls("((((", "SW1H01").is_empty());
+        assert!(matched_calls("))))", "SW1H01").is_empty());
+        assert!(matched_calls(",,,,", "SW1H01").is_empty());
+        // An unterminated literal runs to the end and is compared as-is, so a
+        // bare opening quote cannot match a complete resref.
+        assert!(matched_calls("HasItem(\"SW1H0", "SW1H01").is_empty());
+        assert_eq!(
+            matched_calls("HasItem(\"SW1H01", "SW1H01"),
+            vec![("HasItem".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn script_candidates_drop_calls_that_name_another_type() {
+        // `AR0602` exists in the real game as both an area and a script, which
+        // is exactly the collision the vocabulary filter resolves.
+        let dlg = build_scripted_dlg("AreaCheck(\"AR0602\")", "SetGlobal(\"done\",\"AR0602\",1)");
+
+        // As an area: AreaCheck is a genuine reference; SetGlobal is not, since
+        // its second argument is a variable scope rather than an area file.
+        assert_eq!(
+            dlg.script_resref_candidates("AR0602", ARE_TYPE),
+            vec!["state_trigger[0] AreaCheck".to_string()]
+        );
+        // As a script: nothing, because AreaCheck names an area.
+        assert!(
+            dlg.script_resref_candidates("AR0602", BCS_TYPE).is_empty(),
+            "AreaCheck names an ARE and must not answer a BCS query"
+        );
+    }
+
+    #[test]
+    fn script_candidates_keep_calls_the_vocabulary_cannot_type() {
+        // An unlisted call yields a candidate whatever the query type: the
+        // filter only ever rejects a confident contradiction.
+        let dlg = build_scripted_dlg("MysteryTrigger(\"AR0602\")", "NoSuchAction(\"AR0602\")");
+        for kind in [ARE_TYPE, BCS_TYPE, ITM_TYPE] {
+            assert_eq!(dlg.script_resref_candidates("AR0602", kind).len(), 2);
+        }
     }
 }

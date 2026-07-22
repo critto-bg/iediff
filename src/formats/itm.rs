@@ -14,8 +14,8 @@ use std::io::{self, Write};
 
 use crate::formats::eff::Feature;
 use crate::formats::fields::{set_bits, set_flags, write_bitfield, write_school};
-use crate::formats::item_category_name;
-use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::formats::{BAM_TYPE, item_category_name};
+use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for ITM files.
 pub const ITM_TYPE: u16 = 0x03ed;
@@ -444,6 +444,40 @@ impl Itm {
         uses
     }
 
+    /// Every resource this item names, tagged with the type it names: the item
+    /// it degrades into, and the BAM icons for the header and each ability.
+    /// Effect resources are not yet decoded.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let h = &self.header;
+        let mut uses = vec![
+            ResrefUse::new(ITM_TYPE, &h.replacement_item, "replacement_item"),
+            ResrefUse::new(BAM_TYPE, &h.inventory_icon, "inventory_icon"),
+            ResrefUse::new(BAM_TYPE, &h.ground_icon, "ground_icon"),
+            ResrefUse::new(BAM_TYPE, &h.description_icon, "description_icon"),
+        ];
+        for (i, ext) in self.ext_headers.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                BAM_TYPE,
+                &ext.use_icon,
+                format!("ability[{i}].use_icon"),
+            ));
+        }
+        uses.retain(|u| !u.value.is_empty());
+        // Effects can name a resource (creating or removing an item, say): the
+        // always-on equipping effects, then each ability's own effects.
+        for (i, feat) in self.equipping.iter().enumerate() {
+            let at = format!("equipping[{i}]");
+            uses.extend(feat.resref_uses().into_iter().map(|u| u.prefixed(&at)));
+        }
+        for (j, ext) in self.ext_headers.iter().enumerate() {
+            for (k, feat) in ext.features.iter().enumerate() {
+                let at = format!("ability[{j}].effect[{k}]");
+                uses.extend(feat.resref_uses().into_iter().map(|u| u.prefixed(&at)));
+            }
+        }
+        uses
+    }
+
     /// Attach the display names resolved from the header strrefs.
     pub fn set_names(&mut self, unidentified: Option<String>, identified: Option<String>) {
         self.unidentified_name = unidentified;
@@ -861,6 +895,29 @@ mod tests {
         data[0x00..0x04].copy_from_slice(ITM_SIGNATURE);
         data[0x04..0x08].copy_from_slice(ITM_VERSION);
         data
+    }
+
+    #[test]
+    fn resref_uses_reports_the_replacement_item_and_icons() {
+        let mut data = build_itm();
+        data[0x10..0x14].copy_from_slice(b"SW1H"); // replacement item
+        data[0x3a..0x3e].copy_from_slice(b"ISW1"); // inventory icon
+        data[0x44..0x48].copy_from_slice(b"GSW1"); // ground icon
+
+        let itm = Itm::parse(&data).expect("parse");
+        let uses = itm.resref_uses();
+        let got: Vec<(u16, &str, &str)> = uses
+            .iter()
+            .map(|u| (u.kind, u.value, u.path.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (ITM_TYPE, "SW1H", "replacement_item"),
+                (BAM_TYPE, "ISW1", "inventory_icon"),
+                (BAM_TYPE, "GSW1", "ground_icon"),
+            ]
+        );
     }
 
     #[test]

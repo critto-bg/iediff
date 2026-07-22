@@ -182,15 +182,6 @@ impl KeyFile {
         self.index.get(&key).and_then(|&i| self.resources.get(i))
     }
 
-    /// All resources whose name starts with `prefix` (case-insensitive). Drives
-    /// prefix search.
-    pub fn find_by_prefix(&self, prefix: &str) -> Vec<&ResourceEntry> {
-        self.resources
-            .iter()
-            .filter(|res| crate::starts_with_ignore_ascii_case(&res.name, prefix))
-            .collect()
-    }
-
     pub fn bif_name(&self, index: usize) -> Option<&str> {
         self.bifs.get(index).map(String::as_str)
     }

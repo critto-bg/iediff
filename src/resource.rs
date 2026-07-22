@@ -4,13 +4,19 @@
 //! name and type, it resolves the locator through the KEY, opens (and caches)
 //! the owning BIF, and returns the resource's raw bytes. BIFs are opened lazily
 //! and kept open, so repeated reads from the same archive reuse one handle.
+//!
+//! One resource at a time: resolve it, read it, decode it. Finding resources
+//! lives in [`search`](crate::search), which reaches the index through
+//! [`index_entries`](ResourceManager::index_entries) and
+//! [`read_for_scan`](ResourceManager::read_for_scan).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::Reader;
 use crate::formats::are::{ARE_TYPE, Are, AreError};
 use crate::formats::bif::{BifArchive, BifError};
 use crate::formats::cre::{CRE_TYPE, Cre, CreError, CreNames};
@@ -24,7 +30,6 @@ use crate::formats::spl::{SPL_TYPE, Spl, SplError};
 use crate::formats::sto::{STO_TYPE, Sto, StoError};
 use crate::formats::tlk::{TlkError, TlkFile};
 use crate::formats::twoda::{TWODA_TYPE, TwoDA, TwoDAError};
-use crate::{Reader, StrrefUse};
 
 /// Locale whose `dialog.tlk` strings are resolved against. BG2:EE ships several
 /// under `lang/`; English is the default. (Selectable later.)
@@ -180,6 +185,10 @@ impl From<DlgError> for ResourceError {
     }
 }
 
+/// One index layer's `(name, type)` entries. See
+/// [`ResourceManager::index_entries`].
+pub(crate) type IndexEntries<'a> = Vec<(&'a str, u16)>;
+
 /// Where to resolve a resource from. `Auto` prefers an override file over the
 /// archived original; `Biff` ignores the override entirely (the `--biff` flag).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -189,6 +198,7 @@ pub enum Source {
 }
 
 /// Where a resolved resource actually came from.
+#[derive(Clone)]
 pub enum Origin {
     /// A file in the override directory (its path).
     Override(PathBuf),
@@ -358,156 +368,6 @@ pub struct Loaded {
     pub resource: Resource,
 }
 
-/// One resource matched by a prefix search: its name and type.
-pub struct SearchHit {
-    pub name: String,
-    pub res_type: u16,
-}
-
-/// Prefix-search results, grouped by where the resources live. Each group is
-/// sorted by name then type.
-pub struct SearchResults {
-    pub over: Vec<SearchHit>,
-    pub biff: Vec<SearchHit>,
-}
-
-impl SearchResults {
-    /// Total number of matches across both layers.
-    pub fn total(&self) -> usize {
-        self.over.len() + self.biff.len()
-    }
-}
-
-/// Resource types with a *typed* strref field, which a reverse search matches
-/// exactly. These are the binary formats we decode.
-const STRREF_TYPES: [u16; 8] = [
-    EFF_TYPE, ITM_TYPE, SPL_TYPE, CRE_TYPE, PRO_TYPE, STO_TYPE, ARE_TYPE, DLG_TYPE,
-];
-
-/// Text formats with no typed strref field of their own, pulled into the search
-/// universe purely for the heuristic ("soft") scan: a strref may appear as a
-/// cell value (2DA) or table value (IDS), but nothing types it as one, so a
-/// numeric match is only a candidate. DLG is soft-scanned too (its action
-/// scripts), but already appears in [`STRREF_TYPES`] for its typed fields.
-const SOFT_TYPES: [u16; 2] = [TWODA_TYPE, IDS_TYPE];
-
-/// Heuristic ("soft") matches for a strref in a resource whose references
-/// aren't fully typed: the line numbers of a 2DA/IDS text table where the number
-/// appears, or the strref-bearing action calls in a DLG's scripts.
-fn soft_matches(res_type: u16, data: &[u8], target: u32) -> Vec<String> {
-    match res_type {
-        TWODA_TYPE | IDS_TYPE => soft_text_matches(data, target),
-        DLG_TYPE => Dlg::parse(data)
-            .map(|d| d.script_strref_candidates(target))
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// One resource that references the searched-for strref, and the field(s) or
-/// location(s) that do (e.g. `["identified_name"]`, or, for a soft text match,
-/// `["line 6"]`). `soft` marks a heuristic 2DA/IDS match the consumer must judge.
-pub struct StrrefHit {
-    pub name: String,
-    pub res_type: u16,
-    pub origin: Origin,
-    pub fields: Vec<String>,
-    pub soft: bool,
-}
-
-/// The `(name, type)` set to scan for a strref, honouring `source` and an
-/// optional type filter. Under `Auto` an override entry shadows the KEY entry of
-/// the same `(name, type)`; `Biff` ignores the override layer. Duplicates (an
-/// override shadowing a BIF, or a KEY listing a resref twice) collapse to one.
-/// Only types in `types` are kept. Names are compared case-insensitively.
-fn strref_universe(
-    over: &[(&str, u16)],
-    key: &[(&str, u16)],
-    source: Source,
-    type_filter: Option<u16>,
-    types: &[u16],
-) -> Vec<(String, u16)> {
-    let keep = |t: u16| types.contains(&t) && type_filter.is_none_or(|f| f == t);
-    let mut seen: HashSet<(String, u16)> = HashSet::new();
-    let mut out = Vec::new();
-
-    let mut push = |name: &str, res_type: u16| {
-        if keep(res_type) && seen.insert((name.to_ascii_uppercase(), res_type)) {
-            out.push((name.to_string(), res_type));
-        }
-    };
-
-    if source != Source::Biff {
-        for &(name, res_type) in over {
-            push(name, res_type);
-        }
-    }
-    for &(name, res_type) in key {
-        push(name, res_type);
-    }
-    out
-}
-
-/// Parse a resource just far enough to collect its strref field uses, skipping
-/// the name/IDS/2DA resolution [`decode`](ResourceManager::decode) performs — the
-/// search only needs raw values. Bytes that don't parse yield nothing.
-fn extract_strrefs(res_type: u16, data: &[u8]) -> Vec<StrrefUse> {
-    match res_type {
-        EFF_TYPE => Eff::parse(data)
-            .map(|e| e.strref_uses())
-            .unwrap_or_default(),
-        ITM_TYPE => Itm::parse(data)
-            .map(|i| i.strref_uses())
-            .unwrap_or_default(),
-        SPL_TYPE => Spl::parse(data)
-            .map(|s| s.strref_uses())
-            .unwrap_or_default(),
-        CRE_TYPE => Cre::parse(data)
-            .map(|c| c.strref_uses())
-            .unwrap_or_default(),
-        PRO_TYPE => Pro::parse(data)
-            .map(|p| p.strref_uses())
-            .unwrap_or_default(),
-        STO_TYPE => Sto::parse(data)
-            .map(|s| s.strref_uses())
-            .unwrap_or_default(),
-        ARE_TYPE => Are::parse(data)
-            .map(|a| a.strref_uses())
-            .unwrap_or_default(),
-        DLG_TYPE => Dlg::parse(data)
-            .map(|d| d.strref_uses())
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// Heuristic ("soft") match for a strref in a text table (2DA/IDS): the 1-based
-/// numbers of the lines on which `target` appears as a whitespace-delimited
-/// integer token. Decrypts an XOR-encrypted table first. A match is only a
-/// candidate — the number could be a strref or any other value.
-fn soft_text_matches(data: &[u8], target: u32) -> Vec<String> {
-    let text = crate::decrypt_text(data);
-    let text = String::from_utf8_lossy(&text);
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            line.split_whitespace()
-                .any(|token| token.parse::<u32>() == Ok(target))
-        })
-        .map(|(i, _)| format!("line {}", i + 1))
-        .collect()
-}
-
-/// Collect (name, type) pairs into [`SearchHit`]s sorted by name then type. The
-/// KEY guarantees distinct (name, type) entries, so no deduplication is needed.
-fn sorted_hits(items: impl Iterator<Item = (String, u16)>) -> Vec<SearchHit> {
-    let mut hits: Vec<SearchHit> = items
-        .map(|(name, res_type)| SearchHit { name, res_type })
-        .collect();
-    hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.res_type.cmp(&b.res_type)));
-    hits
-}
-
 /// Loads a KEY and serves resource bytes out of the BIFs it indexes.
 pub struct ResourceManager {
     key: KeyFile,
@@ -595,6 +455,42 @@ impl ResourceManager {
             shadowing,
             by_type,
         }
+    }
+
+    /// Every `(name, type)` the index knows, as `(override, KEY)`. Kept apart
+    /// because the layers shadow each other and only the caller knows whether
+    /// `--biff` is in play.
+    ///
+    /// The names borrow from the index, so a caller needing `&mut self`
+    /// afterwards must copy what it wants and drop these first.
+    pub(crate) fn index_entries(&self) -> (IndexEntries<'_>, IndexEntries<'_>) {
+        let over = self
+            .over
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.res_type))
+            .collect();
+        let key = self
+            .key
+            .resources()
+            .iter()
+            .map(|r| (r.name(), r.res_type()))
+            .collect();
+        (over, key)
+    }
+
+    /// Resolve one resource and read its bytes. `None` when it does not resolve
+    /// or cannot be read, which a scan skips rather than failing on.
+    pub(crate) fn read_for_scan(
+        &mut self,
+        name: &str,
+        res_type: u16,
+        source: Source,
+    ) -> Option<(Origin, Vec<u8>)> {
+        let located = self.locate(name, res_type, source)?;
+        let origin = located.origin();
+        let bytes = self.read_located(&located).ok()?;
+        Some((origin, bytes))
     }
 
     /// Resolve a resource to a concrete location: an override file when one
@@ -964,108 +860,6 @@ impl ResourceManager {
         }
     }
 
-    /// Resources whose name starts with `prefix`, optionally filtered to a single
-    /// type, grouped by override vs biff. `--biff` (`source`) hides the override
-    /// layer. Each group is sorted by name then type.
-    pub fn search(&self, prefix: &str, type_filter: Option<u16>, source: Source) -> SearchResults {
-        let keep = |res_type: u16| type_filter.is_none_or(|t| t == res_type);
-
-        let over = if source == Source::Biff {
-            Vec::new()
-        } else {
-            sorted_hits(
-                self.over
-                    .find_by_prefix(prefix)
-                    .iter()
-                    .filter(|e| keep(e.res_type))
-                    .map(|e| (e.name.clone(), e.res_type)),
-            )
-        };
-
-        let biff = sorted_hits(
-            self.key
-                .find_by_prefix(prefix)
-                .iter()
-                .filter(|res| keep(res.res_type()))
-                .map(|res| (res.name().to_string(), res.res_type())),
-        );
-
-        SearchResults { over, biff }
-    }
-
-    /// Find every resource that references `target`. The binary formats are
-    /// matched on their typed strref fields; 2DA/IDS text tables are also scanned
-    /// heuristically (a numeric token match — a candidate the caller must judge),
-    /// unless `type_filter` excludes them. `source` and `type_filter` narrow the
-    /// universe exactly as [`search`](Self::search) does. Resources that fail to
-    /// read or parse are skipped. Hits are sorted by name then type.
-    pub fn find_strref(
-        &mut self,
-        target: u32,
-        source: Source,
-        type_filter: Option<u16>,
-    ) -> Vec<StrrefHit> {
-        let mut types = STRREF_TYPES.to_vec();
-        types.extend_from_slice(&SOFT_TYPES);
-
-        // Snapshot the universe first: this borrows the KEY and override index,
-        // which the read loop below needs `&mut self` for.
-        let over: Vec<(&str, u16)> = self
-            .over
-            .entries
-            .iter()
-            .map(|e| (e.name.as_str(), e.res_type))
-            .collect();
-        let key: Vec<(&str, u16)> = self
-            .key
-            .resources()
-            .iter()
-            .map(|r| (r.name(), r.res_type()))
-            .collect();
-        let universe = strref_universe(&over, &key, source, type_filter, &types);
-        drop((over, key));
-
-        let mut hits = Vec::new();
-        for (name, res_type) in universe {
-            let Some(located) = self.locate(&name, res_type, source) else {
-                continue;
-            };
-            let Ok(bytes) = self.read_located(&located) else {
-                continue;
-            };
-
-            // Exact matches on typed strref fields, and — for DLG scripts and
-            // 2DA/IDS text — heuristic candidates.
-            let hard: Vec<String> = extract_strrefs(res_type, &bytes)
-                .into_iter()
-                .filter(|u| u.value == target)
-                .map(|u| u.path)
-                .collect();
-            if !hard.is_empty() {
-                hits.push(StrrefHit {
-                    name: name.clone(),
-                    res_type,
-                    origin: located.origin(),
-                    fields: hard,
-                    soft: false,
-                });
-            }
-
-            let soft = soft_matches(res_type, &bytes, target);
-            if !soft.is_empty() {
-                hits.push(StrrefHit {
-                    name,
-                    res_type,
-                    origin: located.origin(),
-                    fields: soft,
-                    soft: true,
-                });
-            }
-        }
-        hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.res_type.cmp(&b.res_type)));
-        hits
-    }
-
     /// Best-effort resolve a strref to its TLK string for display. `None` for
     /// the -1 "no string" sentinel, on any lookup error, or when the string is
     /// empty.
@@ -1328,110 +1122,5 @@ impl Override {
             .get(&key)
             .and_then(|&i| self.entries.get(i))
             .map(|entry| entry.path.as_path())
-    }
-
-    /// Every override entry whose name starts with `prefix` (case-insensitive).
-    fn find_by_prefix(&self, prefix: &str) -> Vec<&OverrideEntry> {
-        self.entries
-            .iter()
-            .filter(|entry| crate::starts_with_ignore_ascii_case(&entry.name, prefix))
-            .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sorted(mut u: Vec<(String, u16)>) -> Vec<(String, u16)> {
-        u.sort();
-        u
-    }
-
-    #[test]
-    fn universe_shadows_key_with_override_under_auto() {
-        let over = [("FOO", ITM_TYPE), ("NEW", CRE_TYPE)];
-        let key = [("FOO", ITM_TYPE), ("BAR", SPL_TYPE)];
-        assert_eq!(
-            sorted(strref_universe(
-                &over,
-                &key,
-                Source::Auto,
-                None,
-                &STRREF_TYPES
-            )),
-            vec![
-                ("BAR".to_string(), SPL_TYPE),
-                ("FOO".to_string(), ITM_TYPE),
-                ("NEW".to_string(), CRE_TYPE),
-            ]
-        );
-    }
-
-    #[test]
-    fn universe_ignores_override_under_biff() {
-        let over = [("NEW", CRE_TYPE)];
-        let key = [("FOO", ITM_TYPE)];
-        assert_eq!(
-            strref_universe(&over, &key, Source::Biff, None, &STRREF_TYPES),
-            vec![("FOO".to_string(), ITM_TYPE)]
-        );
-    }
-
-    #[test]
-    fn universe_dedupes_case_insensitively() {
-        let over: [(&str, u16); 0] = [];
-        let key = [("foo", ITM_TYPE), ("FOO", ITM_TYPE)];
-        assert_eq!(
-            strref_universe(&over, &key, Source::Auto, None, &STRREF_TYPES),
-            vec![("foo".to_string(), ITM_TYPE)]
-        );
-    }
-
-    #[test]
-    fn universe_skips_non_strref_types_and_honours_filter() {
-        let over: [(&str, u16); 0] = [];
-        let key = [("TBL", TWODA_TYPE), ("FOO", ITM_TYPE), ("BAR", SPL_TYPE)];
-        // 2DA is excluded from the typed set even with no filter.
-        assert_eq!(
-            sorted(strref_universe(
-                &over,
-                &key,
-                Source::Auto,
-                None,
-                &STRREF_TYPES
-            )),
-            vec![("BAR".to_string(), SPL_TYPE), ("FOO".to_string(), ITM_TYPE)]
-        );
-        // A type filter narrows to the one type.
-        assert_eq!(
-            strref_universe(&over, &key, Source::Auto, Some(ITM_TYPE), &STRREF_TYPES),
-            vec![("FOO".to_string(), ITM_TYPE)]
-        );
-    }
-
-    #[test]
-    fn universe_includes_soft_types_when_requested() {
-        let over: [(&str, u16); 0] = [];
-        let key = [("TBL", TWODA_TYPE), ("FOO", ITM_TYPE)];
-        let mut types = STRREF_TYPES.to_vec();
-        types.extend_from_slice(&SOFT_TYPES);
-        assert_eq!(
-            sorted(strref_universe(&over, &key, Source::Auto, None, &types)),
-            vec![
-                ("FOO".to_string(), ITM_TYPE),
-                ("TBL".to_string(), TWODA_TYPE)
-            ]
-        );
-    }
-
-    #[test]
-    fn soft_text_matches_finds_token_lines() {
-        // 2DA-like: sig, default, header, two rows; 25207 is a cell on line 4.
-        let text = b"2DA V1.0\n*\nNAME REF\nBERSERKER 25207\nWIZARD_SLAYER 40\n";
-        assert_eq!(soft_text_matches(text, 25207), vec!["line 4".to_string()]);
-        // The substring 2520 must not match 25207, and a miss yields nothing.
-        assert!(soft_text_matches(text, 2520).is_empty());
-        assert!(soft_text_matches(text, 99999).is_empty());
     }
 }

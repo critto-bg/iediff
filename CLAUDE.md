@@ -22,17 +22,35 @@ tested against a real BG2:EE install. See `README.md` for goals.
 ## Layout
 
 - `src/main.rs` — crate root: shared, format-agnostic building blocks
-  (`Reader`, `Truncated`, `parse_asciiz`, `describe_tag`) plus the CLI driver.
+  (`Reader`, `Truncated`, `StrrefUse`, `ResrefUse`, `parse_asciiz`,
+  `describe_tag`) plus the CLI driver.
 - `src/resource.rs` — `ResourceManager`: the coordinator that resolves a
-  resource through the KEY and serves its bytes from a lazily-opened, cached BIF.
+  resource through the KEY and serves its bytes from a lazily-opened, cached
+  BIF. One resource at a time: resolve, read, decode.
+- `src/search.rs` — finding resources: by name prefix, and by what references
+  them (`--uses`). Reaches the index through two `pub(crate)` methods on
+  `ResourceManager` (`index_entries`, `read_for_scan`) and owns the per-format
+  dispatch.
+- `src/script.rs` — what the engine's script calls name: static `ACTION.IDS` /
+  `TRIGGER.IDS` signatures plus the curated meaning of each parameter name, so a
+  quoted resref in a DLG script can be typed by the call that takes it. The
+  vocabulary is static because the calls are implemented in the closed-source
+  executable — a mod cannot add one without patching it.
+- `src/fixture.rs` — test-only. Writes a synthetic game tree (KEY + BIF +
+  `override/`) to a temp dir, so search tests can assert exact answers without
+  depending on the local install, which shifts with every mod. Between them its
+  resources name every type in `REFERENCEABLE_KINDS` and cover every format in
+  `SCANNED_TYPES`; the search tests assert that coverage, so adding a format or
+  a reference type fails the suite until the fixture gains a witness.
 - `src/formats/` — one submodule per resource format (`key`, `bif`, …). Each
   owns its own error type that wraps the shared `Truncated` via `From`.
 - `md/` — symlink: IESDP format docs. Authoritative reference for every format.
   Start at `md/file_formats/index.md`; conventions in
   `md/file_formats/general.md`.
 - `game/` — symlink: BG2:EE install used as test data.
-- Both symlinks are git-ignored and local-only. Later, small curated fixtures
-  will be committed for unit tests.
+- Both symlinks are git-ignored and local-only, so no test may depend on them:
+  each format's unit tests build their own byte fixtures, and whole-install
+  tests use `src/fixture.rs`.
 
 ## How the game data fits together
 

@@ -8,6 +8,14 @@
 //! Generated from `md/opcodes/bgee.md` (IESDP). BG(2):EE only, matching the
 //! engine this tool targets.
 
+use crate::formats::are::ARE_TYPE;
+use crate::formats::cre::CRE_TYPE;
+use crate::formats::eff::EFF_TYPE;
+use crate::formats::itm::ITM_TYPE;
+use crate::formats::spl::SPL_TYPE;
+use crate::formats::twoda::TWODA_TYPE;
+use crate::formats::{BAM_TYPE, BCS_TYPE, BMP_TYPE, MVE_TYPE, VVC_TYPE, WAV_TYPE};
+
 /// Human name for an effect `opcode`, or `None` if it is outside the range
 /// this engine defines (0–367). Used only to annotate readable output.
 pub fn opcode_name(opcode: u32) -> Option<&'static str> {
@@ -44,6 +52,192 @@ pub fn opcode_strref_slots(opcode: u32) -> &'static [StrrefSlot] {
         _ => &[],
     }
 }
+
+/// One of an effect's resref fields. [`Resource`](ResourceSlot::Resource) is the
+/// only one a V1 [`Feature`](super::eff::Feature) has (0x14); the V2 body adds
+/// [`Resource2`](ResourceSlot::Resource2) (0x68) and
+/// [`Resource3`](ResourceSlot::Resource3) (0x70).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResourceSlot {
+    Resource,
+    Resource2,
+    Resource3,
+}
+
+/// One resref an effect names: which field holds it, what type it names, and
+/// whether the engine will accept more than that type there.
+#[derive(Clone, Copy, Debug)]
+pub struct ResourceRef {
+    pub slot: ResourceSlot,
+    pub kind: u16,
+    /// The engine resolves this field as more than one type, so the `kind` is
+    /// the likely reading rather than the guaranteed one.
+    pub soft: bool,
+}
+
+const fn hard(slot: ResourceSlot, kind: u16) -> ResourceRef {
+    ResourceRef {
+        slot,
+        kind,
+        soft: false,
+    }
+}
+
+const fn soft(slot: ResourceSlot, kind: u16) -> ResourceRef {
+    ResourceRef {
+        slot,
+        kind,
+        soft: true,
+    }
+}
+
+/// Which of an effect's resref fields carry a resource for `opcode`, and what
+/// each names — the key to finding resources buried in item/spell/creature
+/// effects, since the parser stores every resref as an untyped string.
+///
+/// Complete for BG(2):EE as far as IESDP documents it (`md/opcodes/bgee.md`):
+/// every opcode whose resref field names a *file* is listed. Opcodes that put
+/// something else in a resref field are deliberately excluded — #265/#309 store
+/// a variable name, #144/#279 an arbitrary matching key, #319 a scripting name,
+/// #339 an ARE animation label, and #336 only a filename *prefix* that the
+/// engine completes with a sequence number.
+///
+/// A slot may appear more than once with different types. That is how the
+/// genuinely ambiguous fields are expressed: "the spell or item specified in
+/// the Resource field" (#318/#321/#324) yields both an ITM and a SPL reading,
+/// each marked soft, so a search for either finds it as a candidate. IESDP
+/// flags this collision directly — `spwi112.itm` and `spwi112.spl` are
+/// indistinguishable to these opcodes. Animation fields work the same way,
+/// since the engine accepts a VVC or a BAM.
+pub fn opcode_resource_slots(opcode: u32) -> &'static [ResourceRef] {
+    match opcode {
+        // Items: create, remove, restrict, drain.
+        111 | 123 | 143 | 180 | 243 | 255 => &ITEM,
+        112 => &ITEM_AND_SOUND,
+        122 => &ITEM_RANDOM_OF_THREE,
+        182 => &ITEM_THEN_EFFECT,
+        318 | 321 | 324 => &ITEM_OR_SPELL,
+        // Spells: cast, learn, grant, remove, react with.
+        146
+        | 147
+        | 148
+        | 171
+        | 172
+        | 200
+        | 201
+        | 206
+        | 207
+        | 223
+        | 226..=228
+        | 232
+        | 251
+        | 252
+        | 258..=260
+        | 266
+        | 313
+        | 326
+        | 333
+        | 335
+        | 340
+        | 341
+        | 361
+        | 366 => &SPELL,
+        78 => &SPELL_MAYBE,
+        256 => &SEQUENCER,
+        // Creatures: summon, replace, polymorph into.
+        67 => &CREATURE_WITH_ANIMATIONS,
+        135 | 151 => &CREATURE,
+        // Effects applied from another file.
+        177 | 183 | 248 | 249 | 272 | 283 => &EFFECT,
+        // Everything else that names a file.
+        82 => &SCRIPT,
+        107 => &PORTRAIT,
+        127 | 214 | 273 | 331 => &TABLE,
+        152 => &MOVIE,
+        174 => &SOUND,
+        186 => &AREA,
+        68 | 153..=158 | 215 | 296 => &ANIMATION,
+        _ => &[],
+    }
+}
+
+/// The item named by the effect's one resref field.
+static ITEM: [ResourceRef; 1] = [hard(ResourceSlot::Resource, ITM_TYPE)];
+
+/// Opcode #112: the item to remove, plus (when `Sound` is 2) a WAV to play.
+static ITEM_AND_SOUND: [ResourceRef; 2] = [
+    hard(ResourceSlot::Resource, ITM_TYPE),
+    soft(ResourceSlot::Resource2, WAV_TYPE),
+];
+
+/// Opcode #122 (EE): the item created is picked at random from whichever of the
+/// three resource fields are non-empty, so all three name items. (#255, its
+/// sibling, documents no such fallback.)
+static ITEM_RANDOM_OF_THREE: [ResourceRef; 3] = [
+    hard(ResourceSlot::Resource, ITM_TYPE),
+    hard(ResourceSlot::Resource2, ITM_TYPE),
+    hard(ResourceSlot::Resource3, ITM_TYPE),
+];
+
+/// Opcode #182: apply the EFF in `Resource2` while the ITM in `Resource` is
+/// equipped — the two slots name different types.
+static ITEM_THEN_EFFECT: [ResourceRef; 2] = [
+    hard(ResourceSlot::Resource, ITM_TYPE),
+    hard(ResourceSlot::Resource2, EFF_TYPE),
+];
+
+/// "The spell or item specified in the Resource field" (#318/#321/#324): both
+/// readings are offered, neither is certain.
+static ITEM_OR_SPELL: [ResourceRef; 2] = [
+    soft(ResourceSlot::Resource, ITM_TYPE),
+    soft(ResourceSlot::Resource, SPL_TYPE),
+];
+
+/// The spell named by the effect's one resref field.
+static SPELL: [ResourceRef; 1] = [hard(ResourceSlot::Resource, SPL_TYPE)];
+
+/// Opcode #78 (Mold Touch) applies a SPL only in one of its modes.
+static SPELL_MAYBE: [ResourceRef; 1] = [soft(ResourceSlot::Resource, SPL_TYPE)];
+
+/// Opcode #256: the sequencer stores a spell, a VVC, and a second spell.
+static SEQUENCER: [ResourceRef; 3] = [
+    hard(ResourceSlot::Resource, SPL_TYPE),
+    hard(ResourceSlot::Resource2, VVC_TYPE),
+    hard(ResourceSlot::Resource3, SPL_TYPE),
+];
+
+/// The creature named by the effect's one resref field.
+static CREATURE: [ResourceRef; 1] = [hard(ResourceSlot::Resource, CRE_TYPE)];
+
+/// Opcode #67: the creature to summon, plus (EE) an animation at the summoned
+/// creature's location and another at the ability target's.
+static CREATURE_WITH_ANIMATIONS: [ResourceRef; 5] = [
+    hard(ResourceSlot::Resource, CRE_TYPE),
+    soft(ResourceSlot::Resource2, VVC_TYPE),
+    soft(ResourceSlot::Resource2, BAM_TYPE),
+    soft(ResourceSlot::Resource3, VVC_TYPE),
+    soft(ResourceSlot::Resource3, BAM_TYPE),
+];
+
+/// An EFF file applied by the effect (#248/#249 note explicitly that the field
+/// "references a EFF not a SPL").
+static EFFECT: [ResourceRef; 1] = [hard(ResourceSlot::Resource, EFF_TYPE)];
+
+/// A custom 2DA driving the effect's choice of spells or monsters.
+static TABLE: [ResourceRef; 1] = [hard(ResourceSlot::Resource, TWODA_TYPE)];
+
+static SCRIPT: [ResourceRef; 1] = [hard(ResourceSlot::Resource, BCS_TYPE)];
+static PORTRAIT: [ResourceRef; 1] = [hard(ResourceSlot::Resource, BMP_TYPE)];
+static MOVIE: [ResourceRef; 1] = [hard(ResourceSlot::Resource, MVE_TYPE)];
+static SOUND: [ResourceRef; 1] = [hard(ResourceSlot::Resource, WAV_TYPE)];
+static AREA: [ResourceRef; 1] = [hard(ResourceSlot::Resource, ARE_TYPE)];
+
+/// "Animation file (VVC or BAM)" — the engine takes either, so both are
+/// offered as candidates.
+static ANIMATION: [ResourceRef; 2] = [
+    soft(ResourceSlot::Resource, VVC_TYPE),
+    soft(ResourceSlot::Resource, BAM_TYPE),
+];
 
 /// Opcode → name, indexed directly by opcode number.
 static OPCODE_NAMES: [&str; 368] = [
@@ -439,6 +633,76 @@ mod tests {
         // ordinary numeric opcodes carry no strref.
         for op in [0, 1, 13, 68, 367, 999] {
             assert!(opcode_strref_slots(op).is_empty(), "opcode {op}");
+        }
+    }
+
+    fn kinds(opcode: u32) -> Vec<(ResourceSlot, u16, bool)> {
+        opcode_resource_slots(opcode)
+            .iter()
+            .map(|r| (r.slot, r.kind, r.soft))
+            .collect()
+    }
+
+    #[test]
+    fn each_family_names_its_own_type() {
+        use ResourceSlot::Resource;
+        assert_eq!(kinds(122)[0], (Resource, ITM_TYPE, false));
+        assert_eq!(kinds(146)[0], (Resource, SPL_TYPE, false));
+        assert_eq!(kinds(151)[0], (Resource, CRE_TYPE, false));
+        assert_eq!(kinds(177)[0], (Resource, EFF_TYPE, false));
+        assert_eq!(kinds(82)[0], (Resource, BCS_TYPE, false));
+        assert_eq!(kinds(186)[0], (Resource, ARE_TYPE, false));
+        assert_eq!(kinds(174)[0], (Resource, WAV_TYPE, false));
+        assert_eq!(kinds(107)[0], (Resource, BMP_TYPE, false));
+        assert_eq!(kinds(152)[0], (Resource, MVE_TYPE, false));
+        assert_eq!(kinds(214)[0], (Resource, TWODA_TYPE, false));
+    }
+
+    #[test]
+    fn ambiguous_fields_offer_every_reading_and_mark_them_soft() {
+        use ResourceSlot::Resource;
+        // "The spell or item specified in the Resource field."
+        assert_eq!(
+            kinds(318),
+            vec![(Resource, ITM_TYPE, true), (Resource, SPL_TYPE, true)]
+        );
+        // "Animation file (VVC or BAM)."
+        assert_eq!(
+            kinds(215),
+            vec![(Resource, VVC_TYPE, true), (Resource, BAM_TYPE, true)]
+        );
+    }
+
+    #[test]
+    fn multi_slot_opcodes_type_each_slot_separately() {
+        use ResourceSlot::{Resource, Resource2, Resource3};
+        // #182: the item to check for, then the effect to apply.
+        assert_eq!(
+            kinds(182),
+            vec![(Resource, ITM_TYPE, false), (Resource2, EFF_TYPE, false)]
+        );
+        // #256: a spell, the sequencer's VVC, then a second spell.
+        assert_eq!(
+            kinds(256),
+            vec![
+                (Resource, SPL_TYPE, false),
+                (Resource2, VVC_TYPE, false),
+                (Resource3, SPL_TYPE, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn fields_that_are_not_resrefs_are_excluded() {
+        // Variable names (#265/#309), matching keys (#144/#279), a scripting
+        // name (#319), an ARE animation label (#339), and a filename prefix
+        // the engine completes itself (#336) all live in a resref field but
+        // name no file.
+        for opcode in [265, 309, 144, 279, 319, 339, 336] {
+            assert!(
+                opcode_resource_slots(opcode).is_empty(),
+                "opcode {opcode} stores a non-resref in its resource field"
+            );
         }
     }
 }

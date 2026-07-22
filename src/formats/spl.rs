@@ -14,7 +14,8 @@ use std::io::{self, Write};
 
 use crate::formats::eff::Feature;
 use crate::formats::fields::{set_flags, write_bitfield};
-use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::formats::{BAM_TYPE, WAV_TYPE};
+use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for SPL files.
 pub const SPL_TYPE: u16 = 0x03ee;
@@ -370,6 +371,40 @@ impl Spl {
             for (k, feat) in ext.features.iter().enumerate() {
                 let at = format!("ability[{j}].effect[{k}]");
                 uses.extend(feat.strref_uses().into_iter().map(|u| u.prefixed(&at)));
+            }
+        }
+        uses
+    }
+
+    /// Every resource this spell names, tagged with the type it names: the
+    /// completion sound and the BAM icons for the header and each ability.
+    /// Effect resources are not yet decoded.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let h = &self.header;
+        let mut uses = vec![
+            ResrefUse::new(WAV_TYPE, &h.completion_sound, "completion_sound"),
+            ResrefUse::new(BAM_TYPE, &h.spellbook_icon, "spellbook_icon"),
+            ResrefUse::new(BAM_TYPE, &h.ground_icon, "ground_icon"),
+            ResrefUse::new(BAM_TYPE, &h.description_icon, "description_icon"),
+        ];
+        for (i, ext) in self.ext_headers.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                BAM_TYPE,
+                &ext.memorised_icon,
+                format!("ability[{i}].memorised_icon"),
+            ));
+        }
+        uses.retain(|u| !u.value.is_empty());
+        // Effects can name a resource (a scroll creating the item it teaches,
+        // say): the on-cast effects, then each ability's own effects.
+        for (i, feat) in self.casting.iter().enumerate() {
+            let at = format!("casting[{i}]");
+            uses.extend(feat.resref_uses().into_iter().map(|u| u.prefixed(&at)));
+        }
+        for (j, ext) in self.ext_headers.iter().enumerate() {
+            for (k, feat) in ext.features.iter().enumerate() {
+                let at = format!("ability[{j}].effect[{k}]");
+                uses.extend(feat.resref_uses().into_iter().map(|u| u.prefixed(&at)));
             }
         }
         uses

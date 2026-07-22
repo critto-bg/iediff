@@ -16,8 +16,13 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::formats::cre::CRE_TYPE;
+use crate::formats::dlg::DLG_TYPE;
 use crate::formats::fields::{set_bits, set_flags, write_bitfield};
-use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::formats::itm::ITM_TYPE;
+use crate::formats::pro::PRO_TYPE;
+use crate::formats::{BAM_TYPE, BCS_TYPE, WAV_TYPE, WED_TYPE};
+use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for ARE files.
 pub const ARE_TYPE: u16 = 0x03f2;
@@ -1006,6 +1011,179 @@ impl Are {
         uses
     }
 
+    /// Every resource this area names, tagged with the type it names: the
+    /// tilemap and neighbouring areas, the area and per-record scripts, the CRE
+    /// of every actor / spawn / rest creature, the ITM of every pooled item and
+    /// key, the DLG of every actor and door, and the sounds and animations.
+    ///
+    /// Note that a container's contents are *not* named on the container: every
+    /// item in the area lives in one flat pool, which the containers index into.
+    /// A hit therefore reads `item[12]`, not `container[3].item[0]`.
+    ///
+    /// Skipped as area-internal labels rather than resource references: each
+    /// record's `name`, a door's `door_id` and a tiled object's `tile_id` (both
+    /// name entries inside the WED), and a region's `entrance` (an entrance name
+    /// within the destination area).
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let h = &self.header;
+        let mut uses = vec![
+            ResrefUse::new(WED_TYPE, &h.wed, "wed"),
+            ResrefUse::new(BCS_TYPE, &h.script, "script"),
+            ResrefUse::new(ARE_TYPE, &h.north.area, "north"),
+            ResrefUse::new(ARE_TYPE, &h.east.area, "east"),
+            ResrefUse::new(ARE_TYPE, &h.south.area, "south"),
+            ResrefUse::new(ARE_TYPE, &h.west.area, "west"),
+        ];
+
+        for (i, a) in self.actors.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                CRE_TYPE,
+                &a.cre_file,
+                format!("actor[{i}].cre"),
+            ));
+            uses.push(ResrefUse::new(
+                DLG_TYPE,
+                &a.dialog,
+                format!("actor[{i}].dialog"),
+            ));
+            for (j, script) in a.scripts.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    BCS_TYPE,
+                    script,
+                    format!("actor[{i}].script[{j}]"),
+                ));
+            }
+        }
+
+        for (i, r) in self.regions.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ARE_TYPE,
+                &r.destination,
+                format!("region[{i}].destination"),
+            ));
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &r.key_item,
+                format!("region[{i}].key_item"),
+            ));
+            uses.push(ResrefUse::new(
+                BCS_TYPE,
+                &r.script,
+                format!("region[{i}].script"),
+            ));
+        }
+
+        for (i, c) in self.containers.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &c.key_item,
+                format!("container[{i}].key_item"),
+            ));
+        }
+
+        for (i, item) in self.items.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &item.resource,
+                format!("item[{i}]"),
+            ));
+        }
+
+        for (i, s) in self.spawns.iter().enumerate() {
+            for (j, c) in s.creatures.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    CRE_TYPE,
+                    &c.resource,
+                    format!("spawn[{i}].creature[{j}]"),
+                ));
+            }
+        }
+
+        for (i, a) in self.ambients.iter().enumerate() {
+            for (j, sound) in a.sounds.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    WAV_TYPE,
+                    sound,
+                    format!("ambient[{i}].sound[{j}]"),
+                ));
+            }
+        }
+
+        for (i, d) in self.doors.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &d.key_item,
+                format!("door[{i}].key_item"),
+            ));
+            uses.push(ResrefUse::new(
+                BCS_TYPE,
+                &d.script,
+                format!("door[{i}].script"),
+            ));
+            uses.push(ResrefUse::new(
+                DLG_TYPE,
+                &d.dialog,
+                format!("door[{i}].dialog"),
+            ));
+            uses.push(ResrefUse::new(
+                WAV_TYPE,
+                &d.open_sound,
+                format!("door[{i}].open_sound"),
+            ));
+            uses.push(ResrefUse::new(
+                WAV_TYPE,
+                &d.close_sound,
+                format!("door[{i}].close_sound"),
+            ));
+        }
+
+        for (i, a) in self.animations.iter().enumerate() {
+            // "BGEE: BAM/WBM/PVRZ, Others: BAM" — BAM is the likely reading on
+            // this engine, not the guaranteed one.
+            uses.push(
+                ResrefUse::new(BAM_TYPE, &a.resource, format!("animation[{i}].resource")).soft(),
+            );
+        }
+
+        for (i, t) in self.proj_traps.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                PRO_TYPE,
+                &t.projectile,
+                format!("proj_trap[{i}].projectile"),
+            ));
+        }
+
+        if let Some(song) = &self.song {
+            for (i, sound) in song.day_ambient.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    WAV_TYPE,
+                    sound,
+                    format!("song.day_ambient[{i}]"),
+                ));
+            }
+            for (i, sound) in song.night_ambient.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    WAV_TYPE,
+                    sound,
+                    format!("song.night_ambient[{i}]"),
+                ));
+            }
+        }
+
+        if let Some(rest) = &self.rest {
+            for (i, c) in rest.creatures.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    CRE_TYPE,
+                    &c.resource,
+                    format!("rest.creature[{i}]"),
+                ));
+            }
+        }
+
+        uses.retain(|u| !u.value.is_empty());
+        uses
+    }
+
     /// The projectile traps, for the manager to resolve their missile symbols.
     pub fn proj_traps_mut(&mut self) -> &mut [ProjectileTrap] {
         &mut self.proj_traps
@@ -1664,10 +1842,10 @@ mod tests {
         data
     }
 
-    fn put_u32(data: &mut Vec<u8>, at: usize, value: u32) {
+    fn put_u32(data: &mut [u8], at: usize, value: u32) {
         data[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
-    fn put_u16(data: &mut Vec<u8>, at: usize, value: u16) {
+    fn put_u16(data: &mut [u8], at: usize, value: u16) {
         data[at..at + 2].copy_from_slice(&value.to_le_bytes());
     }
 
@@ -1716,6 +1894,58 @@ mod tests {
         let are = Are::parse(&data).expect("parse");
         assert_eq!(are.containers.len(), 1);
         assert!(are.container_items(&are.containers[0]).is_empty());
+    }
+
+    #[test]
+    fn resref_uses_tag_each_reference_with_the_type_it_names() {
+        let mut data = build_are();
+        data[0x08..0x0c].copy_from_slice(b"AR10"); // WED
+        data[0x94..0x98].copy_from_slice(b"AREA"); // area script
+        data[0x18..0x1c].copy_from_slice(b"AR20"); // north neighbour
+
+        let actor_off = data.len();
+        data.resize(actor_off + ACTOR_SIZE, 0);
+        data[actor_off + 0x48..actor_off + 0x4c].copy_from_slice(b"CHAT"); // dialog
+        data[actor_off + 0x50..actor_off + 0x54].copy_from_slice(b"SCRP"); // script[0]
+        data[actor_off + 0x80..actor_off + 0x84].copy_from_slice(b"GUAR"); // CRE
+
+        let item_off = data.len();
+        data.resize(item_off + ITEM_SIZE, 0);
+        data[item_off..item_off + 4].copy_from_slice(b"SW1H");
+
+        let door_off = data.len();
+        data.resize(door_off + DOOR_SIZE, 0);
+        data[door_off + 0x78..door_off + 0x7c].copy_from_slice(b"KEY1"); // key item
+
+        put_u32(&mut data, 0x54, actor_off as u32);
+        put_u16(&mut data, 0x58, 1);
+        put_u32(&mut data, 0x78, item_off as u32);
+        put_u16(&mut data, 0x76, 1);
+        put_u32(&mut data, 0xa8, door_off as u32);
+        put_u32(&mut data, 0xa4, 1);
+
+        let are = Are::parse(&data).expect("parse");
+        let uses = are.resref_uses();
+        let got: Vec<(u16, &str, &str)> = uses
+            .iter()
+            .map(|u| (u.kind, u.value, u.path.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (WED_TYPE, "AR10", "wed"),
+                (BCS_TYPE, "AREA", "script"),
+                (ARE_TYPE, "AR20", "north"),
+                (CRE_TYPE, "GUAR", "actor[0].cre"),
+                (DLG_TYPE, "CHAT", "actor[0].dialog"),
+                (BCS_TYPE, "SCRP", "actor[0].script[0]"),
+                (ITM_TYPE, "SW1H", "item[0]"),
+                (ITM_TYPE, "KEY1", "door[0].key_item"),
+            ]
+        );
+        // Empty resrefs (the unset neighbours, the door's script and dialog, the
+        // actor's five other script slots) are dropped, not reported as "".
+        assert!(uses.iter().all(|u| !u.value.is_empty()));
     }
 
     #[test]

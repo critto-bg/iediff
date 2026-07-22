@@ -13,8 +13,10 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crate::formats::opcode::{StrrefSlot, opcode_name, opcode_strref_slots};
-use crate::{Reader, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::formats::opcode::{
+    ResourceSlot, StrrefSlot, opcode_name, opcode_resource_slots, opcode_strref_slots,
+};
+use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for EFF files.
 pub const EFF_TYPE: u16 = 0x03f8;
@@ -239,6 +241,32 @@ impl Eff {
         effect_strref_uses(self.opcode, self.param1, self.param2, self.special)
     }
 
+    /// Resources this effect names, tagged `op<n>.<field>` with the type each
+    /// names. Empty for most opcodes; non-empty for the ones whose resref
+    /// fields carry a resource (see [`opcode_resource_slots`]). All three slots
+    /// are reachable here, unlike the V1 [`Feature`], which has only the first.
+    ///
+    /// `parent_resource` is deliberately excluded: it records the ITM/SPL that
+    /// *applied* this effect at runtime, which is provenance rather than a
+    /// reference the file makes.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let mut uses = Vec::new();
+        for slot in opcode_resource_slots(self.opcode) {
+            let value = match slot.slot {
+                ResourceSlot::Resource => &self.resource,
+                ResourceSlot::Resource2 => &self.resource2,
+                ResourceSlot::Resource3 => &self.resource3,
+            };
+            if value.is_empty() {
+                continue;
+            }
+            let field = resource_slot_name(slot.slot);
+            let use_ = ResrefUse::new(slot.kind, value, format!("op{}.{field}", self.opcode));
+            uses.push(if slot.soft { use_.soft() } else { use_ });
+        }
+        uses
+    }
+
     /// Write the effect's fields as `key=value` lines, in disk order, exactly as
     /// stored (unsigned, undecoded). Each key carries `prefix` so the line is
     /// self-locating when embedded (e.g. `"effect.3."` in a CRE); the standalone
@@ -451,6 +479,16 @@ fn effect_strref_uses(opcode: u32, param1: u32, param2: u32, special: u32) -> Ve
     uses
 }
 
+/// Field name for a resource slot, as it appears in a reference path
+/// (`op122.resource2`). Matches the `write_raw` keys.
+fn resource_slot_name(slot: ResourceSlot) -> &'static str {
+    match slot {
+        ResourceSlot::Resource => "resource",
+        ResourceSlot::Resource2 => "resource2",
+        ResourceSlot::Resource3 => "resource3",
+    }
+}
+
 /// Size of one EFF V1 feature block on disk.
 pub const FEATURE_SIZE: usize = 48;
 
@@ -595,6 +633,29 @@ impl Feature {
         Ok(())
     }
 
+    /// Resources this effect names, tagged `op<n>.resource`. The V1 layout has
+    /// a single resref field, so any [`ResourceSlot::Resource2`]/`Resource3`
+    /// the opcode would use in a V2 effect simply isn't there to read — the
+    /// `Resource`-slot filter below is what keeps this honest rather than
+    /// reporting the same resref three times for opcode #122.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        if self.resource.is_empty() {
+            return Vec::new();
+        }
+        opcode_resource_slots(self.opcode as u32)
+            .iter()
+            .filter(|slot| slot.slot == ResourceSlot::Resource)
+            .map(|slot| {
+                let use_ = ResrefUse::new(
+                    slot.kind,
+                    &self.resource,
+                    format!("op{}.resource", self.opcode),
+                );
+                if slot.soft { use_.soft() } else { use_ }
+            })
+            .collect()
+    }
+
     /// Write the feature's fields as `key=value` lines, in disk order, exactly as
     /// stored. Each key is prefixed (e.g. `"ext.0.effect.2."`) so the line is
     /// self-locating in the flat machine-readable view.
@@ -704,6 +765,8 @@ fn save_type(value: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::itm::ITM_TYPE;
+    use crate::formats::spl::SPL_TYPE;
 
     /// A 48-byte V1 feature block with the fields a strref test cares about.
     fn feature(opcode: u16, param1: u32, param2: u32, special: u32) -> Feature {
@@ -754,5 +817,104 @@ mod tests {
         data[0x1c..0x20].copy_from_slice(&4242u32.to_le_bytes()); // param1 (body 0x14)
         let eff = Eff::parse(&data).expect("parse eff");
         assert_eq!(pairs(&eff.strref_uses()), vec![(4242, "op139.param1")]);
+    }
+
+    /// A 48-byte V1 feature block carrying a resref, for the resource tests.
+    fn feature_with_resource(opcode: u16, resource: &str) -> Feature {
+        let mut data = vec![0u8; FEATURE_SIZE];
+        data[0x00..0x02].copy_from_slice(&opcode.to_le_bytes());
+        let bytes = resource.as_bytes();
+        data[0x14..0x14 + bytes.len()].copy_from_slice(bytes);
+        Feature::parse_at(&Reader::new(&data), 0).expect("parse feature")
+    }
+
+    /// A standalone V2 EFF with an opcode and up to three resrefs.
+    fn eff_with_resources(opcode: u32, resources: [&str; 3]) -> Eff {
+        let mut data = vec![0u8; 0x110];
+        data[0x00..0x04].copy_from_slice(EFF_SIGNATURE);
+        data[0x04..0x08].copy_from_slice(EFF_VERSION);
+        data[0x10..0x14].copy_from_slice(&opcode.to_le_bytes()); // body 0x08
+        // Body starts at 0x08, so resource/2/3 (0x28/0x68/0x70) land here.
+        for (at, value) in [
+            (0x30, resources[0]),
+            (0x70, resources[1]),
+            (0x78, resources[2]),
+        ] {
+            data[at..at + value.len()].copy_from_slice(value.as_bytes());
+        }
+        Eff::parse(&data).expect("parse eff")
+    }
+
+    fn refs<'a>(uses: &'a [ResrefUse<'a>]) -> Vec<(u16, &'a str, &'a str, bool)> {
+        uses.iter()
+            .map(|u| (u.kind, u.value, u.path.as_str(), u.soft))
+            .collect()
+    }
+
+    #[test]
+    fn item_opcode_resource_is_reported_as_an_itm() {
+        let feat = feature_with_resource(111, "S!SPSH01");
+        assert_eq!(
+            refs(&feat.resref_uses()),
+            vec![(ITM_TYPE, "S!SPSH01", "op111.resource", false)]
+        );
+    }
+
+    #[test]
+    fn spell_or_item_opcodes_offer_both_readings_as_candidates() {
+        // #318/#321/#324 take "the spell or item specified in the Resource
+        // field". One slot, two types: a search for either finds it, and
+        // neither reading is asserted as fact.
+        for opcode in [318, 321, 324] {
+            let feat = feature_with_resource(opcode, "SPPR309");
+            let path = format!("op{opcode}.resource");
+            assert_eq!(
+                refs(&feat.resref_uses()),
+                vec![
+                    (ITM_TYPE, "SPPR309", &path[..], true),
+                    (SPL_TYPE, "SPPR309", &path[..], true),
+                ],
+                "opcode {opcode} should offer both readings, both soft"
+            );
+        }
+    }
+
+    #[test]
+    fn opcode_122_reads_all_three_resources_only_in_v2() {
+        // In a V2 effect the EE picks at random among the three, so all three
+        // name items.
+        let eff = eff_with_resources(122, ["POTN42", "POTN52", "POTN55"]);
+        assert_eq!(
+            refs(&eff.resref_uses()),
+            vec![
+                (ITM_TYPE, "POTN42", "op122.resource", false),
+                (ITM_TYPE, "POTN52", "op122.resource2", false),
+                (ITM_TYPE, "POTN55", "op122.resource3", false),
+            ]
+        );
+        // A V1 feature has only the first resref field; the other two slots must
+        // not re-report it under resource2/resource3.
+        let feat = feature_with_resource(122, "POTN42");
+        assert_eq!(
+            refs(&feat.resref_uses()),
+            vec![(ITM_TYPE, "POTN42", "op122.resource", false)]
+        );
+    }
+
+    #[test]
+    fn opcodes_without_a_resource_report_nothing() {
+        // A non-resource opcode, and a resource opcode with the field empty.
+        assert!(feature_with_resource(1, "SW1H01").resref_uses().is_empty());
+        assert!(feature_with_resource(111, "").resref_uses().is_empty());
+        // #182 names two different types: the ITM to check for, and the EFF to
+        // apply while it is equipped.
+        let eff = eff_with_resources(182, ["SW1H01", "SOMEEFF", ""]);
+        assert_eq!(
+            refs(&eff.resref_uses()),
+            vec![
+                (ITM_TYPE, "SW1H01", "op182.resource", false),
+                (EFF_TYPE, "SOMEEFF", "op182.resource2", false),
+            ]
+        );
     }
 }
