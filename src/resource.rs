@@ -38,350 +38,6 @@ use crate::script::{self, Vocabulary};
 /// under `lang/`; English is the default. (Selectable later.)
 const DEFAULT_LOCALE: &str = "en_US";
 
-/// Anything that can go wrong while resolving or reading a resource.
-#[derive(Debug)]
-pub enum ResourceError {
-    Io(std::io::Error),
-    Key(KeyError),
-    Bif(BifError),
-    Tlk(TlkError),
-    TwoDA(TwoDAError),
-    Eff(EffError),
-    Itm(ItmError),
-    Spl(SplError),
-    Cre(CreError),
-    Pro(ProError),
-    Sto(StoError),
-    Are(AreError),
-    Dlg(DlgError),
-    Bcs(BcsError),
-    /// No resource with this name and type exists in the KEY.
-    NotFound {
-        name: String,
-        res_type: u16,
-    },
-    /// The KEY locator points at a BIF index that the KEY doesn't list.
-    BifIndexOutOfRange(usize),
-}
-
-impl fmt::Display for ResourceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ResourceError::Io(e) => write!(f, "i/o error: {e}"),
-            ResourceError::Key(e) => write!(f, "{e}"),
-            ResourceError::Bif(e) => write!(f, "{e}"),
-            ResourceError::Tlk(e) => write!(f, "{e}"),
-            ResourceError::TwoDA(e) => write!(f, "{e}"),
-            ResourceError::Eff(e) => write!(f, "{e}"),
-            ResourceError::Itm(e) => write!(f, "{e}"),
-            ResourceError::Spl(e) => write!(f, "{e}"),
-            ResourceError::Cre(e) => write!(f, "{e}"),
-            ResourceError::Pro(e) => write!(f, "{e}"),
-            ResourceError::Sto(e) => write!(f, "{e}"),
-            ResourceError::Are(e) => write!(f, "{e}"),
-            ResourceError::Dlg(e) => write!(f, "{e}"),
-            ResourceError::Bcs(e) => write!(f, "{e}"),
-            ResourceError::NotFound { name, res_type } => {
-                write!(f, "resource not found: {name} (type 0x{res_type:04x})")
-            }
-            ResourceError::BifIndexOutOfRange(index) => {
-                write!(f, "KEY refers to BIF #{index}, which it does not list")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ResourceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ResourceError::Io(e) => Some(e),
-            ResourceError::Key(e) => Some(e),
-            ResourceError::Bif(e) => Some(e),
-            ResourceError::Tlk(e) => Some(e),
-            ResourceError::TwoDA(e) => Some(e),
-            ResourceError::Eff(e) => Some(e),
-            ResourceError::Itm(e) => Some(e),
-            ResourceError::Spl(e) => Some(e),
-            ResourceError::Cre(e) => Some(e),
-            ResourceError::Pro(e) => Some(e),
-            ResourceError::Sto(e) => Some(e),
-            ResourceError::Are(e) => Some(e),
-            ResourceError::Dlg(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for ResourceError {
-    fn from(e: std::io::Error) -> Self {
-        ResourceError::Io(e)
-    }
-}
-
-impl From<KeyError> for ResourceError {
-    fn from(e: KeyError) -> Self {
-        ResourceError::Key(e)
-    }
-}
-
-impl From<BifError> for ResourceError {
-    fn from(e: BifError) -> Self {
-        ResourceError::Bif(e)
-    }
-}
-
-impl From<TlkError> for ResourceError {
-    fn from(e: TlkError) -> Self {
-        ResourceError::Tlk(e)
-    }
-}
-
-impl From<TwoDAError> for ResourceError {
-    fn from(e: TwoDAError) -> Self {
-        ResourceError::TwoDA(e)
-    }
-}
-
-impl From<EffError> for ResourceError {
-    fn from(e: EffError) -> Self {
-        ResourceError::Eff(e)
-    }
-}
-
-impl From<ItmError> for ResourceError {
-    fn from(e: ItmError) -> Self {
-        ResourceError::Itm(e)
-    }
-}
-
-impl From<SplError> for ResourceError {
-    fn from(e: SplError) -> Self {
-        ResourceError::Spl(e)
-    }
-}
-
-impl From<CreError> for ResourceError {
-    fn from(e: CreError) -> Self {
-        ResourceError::Cre(e)
-    }
-}
-
-impl From<ProError> for ResourceError {
-    fn from(e: ProError) -> Self {
-        ResourceError::Pro(e)
-    }
-}
-
-impl From<StoError> for ResourceError {
-    fn from(e: StoError) -> Self {
-        ResourceError::Sto(e)
-    }
-}
-
-impl From<AreError> for ResourceError {
-    fn from(e: AreError) -> Self {
-        ResourceError::Are(e)
-    }
-}
-
-impl From<DlgError> for ResourceError {
-    fn from(e: DlgError) -> Self {
-        ResourceError::Dlg(e)
-    }
-}
-
-impl From<BcsError> for ResourceError {
-    fn from(e: BcsError) -> Self {
-        ResourceError::Bcs(e)
-    }
-}
-
-/// One index layer's `(name, type)` entries. See
-/// [`ResourceManager::index_entries`].
-pub(crate) type IndexEntries<'a> = Vec<(&'a str, u16)>;
-
-/// Where to resolve a resource from. `Auto` prefers an override file over the
-/// archived original; `Biff` ignores the override entirely (the `--biff` flag).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    Auto,
-    Biff,
-}
-
-/// Where a resolved resource actually came from.
-#[derive(Clone)]
-pub enum Origin {
-    /// A file in the override directory (its path).
-    Override(PathBuf),
-    /// A BIF archive, by the name the KEY lists.
-    Bif(String),
-    /// A discrete file read straight from disk (`--file`), bypassing the index.
-    File(PathBuf),
-}
-
-impl fmt::Display for Origin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Origin::Override(path) => write!(f, "override: {}", path.display()),
-            Origin::Bif(bif) => write!(f, "biff: {bif}"),
-            Origin::File(path) => write!(f, "file: {}", path.display()),
-        }
-    }
-}
-
-/// Where a resource lives and how big it is, without its data.
-pub struct ResourceInfo {
-    pub res_type: u16,
-    pub size: u32,
-}
-
-impl fmt::Display for ResourceInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "  type: 0x{:04x} ({})",
-            self.res_type,
-            type_extension(self.res_type)
-        )?;
-        writeln!(f, "  size: {} bytes", self.size)
-    }
-}
-
-/// Summary of the override directory. See [`ResourceManager::override_stats`].
-pub struct OverrideStats {
-    /// Whether the `override` directory exists at all.
-    pub present: bool,
-    /// Addressable resources found (files whose extension names a known type).
-    pub resources: usize,
-    /// How many of those shadow a resource the KEY also lists.
-    pub shadowing: usize,
-    /// (resource type, count), most common first.
-    pub by_type: Vec<(u16, usize)>,
-}
-
-impl fmt::Display for OverrideStats {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if !self.present {
-            return writeln!(f, "override: not present");
-        }
-
-        if self.resources == 0 {
-            return writeln!(f, "override: empty");
-        }
-
-        let fresh = self.resources - self.shadowing;
-        writeln!(
-            f,
-            "override: {} resources ({} new, {} shadowing archived)",
-            self.resources, fresh, self.shadowing
-        )?;
-
-        writeln!(f, "override by type:")?;
-        for (res_type, count) in &self.by_type {
-            writeln!(
-                f,
-                "  {:<5} (0x{:04x})  {:>6}",
-                type_extension(*res_type),
-                res_type,
-                count
-            )?;
-        }
-
-        Ok(())
-    }
-}
-
-/// A loaded resource: a parsed view for formats we understand, otherwise the
-/// basic metadata. Renders itself via [`Display`](fmt::Display), so callers
-/// print it without knowing the concrete format.
-// Variants differ a lot in size (CRE is the largest), but exactly one short-lived
-// value exists per CLI invocation, so the layout doesn't matter — boxing would
-// only add indirection for no benefit.
-#[allow(clippy::large_enum_variant)]
-pub enum Resource {
-    Ids(IdsFile),
-    TwoDA(TwoDA),
-    Eff(Eff),
-    Itm(Itm),
-    Spl(Spl),
-    Cre(Cre),
-    Pro(Pro),
-    Sto(Sto),
-    Are(Are),
-    Dlg(Dlg),
-    Bcs(Script),
-    Other(ResourceInfo),
-}
-
-impl fmt::Display for Resource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Resource::Ids(ids) => write!(f, "{ids}"),
-            Resource::TwoDA(table) => write!(f, "{table}"),
-            Resource::Eff(eff) => write!(f, "{eff}"),
-            Resource::Itm(itm) => write!(f, "{itm}"),
-            Resource::Spl(spl) => write!(f, "{spl}"),
-            Resource::Cre(cre) => write!(f, "{cre}"),
-            Resource::Pro(pro) => write!(f, "{pro}"),
-            Resource::Sto(sto) => write!(f, "{sto}"),
-            Resource::Are(are) => write!(f, "{are}"),
-            Resource::Dlg(dlg) => write!(f, "{dlg}"),
-            Resource::Bcs(script) => write!(f, "{script}"),
-            Resource::Other(info) => write!(f, "{info}"),
-        }
-    }
-}
-
-impl Resource {
-    /// Write the machine-readable view: flat `key=value` lines for the binary
-    /// formats. The text formats (IDS, 2DA) are already field-oriented, so they
-    /// keep their tabular rendering, minus the human view's reading aids.
-    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
-        match self {
-            Resource::Eff(eff) => eff.write_raw(out, ""),
-            Resource::Itm(itm) => itm.write_raw(out),
-            Resource::Spl(spl) => spl.write_raw(out),
-            Resource::Cre(cre) => cre.write_raw(out),
-            Resource::Pro(pro) => pro.write_raw(out),
-            Resource::Sto(sto) => sto.write_raw(out),
-            Resource::Are(are) => are.write_raw(out),
-            Resource::Dlg(dlg) => dlg.write_raw(out),
-            Resource::Bcs(script) => script.write_raw(out),
-            Resource::Ids(ids) => write!(out, "{ids}"),
-            Resource::TwoDA(table) => table.write_raw(out),
-            Resource::Other(info) => write!(out, "{info}"),
-        }
-    }
-}
-
-/// A resource resolved to a concrete place, ready to read.
-enum Located {
-    Override {
-        path: PathBuf,
-    },
-    Bif {
-        source: usize,
-        file_index: u32,
-        res_type: u16,
-        bif: String,
-    },
-}
-
-impl Located {
-    fn origin(&self) -> Origin {
-        match self {
-            Located::Override { path, .. } => Origin::Override(path.clone()),
-            Located::Bif { bif, .. } => Origin::Bif(bif.clone()),
-        }
-    }
-}
-
-/// A loaded resource together with where it was resolved from.
-pub struct Loaded {
-    pub origin: Origin,
-    pub resource: Resource,
-}
-
 /// Loads a KEY and serves resource bytes out of the BIFs it indexes.
 pub struct ResourceManager {
     key: KeyFile,
@@ -404,22 +60,6 @@ pub struct ResourceManager {
     /// The script vocabulary, built from ACTION.IDS/TRIGGER.IDS on first use.
     /// Shared rather than copied: every decoded script points at the same one.
     vocabulary: Option<Rc<Vocabulary>>,
-}
-
-/// The display names a resource (ITM/SPL) carries, resolved from its header
-/// strrefs. Both are kept so a consumer can pick whichever it needs; most want
-/// [`display`](ResourceNames::display).
-#[derive(Clone, Default)]
-pub struct ResourceNames {
-    pub identified: Option<String>,
-    pub unidentified: Option<String>,
-}
-
-impl ResourceNames {
-    /// The name to show by default: identified if resolved, else unidentified.
-    pub fn display(&self) -> Option<&str> {
-        self.identified.as_deref().or(self.unidentified.as_deref())
-    }
 }
 
 impl ResourceManager {
@@ -475,6 +115,46 @@ impl ResourceManager {
         }
     }
 
+    /// Load a resource, parsing it when the format is supported and otherwise
+    /// returning its metadata. The result records where it was resolved from.
+    pub fn load(
+        &mut self,
+        name: &str,
+        res_type: u16,
+        source: Source,
+    ) -> Result<Loaded, ResourceError> {
+        let located =
+            self.locate(name, res_type, source)
+                .ok_or_else(|| ResourceError::NotFound {
+                    name: name.to_string(),
+                    res_type,
+                })?;
+
+        let origin = located.origin();
+        let data = self.read_located(&located)?;
+        let resource = self.decode(res_type, &data)?;
+        Ok(Loaded { origin, resource })
+    }
+
+    /// Load a discrete file straight from disk (the `--file` flag), bypassing
+    /// the KEY/override index entirely. Reference resolution still runs against
+    /// the established game directory, so a modded resource sitting in a mod
+    /// tree resolves its links against the install it will be copied into.
+    pub fn load_file(&mut self, path: &Path, res_type: u16) -> Result<Loaded, ResourceError> {
+        let data = std::fs::read(path)?;
+        let resource = self.decode(res_type, &data)?;
+        Ok(Loaded {
+            origin: Origin::File(path.to_path_buf()),
+            resource,
+        })
+    }
+
+    /// Resolve a strref to its display string from `dialog.tlk`. The TLK is
+    /// opened lazily and kept open for subsequent lookups.
+    pub fn string(&mut self, strref: u32) -> Result<String, ResourceError> {
+        Ok(self.dialog()?.string(strref)?)
+    }
+
     /// Every `(name, type)` the index knows, as `(override, KEY)`. Kept apart
     /// because the layers shadow each other and only the caller knows whether
     /// `--biff` is in play.
@@ -511,6 +191,29 @@ impl ResourceManager {
         Some((origin, bytes))
     }
 
+    /// The script call vocabulary for this install. Built once from its own
+    /// `ACTION.IDS` / `TRIGGER.IDS`; `None` when either is missing, which
+    /// leaves compiled scripts readable but unnamed.
+    pub(crate) fn vocabulary(&mut self) -> Option<Rc<Vocabulary>> {
+        if self.vocabulary.is_none() {
+            // Each table is parsed into an owned value before the next borrow.
+            let actions = self.load_ids("ACTION").map(script::signatures);
+            let triggers = self.load_ids("TRIGGER").map(script::signatures);
+            if let (Some(actions), Some(triggers)) = (actions, triggers) {
+                let mut vocabulary = script::from_signatures(actions, triggers);
+                // Load only the tables the signatures actually name. A table
+                // the install lacks simply leaves those arguments numeric.
+                for table in vocabulary.symbol_tables() {
+                    if let Some(entries) = self.ids_symbols(&table) {
+                        vocabulary.set_symbols(&table, entries);
+                    }
+                }
+                self.vocabulary = Some(Rc::new(vocabulary));
+            }
+        }
+        self.vocabulary.clone()
+    }
+
     /// Resolve a resource to a concrete location: an override file when one
     /// exists (and `source` permits it), otherwise the BIF the KEY points at.
     fn locate(&self, name: &str, res_type: u16, source: Source) -> Option<Located> {
@@ -530,40 +233,6 @@ impl ResourceManager {
             file_index: res.file_index(),
             res_type: res.res_type(),
             bif,
-        })
-    }
-
-    /// Load a resource, parsing it when the format is supported and otherwise
-    /// returning its metadata. The result records where it was resolved from.
-    pub fn load(
-        &mut self,
-        name: &str,
-        res_type: u16,
-        source: Source,
-    ) -> Result<Loaded, ResourceError> {
-        let located =
-            self.locate(name, res_type, source)
-                .ok_or_else(|| ResourceError::NotFound {
-                    name: name.to_string(),
-                    res_type,
-                })?;
-
-        let origin = located.origin();
-        let data = self.read_located(&located)?;
-        let resource = self.decode(res_type, &data)?;
-        Ok(Loaded { origin, resource })
-    }
-
-    /// Load a discrete file straight from disk (the `--file` flag), bypassing
-    /// the KEY/override index entirely. Reference resolution still runs against
-    /// the established game directory, so a modded resource sitting in a mod
-    /// tree resolves its links against the install it will be copied into.
-    pub fn load_file(&mut self, path: &Path, res_type: u16) -> Result<Loaded, ResourceError> {
-        let data = std::fs::read(path)?;
-        let resource = self.decode(res_type, &data)?;
-        Ok(Loaded {
-            origin: Origin::File(path.to_path_buf()),
-            resource,
         })
     }
 
@@ -938,29 +607,6 @@ impl ResourceManager {
             .map(str::to_string)
     }
 
-    /// The script call vocabulary for this install. Built once from its own
-    /// `ACTION.IDS` / `TRIGGER.IDS`; `None` when either is missing, which
-    /// leaves compiled scripts readable but unnamed.
-    pub(crate) fn vocabulary(&mut self) -> Option<Rc<Vocabulary>> {
-        if self.vocabulary.is_none() {
-            // Each table is parsed into an owned value before the next borrow.
-            let actions = self.load_ids("ACTION").map(script::signatures);
-            let triggers = self.load_ids("TRIGGER").map(script::signatures);
-            if let (Some(actions), Some(triggers)) = (actions, triggers) {
-                let mut vocabulary = script::from_signatures(actions, triggers);
-                // Load only the tables the signatures actually name. A table
-                // the install lacks simply leaves those arguments numeric.
-                for table in vocabulary.symbol_tables() {
-                    if let Some(entries) = self.ids_symbols(&table) {
-                        vocabulary.set_symbols(&table, entries);
-                    }
-                }
-                self.vocabulary = Some(Rc::new(vocabulary));
-            }
-        }
-        self.vocabulary.clone()
-    }
-
     /// Resolve the end-of-line comments a decompiled script shows: a strref's
     /// text (and sound) and a named resource's display name. References are
     /// collected first, then resolved, so the script borrow is released before
@@ -1150,12 +796,6 @@ impl ResourceManager {
         }
     }
 
-    /// Resolve a strref to its display string from `dialog.tlk`. The TLK is
-    /// opened lazily and kept open for subsequent lookups.
-    pub fn string(&mut self, strref: u32) -> Result<String, ResourceError> {
-        Ok(self.dialog()?.string(strref)?)
-    }
-
     /// Borrow the dialog TLK, opening it on first use from the locale's
     /// `lang/<locale>/dialog.tlk`.
     fn dialog(&mut self) -> Result<&mut TlkFile, ResourceError> {
@@ -1190,6 +830,208 @@ impl ResourceManager {
         self.open_bifs
             .get_mut(&source)
             .ok_or(ResourceError::BifIndexOutOfRange(source))
+    }
+}
+
+/// The display names a resource (ITM/SPL) carries, resolved from its header
+/// strrefs. Both are kept so a consumer can pick whichever it needs; most want
+/// [`display`](ResourceNames::display).
+#[derive(Clone, Default)]
+pub struct ResourceNames {
+    pub identified: Option<String>,
+    pub unidentified: Option<String>,
+}
+
+impl ResourceNames {
+    /// The name to show by default: identified if resolved, else unidentified.
+    pub fn display(&self) -> Option<&str> {
+        self.identified.as_deref().or(self.unidentified.as_deref())
+    }
+}
+
+/// One index layer's `(name, type)` entries. See
+/// [`ResourceManager::index_entries`].
+pub(crate) type IndexEntries<'a> = Vec<(&'a str, u16)>;
+
+/// Where to resolve a resource from. `Auto` prefers an override file over the
+/// archived original; `Biff` ignores the override entirely (the `--biff` flag).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Auto,
+    Biff,
+}
+
+/// Where a resolved resource actually came from.
+#[derive(Clone)]
+pub enum Origin {
+    /// A file in the override directory (its path).
+    Override(PathBuf),
+    /// A BIF archive, by the name the KEY lists.
+    Bif(String),
+    /// A discrete file read straight from disk (`--file`), bypassing the index.
+    File(PathBuf),
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Origin::Override(path) => write!(f, "override: {}", path.display()),
+            Origin::Bif(bif) => write!(f, "biff: {bif}"),
+            Origin::File(path) => write!(f, "file: {}", path.display()),
+        }
+    }
+}
+
+/// A loaded resource together with where it was resolved from.
+pub struct Loaded {
+    pub origin: Origin,
+    pub resource: Resource,
+}
+
+/// A loaded resource: a parsed view for formats we understand, otherwise the
+/// basic metadata. Renders itself via [`Display`](fmt::Display), so callers
+/// print it without knowing the concrete format.
+// Variants differ a lot in size (CRE is the largest), but exactly one short-lived
+// value exists per CLI invocation, so the layout doesn't matter — boxing would
+// only add indirection for no benefit.
+#[allow(clippy::large_enum_variant)]
+pub enum Resource {
+    Ids(IdsFile),
+    TwoDA(TwoDA),
+    Eff(Eff),
+    Itm(Itm),
+    Spl(Spl),
+    Cre(Cre),
+    Pro(Pro),
+    Sto(Sto),
+    Are(Are),
+    Dlg(Dlg),
+    Bcs(Script),
+    Other(ResourceInfo),
+}
+
+impl Resource {
+    /// Write the machine-readable view: flat `key=value` lines for the binary
+    /// formats. The text formats (IDS, 2DA) are already field-oriented, so they
+    /// keep their tabular rendering, minus the human view's reading aids.
+    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
+        match self {
+            Resource::Eff(eff) => eff.write_raw(out, ""),
+            Resource::Itm(itm) => itm.write_raw(out),
+            Resource::Spl(spl) => spl.write_raw(out),
+            Resource::Cre(cre) => cre.write_raw(out),
+            Resource::Pro(pro) => pro.write_raw(out),
+            Resource::Sto(sto) => sto.write_raw(out),
+            Resource::Are(are) => are.write_raw(out),
+            Resource::Dlg(dlg) => dlg.write_raw(out),
+            Resource::Bcs(script) => script.write_raw(out),
+            Resource::Ids(ids) => write!(out, "{ids}"),
+            Resource::TwoDA(table) => table.write_raw(out),
+            Resource::Other(info) => write!(out, "{info}"),
+        }
+    }
+}
+
+impl fmt::Display for Resource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Resource::Ids(ids) => write!(f, "{ids}"),
+            Resource::TwoDA(table) => write!(f, "{table}"),
+            Resource::Eff(eff) => write!(f, "{eff}"),
+            Resource::Itm(itm) => write!(f, "{itm}"),
+            Resource::Spl(spl) => write!(f, "{spl}"),
+            Resource::Cre(cre) => write!(f, "{cre}"),
+            Resource::Pro(pro) => write!(f, "{pro}"),
+            Resource::Sto(sto) => write!(f, "{sto}"),
+            Resource::Are(are) => write!(f, "{are}"),
+            Resource::Dlg(dlg) => write!(f, "{dlg}"),
+            Resource::Bcs(script) => write!(f, "{script}"),
+            Resource::Other(info) => write!(f, "{info}"),
+        }
+    }
+}
+
+/// Where a resource lives and how big it is, without its data.
+pub struct ResourceInfo {
+    pub res_type: u16,
+    pub size: u32,
+}
+
+impl fmt::Display for ResourceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "  type: 0x{:04x} ({})",
+            self.res_type,
+            type_extension(self.res_type)
+        )?;
+        writeln!(f, "  size: {} bytes", self.size)
+    }
+}
+
+/// Summary of the override directory. See [`ResourceManager::override_stats`].
+pub struct OverrideStats {
+    /// Whether the `override` directory exists at all.
+    pub present: bool,
+    /// Addressable resources found (files whose extension names a known type).
+    pub resources: usize,
+    /// How many of those shadow a resource the KEY also lists.
+    pub shadowing: usize,
+    /// (resource type, count), most common first.
+    pub by_type: Vec<(u16, usize)>,
+}
+
+impl fmt::Display for OverrideStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.present {
+            return writeln!(f, "override: not present");
+        }
+
+        if self.resources == 0 {
+            return writeln!(f, "override: empty");
+        }
+
+        let fresh = self.resources - self.shadowing;
+        writeln!(
+            f,
+            "override: {} resources ({} new, {} shadowing archived)",
+            self.resources, fresh, self.shadowing
+        )?;
+
+        writeln!(f, "override by type:")?;
+        for (res_type, count) in &self.by_type {
+            writeln!(
+                f,
+                "  {:<5} (0x{:04x})  {:>6}",
+                type_extension(*res_type),
+                res_type,
+                count
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// A resource resolved to a concrete place, ready to read.
+enum Located {
+    Override {
+        path: PathBuf,
+    },
+    Bif {
+        source: usize,
+        file_index: u32,
+        res_type: u16,
+        bif: String,
+    },
+}
+
+impl Located {
+    fn origin(&self) -> Origin {
+        match self {
+            Located::Override { path, .. } => Origin::Override(path.clone()),
+            Located::Bif { bif, .. } => Origin::Bif(bif.clone()),
+        }
     }
 }
 
@@ -1271,5 +1113,163 @@ impl Override {
             .get(&key)
             .and_then(|&i| self.entries.get(i))
             .map(|entry| entry.path.as_path())
+    }
+}
+
+/// Anything that can go wrong while resolving or reading a resource.
+#[derive(Debug)]
+pub enum ResourceError {
+    Io(std::io::Error),
+    Key(KeyError),
+    Bif(BifError),
+    Tlk(TlkError),
+    TwoDA(TwoDAError),
+    Eff(EffError),
+    Itm(ItmError),
+    Spl(SplError),
+    Cre(CreError),
+    Pro(ProError),
+    Sto(StoError),
+    Are(AreError),
+    Dlg(DlgError),
+    Bcs(BcsError),
+    /// No resource with this name and type exists in the KEY.
+    NotFound {
+        name: String,
+        res_type: u16,
+    },
+    /// The KEY locator points at a BIF index that the KEY doesn't list.
+    BifIndexOutOfRange(usize),
+}
+
+impl fmt::Display for ResourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceError::Io(e) => write!(f, "i/o error: {e}"),
+            ResourceError::Key(e) => write!(f, "{e}"),
+            ResourceError::Bif(e) => write!(f, "{e}"),
+            ResourceError::Tlk(e) => write!(f, "{e}"),
+            ResourceError::TwoDA(e) => write!(f, "{e}"),
+            ResourceError::Eff(e) => write!(f, "{e}"),
+            ResourceError::Itm(e) => write!(f, "{e}"),
+            ResourceError::Spl(e) => write!(f, "{e}"),
+            ResourceError::Cre(e) => write!(f, "{e}"),
+            ResourceError::Pro(e) => write!(f, "{e}"),
+            ResourceError::Sto(e) => write!(f, "{e}"),
+            ResourceError::Are(e) => write!(f, "{e}"),
+            ResourceError::Dlg(e) => write!(f, "{e}"),
+            ResourceError::Bcs(e) => write!(f, "{e}"),
+            ResourceError::NotFound { name, res_type } => {
+                write!(f, "resource not found: {name} (type 0x{res_type:04x})")
+            }
+            ResourceError::BifIndexOutOfRange(index) => {
+                write!(f, "KEY refers to BIF #{index}, which it does not list")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ResourceError::Io(e) => Some(e),
+            ResourceError::Key(e) => Some(e),
+            ResourceError::Bif(e) => Some(e),
+            ResourceError::Tlk(e) => Some(e),
+            ResourceError::TwoDA(e) => Some(e),
+            ResourceError::Eff(e) => Some(e),
+            ResourceError::Itm(e) => Some(e),
+            ResourceError::Spl(e) => Some(e),
+            ResourceError::Cre(e) => Some(e),
+            ResourceError::Pro(e) => Some(e),
+            ResourceError::Sto(e) => Some(e),
+            ResourceError::Are(e) => Some(e),
+            ResourceError::Dlg(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for ResourceError {
+    fn from(e: std::io::Error) -> Self {
+        ResourceError::Io(e)
+    }
+}
+
+impl From<KeyError> for ResourceError {
+    fn from(e: KeyError) -> Self {
+        ResourceError::Key(e)
+    }
+}
+
+impl From<BifError> for ResourceError {
+    fn from(e: BifError) -> Self {
+        ResourceError::Bif(e)
+    }
+}
+
+impl From<TlkError> for ResourceError {
+    fn from(e: TlkError) -> Self {
+        ResourceError::Tlk(e)
+    }
+}
+
+impl From<TwoDAError> for ResourceError {
+    fn from(e: TwoDAError) -> Self {
+        ResourceError::TwoDA(e)
+    }
+}
+
+impl From<EffError> for ResourceError {
+    fn from(e: EffError) -> Self {
+        ResourceError::Eff(e)
+    }
+}
+
+impl From<ItmError> for ResourceError {
+    fn from(e: ItmError) -> Self {
+        ResourceError::Itm(e)
+    }
+}
+
+impl From<SplError> for ResourceError {
+    fn from(e: SplError) -> Self {
+        ResourceError::Spl(e)
+    }
+}
+
+impl From<CreError> for ResourceError {
+    fn from(e: CreError) -> Self {
+        ResourceError::Cre(e)
+    }
+}
+
+impl From<ProError> for ResourceError {
+    fn from(e: ProError) -> Self {
+        ResourceError::Pro(e)
+    }
+}
+
+impl From<StoError> for ResourceError {
+    fn from(e: StoError) -> Self {
+        ResourceError::Sto(e)
+    }
+}
+
+impl From<AreError> for ResourceError {
+    fn from(e: AreError) -> Self {
+        ResourceError::Are(e)
+    }
+}
+
+impl From<DlgError> for ResourceError {
+    fn from(e: DlgError) -> Self {
+        ResourceError::Dlg(e)
+    }
+}
+
+impl From<BcsError> for ResourceError {
+    fn from(e: BcsError) -> Self {
+        ResourceError::Bcs(e)
     }
 }

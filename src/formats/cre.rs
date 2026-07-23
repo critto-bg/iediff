@@ -36,353 +36,83 @@ const ITEM_SIZE: usize = 20;
 /// Inventory slots: 38 slot words, then the selected-weapon and ability words.
 const SLOT_COUNT: usize = 38;
 
-/// Anything that can go wrong while parsing a CRE file.
-#[derive(Debug)]
-pub enum CreError {
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
-}
+/// STATE.IDS status-flag names (header 0x20), bit-indexed.
+static STATUS_FLAGS: [&str; 32] = [
+    "sleeping",
+    "berserk",
+    "panic",
+    "stunned",
+    "invisible",
+    "helpless",
+    "frozen death",
+    "stone death",
+    "exploding death",
+    "flame death",
+    "acid death",
+    "dead",
+    "silenced",
+    "charmed",
+    "poisoned",
+    "hasted",
+    "slowed",
+    "infravision",
+    "blind",
+    "diseased",
+    "feebleminded",
+    "nondetection",
+    "improved invisibility",
+    "bless",
+    "chant",
+    "draw upon holy might",
+    "luck",
+    "aid",
+    "bad chant",
+    "blur",
+    "mirror image",
+    "confused",
+];
 
-impl fmt::Display for CreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CreError::Truncated(e) => write!(f, "{e}"),
-            CreError::BadSignature(found) => {
-                write!(f, "not a CRE file: signature was {}", describe_tag(found))
-            }
-            CreError::BadVersion(found) => {
-                write!(f, "unsupported CRE version: {}", describe_tag(found))
-            }
-        }
-    }
-}
-
-impl std::error::Error for CreError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            CreError::Truncated(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<Truncated> for CreError {
-    fn from(e: Truncated) -> Self {
-        CreError::Truncated(e)
-    }
-}
-
-/// The fixed 0x2d4-byte CRE header. All documented BG2:EE fields are retained;
-/// the structural section offset/count words are read but not stored.
-struct CreHeader {
-    version: String,
-    long_name: u32,
-    short_name: u32,
-    flags: u32,
-    xp_value: u32,
-    power_level: u32,
-    gold: u32,
-    status_flags: u32,
-    current_hp: u16,
-    max_hp: u16,
-    animation: u32,
-    metal_color: u8,
-    minor_color: u8,
-    major_color: u8,
-    skin_color: u8,
-    leather_color: u8,
-    armor_color: u8,
-    hair_color: u8,
-    eff_version: u8,
-    small_portrait: String,
-    large_portrait: String,
-    reputation: u8,
-    hide_in_shadows: u8,
-    ac_natural: i16,
-    ac_effective: i16,
-    ac_crushing: i16,
-    ac_missile: i16,
-    ac_piercing: i16,
-    ac_slashing: i16,
-    thac0: i8,
-    num_attacks: u8,
-    save_death: u8,
-    save_wands: u8,
-    save_polymorph: u8,
-    save_breath: u8,
-    save_spells: u8,
-    resist_fire: u8,
-    resist_cold: u8,
-    resist_electricity: u8,
-    resist_acid: u8,
-    resist_magic: u8,
-    resist_magic_fire: u8,
-    resist_magic_cold: u8,
-    resist_slashing: u8,
-    resist_crushing: u8,
-    resist_piercing: u8,
-    resist_missile: u8,
-    detect_illusion: u8,
-    set_traps: u8,
-    lore: u8,
-    lockpicking: u8,
-    move_silently: u8,
-    find_traps: u8,
-    pick_pockets: u8,
-    fatigue: u8,
-    intoxication: u8,
-    luck: u8,
-    proficiencies: [u8; 20],
-    turn_undead_level: u8,
-    tracking_skill: u8,
-    tracking_target: String,
-    soundset: [u32; 100],
-    level_first: u8,
-    level_second: u8,
-    level_third: u8,
-    sex: u8,
-    strength: u8,
-    strength_bonus: u8,
-    intelligence: u8,
-    wisdom: u8,
-    dexterity: u8,
-    constitution: u8,
-    charisma: u8,
-    morale: u8,
-    morale_break: u8,
-    racial_enemy: u8,
-    morale_recovery: u16,
-    kit: u32,
-    script_override: String,
-    script_class: String,
-    script_race: String,
-    script_general: String,
-    script_default: String,
-    ea: u8,
-    general: u8,
-    race: u8,
-    class: u8,
-    specific: u8,
-    gender: u8,
-    object_refs: [u8; 5],
-    alignment: u8,
-    global_enum: u16,
-    local_enum: u16,
-    death_variable: String,
-    dialog: String,
-}
-
-impl CreHeader {
-    fn parse(reader: &Reader) -> Result<CreHeader, Truncated> {
-        let mut proficiencies = [0u8; 20];
-        for (i, slot) in proficiencies.iter_mut().enumerate() {
-            *slot = reader.u8_at(0x6e + i, "proficiency")?;
-        }
-
-        let mut soundset = [0u32; 100];
-        for (i, slot) in soundset.iter_mut().enumerate() {
-            *slot = reader.u32_at(0xa4 + i * 4, "soundset strref")?;
-        }
-
-        let mut object_refs = [0u8; 5];
-        for (i, slot) in object_refs.iter_mut().enumerate() {
-            *slot = reader.u8_at(0x276 + i, "object ref")?;
-        }
-
-        Ok(CreHeader {
-            version: parse_asciiz(&reader.tag_at(0x04, "version")?),
-            long_name: reader.u32_at(0x08, "long name")?,
-            short_name: reader.u32_at(0x0c, "short name")?,
-            flags: reader.u32_at(0x10, "creature flags")?,
-            xp_value: reader.u32_at(0x14, "xp value")?,
-            power_level: reader.u32_at(0x18, "power level")?,
-            gold: reader.u32_at(0x1c, "gold")?,
-            status_flags: reader.u32_at(0x20, "status flags")?,
-            current_hp: reader.u16_at(0x24, "current hp")?,
-            max_hp: reader.u16_at(0x26, "max hp")?,
-            animation: reader.u32_at(0x28, "animation id")?,
-            metal_color: reader.u8_at(0x2c, "metal colour")?,
-            minor_color: reader.u8_at(0x2d, "minor colour")?,
-            major_color: reader.u8_at(0x2e, "major colour")?,
-            skin_color: reader.u8_at(0x2f, "skin colour")?,
-            leather_color: reader.u8_at(0x30, "leather colour")?,
-            armor_color: reader.u8_at(0x31, "armour colour")?,
-            hair_color: reader.u8_at(0x32, "hair colour")?,
-            eff_version: reader.u8_at(0x33, "eff version")?,
-            small_portrait: reader.resref_at(0x34, "small portrait")?,
-            large_portrait: reader.resref_at(0x3c, "large portrait")?,
-            reputation: reader.u8_at(0x44, "reputation")?,
-            hide_in_shadows: reader.u8_at(0x45, "hide in shadows")?,
-            ac_natural: reader.u16_at(0x46, "ac natural")? as i16,
-            ac_effective: reader.u16_at(0x48, "ac effective")? as i16,
-            ac_crushing: reader.u16_at(0x4a, "ac crushing")? as i16,
-            ac_missile: reader.u16_at(0x4c, "ac missile")? as i16,
-            ac_piercing: reader.u16_at(0x4e, "ac piercing")? as i16,
-            ac_slashing: reader.u16_at(0x50, "ac slashing")? as i16,
-            thac0: reader.u8_at(0x52, "thac0")? as i8,
-            num_attacks: reader.u8_at(0x53, "number of attacks")?,
-            save_death: reader.u8_at(0x54, "save vs death")?,
-            save_wands: reader.u8_at(0x55, "save vs wands")?,
-            save_polymorph: reader.u8_at(0x56, "save vs polymorph")?,
-            save_breath: reader.u8_at(0x57, "save vs breath")?,
-            save_spells: reader.u8_at(0x58, "save vs spells")?,
-            resist_fire: reader.u8_at(0x59, "resist fire")?,
-            resist_cold: reader.u8_at(0x5a, "resist cold")?,
-            resist_electricity: reader.u8_at(0x5b, "resist electricity")?,
-            resist_acid: reader.u8_at(0x5c, "resist acid")?,
-            resist_magic: reader.u8_at(0x5d, "resist magic")?,
-            resist_magic_fire: reader.u8_at(0x5e, "resist magic fire")?,
-            resist_magic_cold: reader.u8_at(0x5f, "resist magic cold")?,
-            resist_slashing: reader.u8_at(0x60, "resist slashing")?,
-            resist_crushing: reader.u8_at(0x61, "resist crushing")?,
-            resist_piercing: reader.u8_at(0x62, "resist piercing")?,
-            resist_missile: reader.u8_at(0x63, "resist missile")?,
-            detect_illusion: reader.u8_at(0x64, "detect illusion")?,
-            set_traps: reader.u8_at(0x65, "set traps")?,
-            lore: reader.u8_at(0x66, "lore")?,
-            lockpicking: reader.u8_at(0x67, "lockpicking")?,
-            move_silently: reader.u8_at(0x68, "move silently")?,
-            find_traps: reader.u8_at(0x69, "find traps")?,
-            pick_pockets: reader.u8_at(0x6a, "pick pockets")?,
-            fatigue: reader.u8_at(0x6b, "fatigue")?,
-            intoxication: reader.u8_at(0x6c, "intoxication")?,
-            luck: reader.u8_at(0x6d, "luck")?,
-            proficiencies,
-            turn_undead_level: reader.u8_at(0x82, "turn undead level")?,
-            tracking_skill: reader.u8_at(0x83, "tracking skill")?,
-            tracking_target: parse_asciiz(reader.slice(0x84, 32, "tracking target")?),
-            soundset,
-            level_first: reader.u8_at(0x234, "level first class")?,
-            level_second: reader.u8_at(0x235, "level second class")?,
-            level_third: reader.u8_at(0x236, "level third class")?,
-            sex: reader.u8_at(0x237, "sex")?,
-            strength: reader.u8_at(0x238, "strength")?,
-            strength_bonus: reader.u8_at(0x239, "strength bonus")?,
-            intelligence: reader.u8_at(0x23a, "intelligence")?,
-            wisdom: reader.u8_at(0x23b, "wisdom")?,
-            dexterity: reader.u8_at(0x23c, "dexterity")?,
-            constitution: reader.u8_at(0x23d, "constitution")?,
-            charisma: reader.u8_at(0x23e, "charisma")?,
-            morale: reader.u8_at(0x23f, "morale")?,
-            morale_break: reader.u8_at(0x240, "morale break")?,
-            racial_enemy: reader.u8_at(0x241, "racial enemy")?,
-            morale_recovery: reader.u16_at(0x242, "morale recovery")?,
-            kit: reader.u32_at(0x244, "kit")?,
-            script_override: reader.resref_at(0x248, "override script")?,
-            script_class: reader.resref_at(0x250, "class script")?,
-            script_race: reader.resref_at(0x258, "race script")?,
-            script_general: reader.resref_at(0x260, "general script")?,
-            script_default: reader.resref_at(0x268, "default script")?,
-            ea: reader.u8_at(0x270, "enemy-ally")?,
-            general: reader.u8_at(0x271, "general")?,
-            race: reader.u8_at(0x272, "race")?,
-            class: reader.u8_at(0x273, "class")?,
-            specific: reader.u8_at(0x274, "specific")?,
-            gender: reader.u8_at(0x275, "gender")?,
-            object_refs,
-            alignment: reader.u8_at(0x27b, "alignment")?,
-            global_enum: reader.u16_at(0x27c, "global enumeration")?,
-            local_enum: reader.u16_at(0x27e, "local enumeration")?,
-            death_variable: parse_asciiz(reader.slice(0x280, 32, "death variable")?),
-            dialog: reader.resref_at(0x2cc, "dialog")?,
-        })
-    }
-}
-
-/// A spell the creature knows (12-byte record).
-pub struct KnownSpell {
-    resource: String,
-    level: u16,
-    spell_type: u16,
-    name: Option<String>,
-}
-
-/// A row of the spell-memorization table (16-byte record).
-struct MemInfo {
-    level: u16,
-    memorizable: u16,
-    memorizable_after: u16,
-    spell_type: u16,
-    index: u32,
-    count: u32,
-}
-
-/// A memorized spell (12-byte record).
-pub struct MemorizedSpell {
-    resource: String,
-    memorized: u32,
-    name: Option<String>,
-}
-
-/// An item the creature carries (20-byte record).
-pub struct CreItem {
-    resource: String,
-    expiration: u16,
-    quantity1: u16,
-    quantity2: u16,
-    quantity3: u16,
-    flags: u32,
-    name: Option<String>,
-}
-
-/// An embedded effect: V1 feature block or V2 body, per the header's
-/// `eff_version`.
-enum CreEffect {
-    V1(Feature),
-    /// Boxed: a V2 body is far larger than a V1 feature, and effects are stored
-    /// in a `Vec`, so this keeps the common V1 element small.
-    V2(Box<Eff>),
-}
-
-impl KnownSpell {
-    /// The SPL resref, for the manager to resolve a display name.
-    pub fn resource(&self) -> &str {
-        &self.resource
-    }
-
-    /// Attach the resolved SPL display name.
-    pub fn set_name(&mut self, name: Option<String>) {
-        self.name = name;
-    }
-}
-
-impl MemorizedSpell {
-    pub fn resource(&self) -> &str {
-        &self.resource
-    }
-
-    pub fn set_name(&mut self, name: Option<String>) {
-        self.name = name;
-    }
-}
-
-impl CreItem {
-    pub fn resource(&self) -> &str {
-        &self.resource
-    }
-
-    pub fn set_name(&mut self, name: Option<String>) {
-        self.name = name;
-    }
-}
-
-/// Symbolic names for the creature's IDS-mapped identity fields, resolved by the
-/// manager.
-#[derive(Default)]
-pub struct CreNames {
-    pub long_name: Option<String>,
-    pub short_name: Option<String>,
-    pub ea: Option<String>,
-    pub general: Option<String>,
-    pub race: Option<String>,
-    pub class: Option<String>,
-    pub specific: Option<String>,
-    pub gender: Option<String>,
-    pub alignment: Option<String>,
-    pub animation: Option<String>,
-    pub kit: Option<String>,
-}
+/// Inventory slot names for the 38 indexable BG2 slots (header item-slots array).
+static SLOT_NAMES: [&str; SLOT_COUNT] = [
+    "helmet",
+    "armor",
+    "shield",
+    "gloves",
+    "left ring",
+    "right ring",
+    "amulet",
+    "belt",
+    "boots",
+    "weapon 1",
+    "weapon 2",
+    "weapon 3",
+    "weapon 4",
+    "quiver 1",
+    "quiver 2",
+    "quiver 3",
+    "quiver 4",
+    "cloak",
+    "quick item 1",
+    "quick item 2",
+    "quick item 3",
+    "inventory 1",
+    "inventory 2",
+    "inventory 3",
+    "inventory 4",
+    "inventory 5",
+    "inventory 6",
+    "inventory 7",
+    "inventory 8",
+    "inventory 9",
+    "inventory 10",
+    "inventory 11",
+    "inventory 12",
+    "inventory 13",
+    "inventory 14",
+    "inventory 15",
+    "inventory 16",
+    "magic weapon",
+];
 
 /// A parsed CRE file: the header, the spell/effect/item sections, and the
 /// inventory slots.
@@ -774,20 +504,30 @@ impl Cre {
         }
         Ok(())
     }
-}
 
-/// The IDS-mapped identity codes a CRE carries, handed to the manager to
-/// resolve against the IDS tables.
-pub struct CreIdsCodes {
-    pub ea: u8,
-    pub general: u8,
-    pub race: u8,
-    pub class: u8,
-    pub specific: u8,
-    pub gender: u8,
-    pub alignment: u8,
-    pub animation: u32,
-    pub kit: u32,
+    /// Equipped items by slot name: the non-empty inventory slots that map to a
+    /// named equipment position, resolved to the item in that slot.
+    fn equipped(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        for (i, &slot) in self.slots.iter().enumerate() {
+            if slot == 0xffff {
+                continue;
+            }
+            let Some(name) = SLOT_NAMES.get(i) else {
+                continue;
+            };
+            let Some(item) = self.items.get(slot as usize) else {
+                continue;
+            };
+            let label = item
+                .name
+                .as_deref()
+                .map(|x| format!("{}  {x}", item.resource))
+                .unwrap_or_else(|| item.resource.clone());
+            out.push((*name, label));
+        }
+        out
+    }
 }
 
 impl fmt::Display for Cre {
@@ -978,29 +718,365 @@ impl fmt::Display for Cre {
     }
 }
 
-impl Cre {
-    /// Equipped items by slot name: the non-empty inventory slots that map to a
-    /// named equipment position, resolved to the item in that slot.
-    fn equipped(&self) -> Vec<(&'static str, String)> {
-        let mut out = Vec::new();
-        for (i, &slot) in self.slots.iter().enumerate() {
-            if slot == 0xffff {
-                continue;
-            }
-            let Some(name) = SLOT_NAMES.get(i) else {
-                continue;
-            };
-            let Some(item) = self.items.get(slot as usize) else {
-                continue;
-            };
-            let label = item
-                .name
-                .as_deref()
-                .map(|x| format!("{}  {x}", item.resource))
-                .unwrap_or_else(|| item.resource.clone());
-            out.push((*name, label));
+/// The fixed 0x2d4-byte CRE header. All documented BG2:EE fields are retained;
+/// the structural section offset/count words are read but not stored.
+struct CreHeader {
+    version: String,
+    long_name: u32,
+    short_name: u32,
+    flags: u32,
+    xp_value: u32,
+    power_level: u32,
+    gold: u32,
+    status_flags: u32,
+    current_hp: u16,
+    max_hp: u16,
+    animation: u32,
+    metal_color: u8,
+    minor_color: u8,
+    major_color: u8,
+    skin_color: u8,
+    leather_color: u8,
+    armor_color: u8,
+    hair_color: u8,
+    eff_version: u8,
+    small_portrait: String,
+    large_portrait: String,
+    reputation: u8,
+    hide_in_shadows: u8,
+    ac_natural: i16,
+    ac_effective: i16,
+    ac_crushing: i16,
+    ac_missile: i16,
+    ac_piercing: i16,
+    ac_slashing: i16,
+    thac0: i8,
+    num_attacks: u8,
+    save_death: u8,
+    save_wands: u8,
+    save_polymorph: u8,
+    save_breath: u8,
+    save_spells: u8,
+    resist_fire: u8,
+    resist_cold: u8,
+    resist_electricity: u8,
+    resist_acid: u8,
+    resist_magic: u8,
+    resist_magic_fire: u8,
+    resist_magic_cold: u8,
+    resist_slashing: u8,
+    resist_crushing: u8,
+    resist_piercing: u8,
+    resist_missile: u8,
+    detect_illusion: u8,
+    set_traps: u8,
+    lore: u8,
+    lockpicking: u8,
+    move_silently: u8,
+    find_traps: u8,
+    pick_pockets: u8,
+    fatigue: u8,
+    intoxication: u8,
+    luck: u8,
+    proficiencies: [u8; 20],
+    turn_undead_level: u8,
+    tracking_skill: u8,
+    tracking_target: String,
+    soundset: [u32; 100],
+    level_first: u8,
+    level_second: u8,
+    level_third: u8,
+    sex: u8,
+    strength: u8,
+    strength_bonus: u8,
+    intelligence: u8,
+    wisdom: u8,
+    dexterity: u8,
+    constitution: u8,
+    charisma: u8,
+    morale: u8,
+    morale_break: u8,
+    racial_enemy: u8,
+    morale_recovery: u16,
+    kit: u32,
+    script_override: String,
+    script_class: String,
+    script_race: String,
+    script_general: String,
+    script_default: String,
+    ea: u8,
+    general: u8,
+    race: u8,
+    class: u8,
+    specific: u8,
+    gender: u8,
+    object_refs: [u8; 5],
+    alignment: u8,
+    global_enum: u16,
+    local_enum: u16,
+    death_variable: String,
+    dialog: String,
+}
+
+impl CreHeader {
+    fn parse(reader: &Reader) -> Result<CreHeader, Truncated> {
+        let mut proficiencies = [0u8; 20];
+        for (i, slot) in proficiencies.iter_mut().enumerate() {
+            *slot = reader.u8_at(0x6e + i, "proficiency")?;
         }
-        out
+
+        let mut soundset = [0u32; 100];
+        for (i, slot) in soundset.iter_mut().enumerate() {
+            *slot = reader.u32_at(0xa4 + i * 4, "soundset strref")?;
+        }
+
+        let mut object_refs = [0u8; 5];
+        for (i, slot) in object_refs.iter_mut().enumerate() {
+            *slot = reader.u8_at(0x276 + i, "object ref")?;
+        }
+
+        Ok(CreHeader {
+            version: parse_asciiz(&reader.tag_at(0x04, "version")?),
+            long_name: reader.u32_at(0x08, "long name")?,
+            short_name: reader.u32_at(0x0c, "short name")?,
+            flags: reader.u32_at(0x10, "creature flags")?,
+            xp_value: reader.u32_at(0x14, "xp value")?,
+            power_level: reader.u32_at(0x18, "power level")?,
+            gold: reader.u32_at(0x1c, "gold")?,
+            status_flags: reader.u32_at(0x20, "status flags")?,
+            current_hp: reader.u16_at(0x24, "current hp")?,
+            max_hp: reader.u16_at(0x26, "max hp")?,
+            animation: reader.u32_at(0x28, "animation id")?,
+            metal_color: reader.u8_at(0x2c, "metal colour")?,
+            minor_color: reader.u8_at(0x2d, "minor colour")?,
+            major_color: reader.u8_at(0x2e, "major colour")?,
+            skin_color: reader.u8_at(0x2f, "skin colour")?,
+            leather_color: reader.u8_at(0x30, "leather colour")?,
+            armor_color: reader.u8_at(0x31, "armour colour")?,
+            hair_color: reader.u8_at(0x32, "hair colour")?,
+            eff_version: reader.u8_at(0x33, "eff version")?,
+            small_portrait: reader.resref_at(0x34, "small portrait")?,
+            large_portrait: reader.resref_at(0x3c, "large portrait")?,
+            reputation: reader.u8_at(0x44, "reputation")?,
+            hide_in_shadows: reader.u8_at(0x45, "hide in shadows")?,
+            ac_natural: reader.u16_at(0x46, "ac natural")? as i16,
+            ac_effective: reader.u16_at(0x48, "ac effective")? as i16,
+            ac_crushing: reader.u16_at(0x4a, "ac crushing")? as i16,
+            ac_missile: reader.u16_at(0x4c, "ac missile")? as i16,
+            ac_piercing: reader.u16_at(0x4e, "ac piercing")? as i16,
+            ac_slashing: reader.u16_at(0x50, "ac slashing")? as i16,
+            thac0: reader.u8_at(0x52, "thac0")? as i8,
+            num_attacks: reader.u8_at(0x53, "number of attacks")?,
+            save_death: reader.u8_at(0x54, "save vs death")?,
+            save_wands: reader.u8_at(0x55, "save vs wands")?,
+            save_polymorph: reader.u8_at(0x56, "save vs polymorph")?,
+            save_breath: reader.u8_at(0x57, "save vs breath")?,
+            save_spells: reader.u8_at(0x58, "save vs spells")?,
+            resist_fire: reader.u8_at(0x59, "resist fire")?,
+            resist_cold: reader.u8_at(0x5a, "resist cold")?,
+            resist_electricity: reader.u8_at(0x5b, "resist electricity")?,
+            resist_acid: reader.u8_at(0x5c, "resist acid")?,
+            resist_magic: reader.u8_at(0x5d, "resist magic")?,
+            resist_magic_fire: reader.u8_at(0x5e, "resist magic fire")?,
+            resist_magic_cold: reader.u8_at(0x5f, "resist magic cold")?,
+            resist_slashing: reader.u8_at(0x60, "resist slashing")?,
+            resist_crushing: reader.u8_at(0x61, "resist crushing")?,
+            resist_piercing: reader.u8_at(0x62, "resist piercing")?,
+            resist_missile: reader.u8_at(0x63, "resist missile")?,
+            detect_illusion: reader.u8_at(0x64, "detect illusion")?,
+            set_traps: reader.u8_at(0x65, "set traps")?,
+            lore: reader.u8_at(0x66, "lore")?,
+            lockpicking: reader.u8_at(0x67, "lockpicking")?,
+            move_silently: reader.u8_at(0x68, "move silently")?,
+            find_traps: reader.u8_at(0x69, "find traps")?,
+            pick_pockets: reader.u8_at(0x6a, "pick pockets")?,
+            fatigue: reader.u8_at(0x6b, "fatigue")?,
+            intoxication: reader.u8_at(0x6c, "intoxication")?,
+            luck: reader.u8_at(0x6d, "luck")?,
+            proficiencies,
+            turn_undead_level: reader.u8_at(0x82, "turn undead level")?,
+            tracking_skill: reader.u8_at(0x83, "tracking skill")?,
+            tracking_target: parse_asciiz(reader.slice(0x84, 32, "tracking target")?),
+            soundset,
+            level_first: reader.u8_at(0x234, "level first class")?,
+            level_second: reader.u8_at(0x235, "level second class")?,
+            level_third: reader.u8_at(0x236, "level third class")?,
+            sex: reader.u8_at(0x237, "sex")?,
+            strength: reader.u8_at(0x238, "strength")?,
+            strength_bonus: reader.u8_at(0x239, "strength bonus")?,
+            intelligence: reader.u8_at(0x23a, "intelligence")?,
+            wisdom: reader.u8_at(0x23b, "wisdom")?,
+            dexterity: reader.u8_at(0x23c, "dexterity")?,
+            constitution: reader.u8_at(0x23d, "constitution")?,
+            charisma: reader.u8_at(0x23e, "charisma")?,
+            morale: reader.u8_at(0x23f, "morale")?,
+            morale_break: reader.u8_at(0x240, "morale break")?,
+            racial_enemy: reader.u8_at(0x241, "racial enemy")?,
+            morale_recovery: reader.u16_at(0x242, "morale recovery")?,
+            kit: reader.u32_at(0x244, "kit")?,
+            script_override: reader.resref_at(0x248, "override script")?,
+            script_class: reader.resref_at(0x250, "class script")?,
+            script_race: reader.resref_at(0x258, "race script")?,
+            script_general: reader.resref_at(0x260, "general script")?,
+            script_default: reader.resref_at(0x268, "default script")?,
+            ea: reader.u8_at(0x270, "enemy-ally")?,
+            general: reader.u8_at(0x271, "general")?,
+            race: reader.u8_at(0x272, "race")?,
+            class: reader.u8_at(0x273, "class")?,
+            specific: reader.u8_at(0x274, "specific")?,
+            gender: reader.u8_at(0x275, "gender")?,
+            object_refs,
+            alignment: reader.u8_at(0x27b, "alignment")?,
+            global_enum: reader.u16_at(0x27c, "global enumeration")?,
+            local_enum: reader.u16_at(0x27e, "local enumeration")?,
+            death_variable: parse_asciiz(reader.slice(0x280, 32, "death variable")?),
+            dialog: reader.resref_at(0x2cc, "dialog")?,
+        })
+    }
+}
+
+/// A spell the creature knows (12-byte record).
+pub struct KnownSpell {
+    resource: String,
+    level: u16,
+    spell_type: u16,
+    name: Option<String>,
+}
+
+impl KnownSpell {
+    /// The SPL resref, for the manager to resolve a display name.
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    /// Attach the resolved SPL display name.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+}
+
+/// A row of the spell-memorization table (16-byte record).
+struct MemInfo {
+    level: u16,
+    memorizable: u16,
+    memorizable_after: u16,
+    spell_type: u16,
+    index: u32,
+    count: u32,
+}
+
+/// A memorized spell (12-byte record).
+pub struct MemorizedSpell {
+    resource: String,
+    memorized: u32,
+    name: Option<String>,
+}
+
+impl MemorizedSpell {
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+}
+
+/// An item the creature carries (20-byte record).
+pub struct CreItem {
+    resource: String,
+    expiration: u16,
+    quantity1: u16,
+    quantity2: u16,
+    quantity3: u16,
+    flags: u32,
+    name: Option<String>,
+}
+
+impl CreItem {
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+}
+
+/// An embedded effect: V1 feature block or V2 body, per the header's
+/// `eff_version`.
+enum CreEffect {
+    V1(Feature),
+    /// Boxed: a V2 body is far larger than a V1 feature, and effects are stored
+    /// in a `Vec`, so this keeps the common V1 element small.
+    V2(Box<Eff>),
+}
+
+/// Symbolic names for the creature's IDS-mapped identity fields, resolved by the
+/// manager.
+#[derive(Default)]
+pub struct CreNames {
+    pub long_name: Option<String>,
+    pub short_name: Option<String>,
+    pub ea: Option<String>,
+    pub general: Option<String>,
+    pub race: Option<String>,
+    pub class: Option<String>,
+    pub specific: Option<String>,
+    pub gender: Option<String>,
+    pub alignment: Option<String>,
+    pub animation: Option<String>,
+    pub kit: Option<String>,
+}
+
+/// The IDS-mapped identity codes a CRE carries, handed to the manager to
+/// resolve against the IDS tables.
+pub struct CreIdsCodes {
+    pub ea: u8,
+    pub general: u8,
+    pub race: u8,
+    pub class: u8,
+    pub specific: u8,
+    pub gender: u8,
+    pub alignment: u8,
+    pub animation: u32,
+    pub kit: u32,
+}
+
+/// Anything that can go wrong while parsing a CRE file.
+#[derive(Debug)]
+pub enum CreError {
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
+}
+
+impl fmt::Display for CreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CreError::Truncated(e) => write!(f, "{e}"),
+            CreError::BadSignature(found) => {
+                write!(f, "not a CRE file: signature was {}", describe_tag(found))
+            }
+            CreError::BadVersion(found) => {
+                write!(f, "unsupported CRE version: {}", describe_tag(found))
+            }
+        }
+    }
+}
+
+impl std::error::Error for CreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CreError::Truncated(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Truncated> for CreError {
+    fn from(e: Truncated) -> Self {
+        CreError::Truncated(e)
     }
 }
 
@@ -1134,84 +1210,6 @@ fn creature_flags(value: u32) -> Vec<&'static str> {
         ],
     )
 }
-
-/// STATE.IDS status-flag names (header 0x20), bit-indexed.
-static STATUS_FLAGS: [&str; 32] = [
-    "sleeping",
-    "berserk",
-    "panic",
-    "stunned",
-    "invisible",
-    "helpless",
-    "frozen death",
-    "stone death",
-    "exploding death",
-    "flame death",
-    "acid death",
-    "dead",
-    "silenced",
-    "charmed",
-    "poisoned",
-    "hasted",
-    "slowed",
-    "infravision",
-    "blind",
-    "diseased",
-    "feebleminded",
-    "nondetection",
-    "improved invisibility",
-    "bless",
-    "chant",
-    "draw upon holy might",
-    "luck",
-    "aid",
-    "bad chant",
-    "blur",
-    "mirror image",
-    "confused",
-];
-
-/// Inventory slot names for the 38 indexable BG2 slots (header item-slots array).
-static SLOT_NAMES: [&str; SLOT_COUNT] = [
-    "helmet",
-    "armor",
-    "shield",
-    "gloves",
-    "left ring",
-    "right ring",
-    "amulet",
-    "belt",
-    "boots",
-    "weapon 1",
-    "weapon 2",
-    "weapon 3",
-    "weapon 4",
-    "quiver 1",
-    "quiver 2",
-    "quiver 3",
-    "quiver 4",
-    "cloak",
-    "quick item 1",
-    "quick item 2",
-    "quick item 3",
-    "inventory 1",
-    "inventory 2",
-    "inventory 3",
-    "inventory 4",
-    "inventory 5",
-    "inventory 6",
-    "inventory 7",
-    "inventory 8",
-    "inventory 9",
-    "inventory 10",
-    "inventory 11",
-    "inventory 12",
-    "inventory 13",
-    "inventory 14",
-    "inventory 15",
-    "inventory 16",
-    "magic weapon",
-];
 
 #[cfg(test)]
 mod tests {

@@ -17,95 +17,11 @@ use crate::script::{
     Class, IDENTIFIER_TABLE, OBJECT_TABLES, Signature, Vocabulary, is_scope_param,
 };
 
-/// Anything that can go wrong while compiling BAF.
-#[derive(Debug, PartialEq, Eq)]
-pub enum BafError {
-    /// A keyword, punctuation or token was required and something else was found.
-    Expected { want: &'static str, at: usize },
-    /// A call name absent from `ACTION.IDS` / `TRIGGER.IDS`.
-    UnknownCall { name: String, at: usize },
-    /// A symbol absent from the IDS table its parameter names.
-    UnknownSymbol {
-        table: String,
-        symbol: String,
-        at: usize,
-    },
-    /// Text ran out mid-construct.
-    UnexpectedEnd,
-}
-
-impl std::fmt::Display for BafError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BafError::Expected { want, at } => {
-                write!(f, "malformed BAF: expected {want} at byte {at}")
-            }
-            BafError::UnknownCall { name, at } => {
-                write!(f, "malformed BAF: unknown call {name:?} at byte {at}")
-            }
-            BafError::UnknownSymbol { table, symbol, at } => {
-                write!(
-                    f,
-                    "malformed BAF: {symbol:?} is not in {table}.IDS at byte {at}"
-                )
-            }
-            BafError::UnexpectedEnd => write!(f, "malformed BAF: unexpected end of input"),
-        }
-    }
-}
-
-impl std::error::Error for BafError {}
-
-/// Compile a whole BAF script into the record form.
-pub fn compile(text: &[u8], vocabulary: &Vocabulary) -> Result<Script, BafError> {
-    let mut p = Parser::new(text, vocabulary);
-    let mut blocks = Vec::new();
-    p.skip_trivia();
-    while !p.at_end() {
-        blocks.push(p.block()?);
-        p.skip_trivia();
-    }
-    Ok(Script::from_blocks(blocks))
-}
-
-/// Compile a run of triggers (a DLG condition), for typing a dialogue's script
-/// blocks exactly rather than by text.
-pub fn triggers(text: &[u8], vocabulary: &Vocabulary) -> Result<Vec<Trigger>, BafError> {
-    let mut p = Parser::new(text, vocabulary);
-    let mut out = Vec::new();
-    p.skip_trivia();
-    while !p.at_end() {
-        p.condition_line(&mut out)?;
-        p.skip_trivia();
-    }
-    Ok(out)
-}
-
-/// Compile a run of actions (a DLG response).
-pub fn actions(text: &[u8], vocabulary: &Vocabulary) -> Result<Vec<Action>, BafError> {
-    let mut p = Parser::new(text, vocabulary);
-    let mut out = Vec::new();
-    p.skip_trivia();
-    while !p.at_end() {
-        out.push(p.action()?);
-        p.skip_trivia();
-    }
-    Ok(out)
-}
-
 /// A cursor over the BAF text.
 struct Parser<'a> {
     data: &'a [u8],
     pos: usize,
     vocabulary: &'a Vocabulary,
-}
-
-/// One argument, read before it is placed in the record's slots.
-enum Value {
-    Int(i32),
-    Str(String),
-    Object(Object),
-    Point(i32, i32),
 }
 
 impl<'a> Parser<'a> {
@@ -543,6 +459,102 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// One argument, read before it is placed in the record's slots.
+enum Value {
+    Int(i32),
+    Str(String),
+    Object(Object),
+    Point(i32, i32),
+}
+
+/// The record slots being filled as arguments are placed.
+#[derive(Default)]
+struct Slots {
+    next_int: usize,
+    next_string: usize,
+    next_object: usize,
+}
+
+/// A tuple of (parameter class, argument value, is-scope), the shape [`args`]
+/// yields for the record builders.
+type Filled = Vec<((Class, Value), bool)>;
+
+/// Anything that can go wrong while compiling BAF.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BafError {
+    /// A keyword, punctuation or token was required and something else was found.
+    Expected { want: &'static str, at: usize },
+    /// A call name absent from `ACTION.IDS` / `TRIGGER.IDS`.
+    UnknownCall { name: String, at: usize },
+    /// A symbol absent from the IDS table its parameter names.
+    UnknownSymbol {
+        table: String,
+        symbol: String,
+        at: usize,
+    },
+    /// Text ran out mid-construct.
+    UnexpectedEnd,
+}
+
+impl std::fmt::Display for BafError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BafError::Expected { want, at } => {
+                write!(f, "malformed BAF: expected {want} at byte {at}")
+            }
+            BafError::UnknownCall { name, at } => {
+                write!(f, "malformed BAF: unknown call {name:?} at byte {at}")
+            }
+            BafError::UnknownSymbol { table, symbol, at } => {
+                write!(
+                    f,
+                    "malformed BAF: {symbol:?} is not in {table}.IDS at byte {at}"
+                )
+            }
+            BafError::UnexpectedEnd => write!(f, "malformed BAF: unexpected end of input"),
+        }
+    }
+}
+
+impl std::error::Error for BafError {}
+
+/// Compile a whole BAF script into the record form.
+pub fn compile(text: &[u8], vocabulary: &Vocabulary) -> Result<Script, BafError> {
+    let mut p = Parser::new(text, vocabulary);
+    let mut blocks = Vec::new();
+    p.skip_trivia();
+    while !p.at_end() {
+        blocks.push(p.block()?);
+        p.skip_trivia();
+    }
+    Ok(Script::from_blocks(blocks))
+}
+
+/// Compile a run of triggers (a DLG condition), for typing a dialogue's script
+/// blocks exactly rather than by text.
+pub fn triggers(text: &[u8], vocabulary: &Vocabulary) -> Result<Vec<Trigger>, BafError> {
+    let mut p = Parser::new(text, vocabulary);
+    let mut out = Vec::new();
+    p.skip_trivia();
+    while !p.at_end() {
+        p.condition_line(&mut out)?;
+        p.skip_trivia();
+    }
+    Ok(out)
+}
+
+/// Compile a run of actions (a DLG response).
+pub fn actions(text: &[u8], vocabulary: &Vocabulary) -> Result<Vec<Action>, BafError> {
+    let mut p = Parser::new(text, vocabulary);
+    let mut out = Vec::new();
+    p.skip_trivia();
+    while !p.at_end() {
+        out.push(p.action()?);
+        p.skip_trivia();
+    }
+    Ok(out)
+}
+
 /// Whether each parameter, in order, is a scope that shares its predecessor's
 /// string slot rather than opening its own.
 fn scope_flags(signature: &Signature) -> Vec<bool> {
@@ -558,18 +570,6 @@ fn scope_flags(signature: &Signature) -> Vec<bool> {
             scoped
         })
         .collect()
-}
-
-/// A tuple of (parameter class, argument value, is-scope), the shape [`args`]
-/// yields for the record builders.
-type Filled = Vec<((Class, Value), bool)>;
-
-/// The record slots being filled as arguments are placed.
-#[derive(Default)]
-struct Slots {
-    next_int: usize,
-    next_string: usize,
-    next_object: usize,
 }
 
 fn build_trigger(signature: &Signature, filled: Filled) -> Trigger {

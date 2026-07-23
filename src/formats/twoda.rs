@@ -17,7 +17,6 @@
 //! [`decrypt_text`](crate::decrypt_text) handles transparently.
 //! Spec: `md/file_formats/ie_formats/2da.md`.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -35,48 +34,14 @@ const INDEX_PREFIX: &str = "col:";
 /// Resource type code for 2DA files.
 pub const TWODA_TYPE: u16 = 0x03f4;
 
-/// Anything that can go wrong while parsing a 2DA file.
-#[derive(Debug)]
-pub enum TwoDAError {
-    /// The first line's first token was not `2DA`.
-    BadSignature(String),
-    /// The table ended before the default-value and column-header rows.
-    MissingHeader,
-}
-
-impl fmt::Display for TwoDAError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TwoDAError::BadSignature(found) => {
-                write!(f, "not a 2DA file: first token was {found:?}")
-            }
-            TwoDAError::MissingHeader => {
-                write!(f, "malformed 2DA: missing default-value or header row")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TwoDAError {}
-
-/// One data row: a label plus its cell values. `cells` may be shorter than the
-/// table's column count; absent trailing cells take the table default.
-struct Row {
-    label: String,
-    cells: Vec<String>,
-}
-
-/// A parsed 2DA table. Cells are looked up by index or by label; an absent cell
-/// resolves to [`default`](Self::default).
+/// A parsed 2DA table. Kept for its row labels — the value→name lookups other
+/// resources index it for — and for printing; an absent cell resolves to
+/// [`default`](Self::default).
 pub struct TwoDA {
     default: String,
     /// Value-column headers, in order. Excludes the (unlabelled) row-label column.
     columns: Vec<String>,
     rows: Vec<Row>,
-    /// UPPERCASE row label -> row index. First occurrence wins.
-    by_row: HashMap<String, usize>,
-    /// UPPERCASE column label -> column index. First occurrence wins.
-    by_col: HashMap<String, usize>,
 }
 
 impl TwoDA {
@@ -111,33 +76,22 @@ impl TwoDA {
             .collect();
 
         let mut rows = Vec::new();
-        let mut by_row = HashMap::new();
         for line in lines {
             let mut tokens = line.split_whitespace();
             let Some(label) = tokens.next() else {
                 continue;
             };
             let cells: Vec<String> = tokens.map(str::to_string).collect();
-            by_row
-                .entry(label.to_ascii_uppercase())
-                .or_insert(rows.len());
             rows.push(Row {
                 label: label.to_string(),
                 cells,
             });
         }
 
-        let mut by_col = HashMap::with_capacity(columns.len());
-        for (i, col) in columns.iter().enumerate() {
-            by_col.entry(col.to_ascii_uppercase()).or_insert(i);
-        }
-
         Ok(TwoDA {
             default,
             columns,
             rows,
-            by_row,
-            by_col,
         })
     }
 
@@ -148,35 +102,18 @@ impl TwoDA {
         self.rows.get(index).map(|row| row.label.as_str())
     }
 
-    /// Cell value at a row/column index. `None` if either index is out of range;
-    /// an absent cell within range yields the table default.
-    #[allow(dead_code)] // consumed by resource-field resolution (later milestone)
-    pub fn get(&self, row: usize, col: usize) -> Option<&str> {
-        if col >= self.columns.len() {
-            return None;
-        }
-        let row = self.rows.get(row)?;
-        Some(
-            row.cells
-                .get(col)
-                .map(String::as_str)
-                .unwrap_or(&self.default),
+    /// Write the machine-readable view: the bare grid, as the file itself lays
+    /// it out. Deliberately free of the [`Display`] annotations, which are a
+    /// reading aid rather than data.
+    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
+        write!(
+            out,
+            "{} rows x {} cols, default {:?}\n{}",
+            self.rows.len(),
+            self.columns.len(),
+            self.default,
+            self.render(false)
         )
-    }
-
-    /// Cell value by row and column label (both case-insensitive). `None` if
-    /// either label is unknown.
-    #[allow(dead_code)] // consumed by resource-field resolution (later milestone)
-    pub fn get_by_label(&self, row: &str, col: &str) -> Option<&str> {
-        let row = *self.by_row.get(&row.to_ascii_uppercase())?;
-        let col = *self.by_col.get(&col.to_ascii_uppercase())?;
-        self.get(row, col)
-    }
-
-    /// Table size as `(rows, columns)`.
-    #[allow(dead_code)] // consumed by resource-field resolution (later milestone)
-    pub fn dimensions(&self) -> (usize, usize) {
-        (self.rows.len(), self.columns.len())
     }
 
     /// Value of the cell at column `c` of `row`, defaulting when absent.
@@ -251,20 +188,6 @@ impl TwoDA {
 
         out
     }
-
-    /// Write the machine-readable view: the bare grid, as the file itself lays
-    /// it out. Deliberately free of the [`Display`] annotations, which are a
-    /// reading aid rather than data.
-    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
-        write!(
-            out,
-            "{} rows x {} cols, default {:?}\n{}",
-            self.rows.len(),
-            self.columns.len(),
-            self.default,
-            self.render(false)
-        )
-    }
 }
 
 impl fmt::Display for TwoDA {
@@ -285,6 +208,37 @@ impl fmt::Display for TwoDA {
         )
     }
 }
+
+/// One data row: a label plus its cell values. `cells` may be shorter than the
+/// table's column count; absent trailing cells take the table default.
+struct Row {
+    label: String,
+    cells: Vec<String>,
+}
+
+/// Anything that can go wrong while parsing a 2DA file.
+#[derive(Debug)]
+pub enum TwoDAError {
+    /// The first line's first token was not `2DA`.
+    BadSignature(String),
+    /// The table ended before the default-value and column-header rows.
+    MissingHeader,
+}
+
+impl fmt::Display for TwoDAError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TwoDAError::BadSignature(found) => {
+                write!(f, "not a 2DA file: first token was {found:?}")
+            }
+            TwoDAError::MissingHeader => {
+                write!(f, "malformed 2DA: missing default-value or header row")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TwoDAError {}
 
 /// Append a left-aligned, width-padded cell plus a two-space gutter.
 fn push_cell(line: &mut String, cell: &str, width: usize) {

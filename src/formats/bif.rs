@@ -23,6 +23,137 @@ const BIF_VERSION: &[u8; 4] = b"V1  ";
 const HEADER_LEN: usize = 0x14;
 const FILE_ENTRY_LEN: usize = 16;
 
+/// An opened BIF archive. Holds the file-entry table plus an open handle for
+/// reading resource bytes on demand. Tileset (TIS) entries are not yet parsed.
+pub struct BifArchive {
+    file: File,
+    entries: Vec<FileEntry>,
+    /// file index -> position in `entries`, for O(1) extraction.
+    index: HashMap<u32, usize>,
+}
+
+impl BifArchive {
+    /// Open a BIF and parse its header and file-entry table. Does not read any
+    /// resource data.
+    pub fn open(path: &Path) -> Result<BifArchive, BifError> {
+        let mut file = File::open(path)?;
+
+        let mut header = [0u8; HEADER_LEN];
+        file.read_exact(&mut header)?;
+        let reader = Reader::new(&header);
+
+        let signature = reader.tag_at(0x00, "signature")?;
+        if &signature != BIF_SIGNATURE {
+            return Err(BifError::BadSignature(signature));
+        }
+
+        let version = reader.tag_at(0x04, "version")?;
+        if &version != BIF_VERSION {
+            return Err(BifError::BadVersion(version));
+        }
+
+        let file_count = reader.u32_at(0x08, "file entry count")? as usize;
+        // Tileset count (0x0c) is read for completeness but not yet used.
+        let _tileset_count = reader.u32_at(0x0c, "tileset entry count")?;
+        let table_offset = reader.u32_at(0x10, "file entry offset")? as u64;
+
+        let entries = Self::read_table(&mut file, file_count, table_offset)?;
+
+        let mut index = HashMap::with_capacity(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            index.insert(entry.index, i);
+        }
+
+        Ok(BifArchive {
+            file,
+            entries,
+            index,
+        })
+    }
+
+    /// Extract a resource's raw bytes by its file index (locator bits 0-13).
+    /// `expected_type` is the resource type the KEY recorded; it's cross-checked
+    /// against the BIF's own type field.
+    pub fn read_resource(
+        &mut self,
+        file_index: u32,
+        expected_type: u16,
+    ) -> Result<Vec<u8>, BifError> {
+        let entry = self.entry_for(file_index, expected_type)?;
+
+        self.file.seek(SeekFrom::Start(entry.offset as u64))?;
+        let mut buf = vec![0u8; entry.size as usize];
+        self.file.read_exact(&mut buf)?;
+
+        Ok(buf)
+    }
+
+    /// Read and parse the file-entry table (small: `count * 16` bytes).
+    fn read_table(file: &mut File, count: usize, offset: u64) -> Result<Vec<FileEntry>, BifError> {
+        let table_len = count
+            .checked_mul(FILE_ENTRY_LEN)
+            .ok_or(BifError::Malformed("file entry table size overflow"))?;
+
+        let mut table = vec![0u8; table_len];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut table)?;
+        let reader = Reader::new(&table);
+
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = i * FILE_ENTRY_LEN;
+            let locator = reader.u32_at(base, "file entry locator")?;
+            let data_offset = reader.u32_at(base + 4, "file entry offset")?;
+            let size = reader.u32_at(base + 8, "file entry size")?;
+            // Bytes 14-15 are unused. We keep the type to cross-check against
+            // the KEY at read time.
+            let res_type = reader.u16_at(base + 12, "file entry type")?;
+            entries.push(FileEntry {
+                index: locator & 0x3fff,
+                offset: data_offset,
+                size,
+                res_type,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    /// Locate a file entry by index and cross-check its type against the type
+    /// the KEY recorded. Shared by the size and read paths.
+    fn entry_for(&self, file_index: u32, expected_type: u16) -> Result<FileEntry, BifError> {
+        let entry = match self
+            .index
+            .get(&file_index)
+            .and_then(|&i| self.entries.get(i))
+        {
+            Some(entry) => *entry,
+            None => return Err(BifError::ResourceNotFound(file_index)),
+        };
+
+        if entry.res_type != expected_type {
+            return Err(BifError::TypeMismatch {
+                file_index,
+                expected: expected_type,
+                found: entry.res_type,
+            });
+        }
+
+        Ok(entry)
+    }
+}
+
+/// One non-tileset resource slot in the archive. Small and cheap to copy.
+#[derive(Clone, Copy)]
+struct FileEntry {
+    /// File index (locator bits 0-13); matched against the KEY locator.
+    index: u32,
+    /// Offset of the resource data from the start of the BIF.
+    offset: u32,
+    size: u32,
+    res_type: u16,
+}
+
 /// Anything that can go wrong while opening or reading a BIF archive.
 #[derive(Debug)]
 pub enum BifError {
@@ -92,136 +223,5 @@ impl From<Truncated> for BifError {
 impl From<std::io::Error> for BifError {
     fn from(e: std::io::Error) -> Self {
         BifError::Io(e)
-    }
-}
-
-/// One non-tileset resource slot in the archive. Small and cheap to copy.
-#[derive(Clone, Copy)]
-struct FileEntry {
-    /// File index (locator bits 0-13); matched against the KEY locator.
-    index: u32,
-    /// Offset of the resource data from the start of the BIF.
-    offset: u32,
-    size: u32,
-    res_type: u16,
-}
-
-/// An opened BIF archive. Holds the file-entry table plus an open handle for
-/// reading resource bytes on demand. Tileset (TIS) entries are not yet parsed.
-pub struct BifArchive {
-    file: File,
-    entries: Vec<FileEntry>,
-    /// file index -> position in `entries`, for O(1) extraction.
-    index: HashMap<u32, usize>,
-}
-
-impl BifArchive {
-    /// Open a BIF and parse its header and file-entry table. Does not read any
-    /// resource data.
-    pub fn open(path: &Path) -> Result<BifArchive, BifError> {
-        let mut file = File::open(path)?;
-
-        let mut header = [0u8; HEADER_LEN];
-        file.read_exact(&mut header)?;
-        let reader = Reader::new(&header);
-
-        let signature = reader.tag_at(0x00, "signature")?;
-        if &signature != BIF_SIGNATURE {
-            return Err(BifError::BadSignature(signature));
-        }
-
-        let version = reader.tag_at(0x04, "version")?;
-        if &version != BIF_VERSION {
-            return Err(BifError::BadVersion(version));
-        }
-
-        let file_count = reader.u32_at(0x08, "file entry count")? as usize;
-        // Tileset count (0x0c) is read for completeness but not yet used.
-        let _tileset_count = reader.u32_at(0x0c, "tileset entry count")?;
-        let table_offset = reader.u32_at(0x10, "file entry offset")? as u64;
-
-        let entries = Self::read_table(&mut file, file_count, table_offset)?;
-
-        let mut index = HashMap::with_capacity(entries.len());
-        for (i, entry) in entries.iter().enumerate() {
-            index.insert(entry.index, i);
-        }
-
-        Ok(BifArchive {
-            file,
-            entries,
-            index,
-        })
-    }
-
-    /// Read and parse the file-entry table (small: `count * 16` bytes).
-    fn read_table(file: &mut File, count: usize, offset: u64) -> Result<Vec<FileEntry>, BifError> {
-        let table_len = count
-            .checked_mul(FILE_ENTRY_LEN)
-            .ok_or(BifError::Malformed("file entry table size overflow"))?;
-
-        let mut table = vec![0u8; table_len];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut table)?;
-        let reader = Reader::new(&table);
-
-        let mut entries = Vec::with_capacity(count);
-        for i in 0..count {
-            let base = i * FILE_ENTRY_LEN;
-            let locator = reader.u32_at(base, "file entry locator")?;
-            let data_offset = reader.u32_at(base + 4, "file entry offset")?;
-            let size = reader.u32_at(base + 8, "file entry size")?;
-            // Bytes 14-15 are unused. We keep the type to cross-check against
-            // the KEY at read time.
-            let res_type = reader.u16_at(base + 12, "file entry type")?;
-            entries.push(FileEntry {
-                index: locator & 0x3fff,
-                offset: data_offset,
-                size,
-                res_type,
-            });
-        }
-
-        Ok(entries)
-    }
-
-    /// Locate a file entry by index and cross-check its type against the type
-    /// the KEY recorded. Shared by the size and read paths.
-    fn entry_for(&self, file_index: u32, expected_type: u16) -> Result<FileEntry, BifError> {
-        let entry = match self
-            .index
-            .get(&file_index)
-            .and_then(|&i| self.entries.get(i))
-        {
-            Some(entry) => *entry,
-            None => return Err(BifError::ResourceNotFound(file_index)),
-        };
-
-        if entry.res_type != expected_type {
-            return Err(BifError::TypeMismatch {
-                file_index,
-                expected: expected_type,
-                found: entry.res_type,
-            });
-        }
-
-        Ok(entry)
-    }
-
-    /// Extract a resource's raw bytes by its file index (locator bits 0-13).
-    /// `expected_type` is the resource type the KEY recorded; it's cross-checked
-    /// against the BIF's own type field.
-    pub fn read_resource(
-        &mut self,
-        file_index: u32,
-        expected_type: u16,
-    ) -> Result<Vec<u8>, BifError> {
-        let entry = self.entry_for(file_index, expected_type)?;
-
-        self.file.seek(SeekFrom::Start(entry.offset as u64))?;
-        let mut buf = vec![0u8; entry.size as usize];
-        self.file.read_exact(&mut buf)?;
-
-        Ok(buf)
     }
 }

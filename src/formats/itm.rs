@@ -26,40 +26,276 @@ const EXT_HEADER_SIZE: usize = 56;
 const ITM_SIGNATURE: &[u8; 4] = b"ITM ";
 const ITM_VERSION: &[u8; 4] = b"V1  ";
 
-/// Anything that can go wrong while parsing an ITM file.
-#[derive(Debug)]
-pub enum ItmError {
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
+/// A parsed ITM file: the header, the always-on equipping effects, and the
+/// item's abilities (each with its own effects).
+pub struct Itm {
+    header: ItmHeader,
+    equipping: Vec<Feature>,
+    ext_headers: Vec<ExtHeader>,
+    /// The item's display names, resolved from the header strrefs by the
+    /// manager (the parser cannot reach the TLK). `None` when unset or absent.
+    unidentified_name: Option<String>,
+    identified_name: Option<String>,
 }
 
-impl fmt::Display for ItmError {
+impl Itm {
+    /// Parse an ITM V1 resource.
+    pub fn parse(data: &[u8]) -> Result<Itm, ItmError> {
+        let reader = Reader::new(data);
+
+        let signature = reader.tag_at(0x00, "signature")?;
+        if &signature != ITM_SIGNATURE {
+            return Err(ItmError::BadSignature(signature));
+        }
+
+        let version = reader.tag_at(0x04, "version")?;
+        if &version != ITM_VERSION {
+            return Err(ItmError::BadVersion(version));
+        }
+
+        let header = ItmHeader::parse(&reader)?;
+
+        // The header's structural words locate the two arrays below.
+        let ext_offset = reader.u32_at(0x64, "ext header offset")? as usize;
+        let ext_count = reader.u16_at(0x68, "ext header count")? as usize;
+        let feature_offset = reader.u32_at(0x6a, "feature block offset")?;
+        let equipping_index = reader.u16_at(0x6e, "equipping index")?;
+        let equipping_count = reader.u16_at(0x70, "equipping count")?;
+
+        // Equipping (always-on) effects: a slice of the shared feature pool.
+        let equipping =
+            Feature::read_pool(&reader, feature_offset, equipping_index, equipping_count)?;
+
+        // Each extended header reads its own slice of the same pool.
+        let mut ext_headers = Vec::with_capacity(ext_count);
+        for i in 0..ext_count {
+            let base = ext_offset + i * EXT_HEADER_SIZE;
+            let mut ext = ExtHeader::parse_at(&reader, base)?;
+            let feature_index = reader.u16_at(base + 0x20, "feature index")?;
+            let feature_count = reader.u16_at(base + 0x1e, "feature count")?;
+            ext.features =
+                Feature::read_pool(&reader, feature_offset, feature_index, feature_count)?;
+            ext_headers.push(ext);
+        }
+
+        Ok(Itm {
+            header,
+            equipping,
+            ext_headers,
+            unidentified_name: None,
+            identified_name: None,
+        })
+    }
+
+    /// The header strrefs for the item's unidentified and identified names, for
+    /// the manager to resolve against the TLK.
+    pub fn name_strrefs(&self) -> (u32, u32) {
+        (self.header.unidentified_name, self.header.identified_name)
+    }
+
+    /// Every TLK strref this item references, tagged with its field. The four
+    /// header strings (names and descriptions); embedded-effect string opcodes
+    /// are not yet decoded.
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        let h = &self.header;
+        let mut uses = vec![
+            StrrefUse::new(h.unidentified_name, "unidentified_name"),
+            StrrefUse::new(h.identified_name, "identified_name"),
+            StrrefUse::new(h.unidentified_description, "unidentified_description"),
+            StrrefUse::new(h.identified_description, "identified_description"),
+        ];
+        // Effects can carry a strref (a "display string" opcode): the always-on
+        // equipping effects, then each ability's own effects.
+        for (i, feat) in self.equipping.iter().enumerate() {
+            let at = format!("equipping[{i}]");
+            uses.extend(feat.strref_uses().into_iter().map(|u| u.prefixed(&at)));
+        }
+        for (j, ext) in self.ext_headers.iter().enumerate() {
+            for (k, feat) in ext.features.iter().enumerate() {
+                let at = format!("ability[{j}].effect[{k}]");
+                uses.extend(feat.strref_uses().into_iter().map(|u| u.prefixed(&at)));
+            }
+        }
+        uses
+    }
+
+    /// Every resource this item names, tagged with the type it names: the item
+    /// it degrades into, and the BAM icons for the header and each ability.
+    /// Effect resources are not yet decoded.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let h = &self.header;
+        let mut uses = vec![
+            ResrefUse::new(ITM_TYPE, &h.replacement_item, "replacement_item"),
+            ResrefUse::new(BAM_TYPE, &h.inventory_icon, "inventory_icon"),
+            ResrefUse::new(BAM_TYPE, &h.ground_icon, "ground_icon"),
+            ResrefUse::new(BAM_TYPE, &h.description_icon, "description_icon"),
+        ];
+        for (i, ext) in self.ext_headers.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                BAM_TYPE,
+                &ext.use_icon,
+                format!("ability[{i}].use_icon"),
+            ));
+        }
+        uses.retain(|u| !u.value.is_empty());
+        // Effects can name a resource (creating or removing an item, say): the
+        // always-on equipping effects, then each ability's own effects.
+        for (i, feat) in self.equipping.iter().enumerate() {
+            let at = format!("equipping[{i}]");
+            uses.extend(feat.resref_uses().into_iter().map(|u| u.prefixed(&at)));
+        }
+        for (j, ext) in self.ext_headers.iter().enumerate() {
+            for (k, feat) in ext.features.iter().enumerate() {
+                let at = format!("ability[{j}].effect[{k}]");
+                uses.extend(feat.resref_uses().into_iter().map(|u| u.prefixed(&at)));
+            }
+        }
+        uses
+    }
+
+    /// Attach the display names resolved from the header strrefs.
+    pub fn set_names(&mut self, unidentified: Option<String>, identified: Option<String>) {
+        self.unidentified_name = unidentified;
+        self.identified_name = identified;
+    }
+
+    /// The item's abilities, for the manager to resolve their school names.
+    pub fn ext_headers_mut(&mut self) -> &mut [ExtHeader] {
+        &mut self.ext_headers
+    }
+
+    /// The item's abilities (read-only).
+    pub fn ext_headers(&self) -> &[ExtHeader] {
+        &self.ext_headers
+    }
+
+    /// Write the whole item as flat, self-locating `key=value` lines: header
+    /// fields bare, equipping effects under `equip.<n>.`, abilities under
+    /// `ext.<n>.` (and their effects under `ext.<n>.effect.<m>.`).
+    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
+        let h = &self.header;
+        writeln!(out, "version={}", h.version)?;
+        writeln!(out, "unidentified_name={}", h.unidentified_name)?;
+        writeln!(out, "identified_name={}", h.identified_name)?;
+        writeln!(out, "replacement_item={}", h.replacement_item)?;
+        writeln!(out, "flags={}", h.flags)?;
+        writeln!(out, "item_type={}", h.item_type)?;
+        writeln!(out, "usability={}", h.usability)?;
+        writeln!(out, "animation={}", h.animation)?;
+        writeln!(out, "min_level={}", h.min_level)?;
+        writeln!(out, "min_strength={}", h.min_strength)?;
+        writeln!(out, "min_strength_bonus={}", h.min_strength_bonus)?;
+        writeln!(out, "kit_usability_1={}", h.kit_usability_1)?;
+        writeln!(out, "min_intelligence={}", h.min_intelligence)?;
+        writeln!(out, "kit_usability_2={}", h.kit_usability_2)?;
+        writeln!(out, "min_dexterity={}", h.min_dexterity)?;
+        writeln!(out, "kit_usability_3={}", h.kit_usability_3)?;
+        writeln!(out, "min_wisdom={}", h.min_wisdom)?;
+        writeln!(out, "kit_usability_4={}", h.kit_usability_4)?;
+        writeln!(out, "min_constitution={}", h.min_constitution)?;
+        writeln!(out, "weapon_proficiency={}", h.weapon_proficiency)?;
+        writeln!(out, "min_charisma={}", h.min_charisma)?;
+        writeln!(out, "price={}", h.price)?;
+        writeln!(out, "stack_amount={}", h.stack_amount)?;
+        writeln!(out, "inventory_icon={}", h.inventory_icon)?;
+        writeln!(out, "lore_to_id={}", h.lore_to_id)?;
+        writeln!(out, "ground_icon={}", h.ground_icon)?;
+        writeln!(out, "weight={}", h.weight)?;
+        writeln!(
+            out,
+            "unidentified_description={}",
+            h.unidentified_description
+        )?;
+        writeln!(out, "identified_description={}", h.identified_description)?;
+        writeln!(out, "description_icon={}", h.description_icon)?;
+        writeln!(out, "enchantment={}", h.enchantment)?;
+        for (i, feat) in self.equipping.iter().enumerate() {
+            feat.write_raw(out, &format!("equip.{i}."))?;
+        }
+        for (i, ext) in self.ext_headers.iter().enumerate() {
+            ext.write_raw(out, &format!("ext.{i}."))?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Itm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ItmError::Truncated(e) => write!(f, "{e}"),
-            ItmError::BadSignature(found) => {
-                write!(f, "not an ITM file: signature was {}", describe_tag(found))
+        let h = &self.header;
+        writeln!(f, "ITM V1")?;
+        match (&self.identified_name, &self.unidentified_name) {
+            // Show the identified name; surface the unidentified one only when
+            // it is a distinct string (most items reuse the identified name).
+            (Some(id), Some(unid)) if unid != id => {
+                writeln!(f, "  name:        {id}")?;
+                writeln!(f, "  unid. name:  {unid}")?;
             }
-            ItmError::BadVersion(found) => {
-                write!(f, "unsupported ITM version: {}", describe_tag(found))
-            }
+            (Some(name), _) | (None, Some(name)) => writeln!(f, "  name:        {name}")?,
+            // No string resolved (e.g. TLK unavailable): keep the raw strrefs.
+            (None, None) => writeln!(
+                f,
+                "  name:        unid strref {} / id strref {}",
+                h.unidentified_name, h.identified_name
+            )?,
         }
-    }
-}
-
-impl std::error::Error for ItmError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ItmError::Truncated(e) => Some(e),
-            _ => None,
+        writeln!(
+            f,
+            "  item type:   {} ({})",
+            h.item_type,
+            item_category_name(h.item_type)
+        )?;
+        write_bitfield(f, "  flags:       ", h.flags, &header_flags(h.flags))?;
+        writeln!(f, "  usability:   0x{:08x}", h.usability)?;
+        let unusable = usability_names(h.usability);
+        if !unusable.is_empty() {
+            writeln!(f, "    {:<9} {}", "unusable:", unusable.join(", "))?;
         }
-    }
-}
+        let kits = kit_names(
+            h.kit_usability_1,
+            h.kit_usability_2,
+            h.kit_usability_3,
+            h.kit_usability_4,
+        );
+        if !kits.is_empty() {
+            writeln!(f, "    {:<9} {}", "kits:", kits.join(", "))?;
+        }
+        if h.weapon_proficiency != 0 {
+            writeln!(
+                f,
+                "  proficiency: 0x{:02x} ({})",
+                h.weapon_proficiency,
+                proficiency_name(h.weapon_proficiency)
+            )?;
+        }
+        if !h.animation.trim().is_empty() {
+            writeln!(f, "  animation:   {:?}", h.animation)?;
+        }
+        writeln!(f, "  enchantment: {}", h.enchantment)?;
+        writeln!(f, "  price:       {}", h.price)?;
+        writeln!(f, "  weight:      {}", h.weight)?;
+        writeln!(f, "  lore:        {}", h.lore_to_id)?;
+        writeln!(f, "  stack:       {}", h.stack_amount)?;
+        let requires = requirements(h);
+        if !requires.is_empty() {
+            writeln!(f, "  requires:    {requires}")?;
+        }
+        if !h.replacement_item.is_empty() {
+            writeln!(f, "  replacement: {:?}", h.replacement_item)?;
+        }
 
-impl From<Truncated> for ItmError {
-    fn from(e: Truncated) -> Self {
-        ItmError::Truncated(e)
+        writeln!(f)?;
+        writeln!(f, "  equipping effects: {}", self.equipping.len())?;
+        for feat in &self.equipping {
+            feat.write_human(f, "    ")?;
+        }
+
+        writeln!(f)?;
+        writeln!(f, "  abilities: {}", self.ext_headers.len())?;
+        for (i, ext) in self.ext_headers.iter().enumerate() {
+            writeln!(f)?;
+            ext.write_human(f, i)?;
+        }
+        Ok(())
     }
 }
 
@@ -351,276 +587,40 @@ impl ExtHeader {
     }
 }
 
-/// A parsed ITM file: the header, the always-on equipping effects, and the
-/// item's abilities (each with its own effects).
-pub struct Itm {
-    header: ItmHeader,
-    equipping: Vec<Feature>,
-    ext_headers: Vec<ExtHeader>,
-    /// The item's display names, resolved from the header strrefs by the
-    /// manager (the parser cannot reach the TLK). `None` when unset or absent.
-    unidentified_name: Option<String>,
-    identified_name: Option<String>,
+/// Anything that can go wrong while parsing an ITM file.
+#[derive(Debug)]
+pub enum ItmError {
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
 }
 
-impl Itm {
-    /// Parse an ITM V1 resource.
-    pub fn parse(data: &[u8]) -> Result<Itm, ItmError> {
-        let reader = Reader::new(data);
-
-        let signature = reader.tag_at(0x00, "signature")?;
-        if &signature != ITM_SIGNATURE {
-            return Err(ItmError::BadSignature(signature));
-        }
-
-        let version = reader.tag_at(0x04, "version")?;
-        if &version != ITM_VERSION {
-            return Err(ItmError::BadVersion(version));
-        }
-
-        let header = ItmHeader::parse(&reader)?;
-
-        // The header's structural words locate the two arrays below.
-        let ext_offset = reader.u32_at(0x64, "ext header offset")? as usize;
-        let ext_count = reader.u16_at(0x68, "ext header count")? as usize;
-        let feature_offset = reader.u32_at(0x6a, "feature block offset")?;
-        let equipping_index = reader.u16_at(0x6e, "equipping index")?;
-        let equipping_count = reader.u16_at(0x70, "equipping count")?;
-
-        // Equipping (always-on) effects: a slice of the shared feature pool.
-        let equipping =
-            Feature::read_pool(&reader, feature_offset, equipping_index, equipping_count)?;
-
-        // Each extended header reads its own slice of the same pool.
-        let mut ext_headers = Vec::with_capacity(ext_count);
-        for i in 0..ext_count {
-            let base = ext_offset + i * EXT_HEADER_SIZE;
-            let mut ext = ExtHeader::parse_at(&reader, base)?;
-            let feature_index = reader.u16_at(base + 0x20, "feature index")?;
-            let feature_count = reader.u16_at(base + 0x1e, "feature count")?;
-            ext.features =
-                Feature::read_pool(&reader, feature_offset, feature_index, feature_count)?;
-            ext_headers.push(ext);
-        }
-
-        Ok(Itm {
-            header,
-            equipping,
-            ext_headers,
-            unidentified_name: None,
-            identified_name: None,
-        })
-    }
-
-    /// The header strrefs for the item's unidentified and identified names, for
-    /// the manager to resolve against the TLK.
-    pub fn name_strrefs(&self) -> (u32, u32) {
-        (self.header.unidentified_name, self.header.identified_name)
-    }
-
-    /// Every TLK strref this item references, tagged with its field. The four
-    /// header strings (names and descriptions); embedded-effect string opcodes
-    /// are not yet decoded.
-    pub fn strref_uses(&self) -> Vec<StrrefUse> {
-        let h = &self.header;
-        let mut uses = vec![
-            StrrefUse::new(h.unidentified_name, "unidentified_name"),
-            StrrefUse::new(h.identified_name, "identified_name"),
-            StrrefUse::new(h.unidentified_description, "unidentified_description"),
-            StrrefUse::new(h.identified_description, "identified_description"),
-        ];
-        // Effects can carry a strref (a "display string" opcode): the always-on
-        // equipping effects, then each ability's own effects.
-        for (i, feat) in self.equipping.iter().enumerate() {
-            let at = format!("equipping[{i}]");
-            uses.extend(feat.strref_uses().into_iter().map(|u| u.prefixed(&at)));
-        }
-        for (j, ext) in self.ext_headers.iter().enumerate() {
-            for (k, feat) in ext.features.iter().enumerate() {
-                let at = format!("ability[{j}].effect[{k}]");
-                uses.extend(feat.strref_uses().into_iter().map(|u| u.prefixed(&at)));
-            }
-        }
-        uses
-    }
-
-    /// Every resource this item names, tagged with the type it names: the item
-    /// it degrades into, and the BAM icons for the header and each ability.
-    /// Effect resources are not yet decoded.
-    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
-        let h = &self.header;
-        let mut uses = vec![
-            ResrefUse::new(ITM_TYPE, &h.replacement_item, "replacement_item"),
-            ResrefUse::new(BAM_TYPE, &h.inventory_icon, "inventory_icon"),
-            ResrefUse::new(BAM_TYPE, &h.ground_icon, "ground_icon"),
-            ResrefUse::new(BAM_TYPE, &h.description_icon, "description_icon"),
-        ];
-        for (i, ext) in self.ext_headers.iter().enumerate() {
-            uses.push(ResrefUse::new(
-                BAM_TYPE,
-                &ext.use_icon,
-                format!("ability[{i}].use_icon"),
-            ));
-        }
-        uses.retain(|u| !u.value.is_empty());
-        // Effects can name a resource (creating or removing an item, say): the
-        // always-on equipping effects, then each ability's own effects.
-        for (i, feat) in self.equipping.iter().enumerate() {
-            let at = format!("equipping[{i}]");
-            uses.extend(feat.resref_uses().into_iter().map(|u| u.prefixed(&at)));
-        }
-        for (j, ext) in self.ext_headers.iter().enumerate() {
-            for (k, feat) in ext.features.iter().enumerate() {
-                let at = format!("ability[{j}].effect[{k}]");
-                uses.extend(feat.resref_uses().into_iter().map(|u| u.prefixed(&at)));
-            }
-        }
-        uses
-    }
-
-    /// Attach the display names resolved from the header strrefs.
-    pub fn set_names(&mut self, unidentified: Option<String>, identified: Option<String>) {
-        self.unidentified_name = unidentified;
-        self.identified_name = identified;
-    }
-
-    /// The item's abilities, for the manager to resolve their school names.
-    pub fn ext_headers_mut(&mut self) -> &mut [ExtHeader] {
-        &mut self.ext_headers
-    }
-
-    /// The item's abilities (read-only).
-    pub fn ext_headers(&self) -> &[ExtHeader] {
-        &self.ext_headers
-    }
-
-    /// Write the whole item as flat, self-locating `key=value` lines: header
-    /// fields bare, equipping effects under `equip.<n>.`, abilities under
-    /// `ext.<n>.` (and their effects under `ext.<n>.effect.<m>.`).
-    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
-        let h = &self.header;
-        writeln!(out, "version={}", h.version)?;
-        writeln!(out, "unidentified_name={}", h.unidentified_name)?;
-        writeln!(out, "identified_name={}", h.identified_name)?;
-        writeln!(out, "replacement_item={}", h.replacement_item)?;
-        writeln!(out, "flags={}", h.flags)?;
-        writeln!(out, "item_type={}", h.item_type)?;
-        writeln!(out, "usability={}", h.usability)?;
-        writeln!(out, "animation={}", h.animation)?;
-        writeln!(out, "min_level={}", h.min_level)?;
-        writeln!(out, "min_strength={}", h.min_strength)?;
-        writeln!(out, "min_strength_bonus={}", h.min_strength_bonus)?;
-        writeln!(out, "kit_usability_1={}", h.kit_usability_1)?;
-        writeln!(out, "min_intelligence={}", h.min_intelligence)?;
-        writeln!(out, "kit_usability_2={}", h.kit_usability_2)?;
-        writeln!(out, "min_dexterity={}", h.min_dexterity)?;
-        writeln!(out, "kit_usability_3={}", h.kit_usability_3)?;
-        writeln!(out, "min_wisdom={}", h.min_wisdom)?;
-        writeln!(out, "kit_usability_4={}", h.kit_usability_4)?;
-        writeln!(out, "min_constitution={}", h.min_constitution)?;
-        writeln!(out, "weapon_proficiency={}", h.weapon_proficiency)?;
-        writeln!(out, "min_charisma={}", h.min_charisma)?;
-        writeln!(out, "price={}", h.price)?;
-        writeln!(out, "stack_amount={}", h.stack_amount)?;
-        writeln!(out, "inventory_icon={}", h.inventory_icon)?;
-        writeln!(out, "lore_to_id={}", h.lore_to_id)?;
-        writeln!(out, "ground_icon={}", h.ground_icon)?;
-        writeln!(out, "weight={}", h.weight)?;
-        writeln!(
-            out,
-            "unidentified_description={}",
-            h.unidentified_description
-        )?;
-        writeln!(out, "identified_description={}", h.identified_description)?;
-        writeln!(out, "description_icon={}", h.description_icon)?;
-        writeln!(out, "enchantment={}", h.enchantment)?;
-        for (i, feat) in self.equipping.iter().enumerate() {
-            feat.write_raw(out, &format!("equip.{i}."))?;
-        }
-        for (i, ext) in self.ext_headers.iter().enumerate() {
-            ext.write_raw(out, &format!("ext.{i}."))?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Display for Itm {
+impl fmt::Display for ItmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let h = &self.header;
-        writeln!(f, "ITM V1")?;
-        match (&self.identified_name, &self.unidentified_name) {
-            // Show the identified name; surface the unidentified one only when
-            // it is a distinct string (most items reuse the identified name).
-            (Some(id), Some(unid)) if unid != id => {
-                writeln!(f, "  name:        {id}")?;
-                writeln!(f, "  unid. name:  {unid}")?;
+        match self {
+            ItmError::Truncated(e) => write!(f, "{e}"),
+            ItmError::BadSignature(found) => {
+                write!(f, "not an ITM file: signature was {}", describe_tag(found))
             }
-            (Some(name), _) | (None, Some(name)) => writeln!(f, "  name:        {name}")?,
-            // No string resolved (e.g. TLK unavailable): keep the raw strrefs.
-            (None, None) => writeln!(
-                f,
-                "  name:        unid strref {} / id strref {}",
-                h.unidentified_name, h.identified_name
-            )?,
+            ItmError::BadVersion(found) => {
+                write!(f, "unsupported ITM version: {}", describe_tag(found))
+            }
         }
-        writeln!(
-            f,
-            "  item type:   {} ({})",
-            h.item_type,
-            item_category_name(h.item_type)
-        )?;
-        write_bitfield(f, "  flags:       ", h.flags, &header_flags(h.flags))?;
-        writeln!(f, "  usability:   0x{:08x}", h.usability)?;
-        let unusable = usability_names(h.usability);
-        if !unusable.is_empty() {
-            writeln!(f, "    {:<9} {}", "unusable:", unusable.join(", "))?;
-        }
-        let kits = kit_names(
-            h.kit_usability_1,
-            h.kit_usability_2,
-            h.kit_usability_3,
-            h.kit_usability_4,
-        );
-        if !kits.is_empty() {
-            writeln!(f, "    {:<9} {}", "kits:", kits.join(", "))?;
-        }
-        if h.weapon_proficiency != 0 {
-            writeln!(
-                f,
-                "  proficiency: 0x{:02x} ({})",
-                h.weapon_proficiency,
-                proficiency_name(h.weapon_proficiency)
-            )?;
-        }
-        if !h.animation.trim().is_empty() {
-            writeln!(f, "  animation:   {:?}", h.animation)?;
-        }
-        writeln!(f, "  enchantment: {}", h.enchantment)?;
-        writeln!(f, "  price:       {}", h.price)?;
-        writeln!(f, "  weight:      {}", h.weight)?;
-        writeln!(f, "  lore:        {}", h.lore_to_id)?;
-        writeln!(f, "  stack:       {}", h.stack_amount)?;
-        let requires = requirements(h);
-        if !requires.is_empty() {
-            writeln!(f, "  requires:    {requires}")?;
-        }
-        if !h.replacement_item.is_empty() {
-            writeln!(f, "  replacement: {:?}", h.replacement_item)?;
-        }
+    }
+}
 
-        writeln!(f)?;
-        writeln!(f, "  equipping effects: {}", self.equipping.len())?;
-        for feat in &self.equipping {
-            feat.write_human(f, "    ")?;
+impl std::error::Error for ItmError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ItmError::Truncated(e) => Some(e),
+            _ => None,
         }
+    }
+}
 
-        writeln!(f)?;
-        writeln!(f, "  abilities: {}", self.ext_headers.len())?;
-        for (i, ext) in self.ext_headers.iter().enumerate() {
-            writeln!(f)?;
-            ext.write_human(f, i)?;
-        }
-        Ok(())
+impl From<Truncated> for ItmError {
+    fn from(e: Truncated) -> Self {
+        ItmError::Truncated(e)
     }
 }
 

@@ -41,39 +41,296 @@ pub const BCS_TYPE: u16 = 0x03ef;
 /// class, specific, gender, alignment) then five `OBJECT.IDS` identifiers.
 pub const OBJECT_FIELDS: usize = 12;
 
-/// Anything that can go wrong while reading a compiled script.
-#[derive(Debug)]
-pub enum BcsError {
-    /// A marker, quote or number was required here and something else was found.
-    Expected { want: &'static str, at: usize },
-    /// Digits were expected but the run did not parse as a 32-bit integer.
-    BadNumber { text: String, at: usize },
-    /// A quoted string ran to the end of the file.
-    UnterminatedString { at: usize },
-    /// Bytes follow the closing `SC`.
-    Trailing { at: usize },
+/// Width of the scope prefix glued onto a variable name. Area names are six
+/// characters, and so are `GLOBAL` and `LOCALS`.
+const SCOPE_WIDTH: usize = 6;
+
+/// A compiled script: blocks evaluated in order, the first whose condition
+/// holds taking effect.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Script {
+    pub blocks: Vec<Block>,
+    /// Whether re-encoding reproduced the bytes read, or `None` when the check
+    /// was skipped. [`parse_verified`](Self::parse_verified) sets it so a view
+    /// can flag a script this layer does not fully model; the search path leaves
+    /// it unchecked.
+    exact: Option<bool>,
+    /// The install's call vocabulary, attached after parsing. Without it the
+    /// views can only show numeric ids.
+    vocabulary: Option<Rc<Vocabulary>>,
+    /// End-of-line comments the manager resolves at decode time, since the
+    /// writer cannot reach the TLK: a strref's text (and sound), and a named
+    /// resource's display name. Keyed by the value the comment explains.
+    comments: Comments,
 }
 
-impl fmt::Display for BcsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BcsError::Expected { want, at } => {
-                write!(f, "malformed BCS: expected {want:?} at byte {at}")
+impl Script {
+    /// Read a compiled script. Whitespace between tokens is taken leniently,
+    /// since only the writer needs to match the engine's exact layout.
+    ///
+    /// Does *not* verify the round trip: a whole-install reverse search parses
+    /// thousands of scripts and never asks whether they re-encode, so the check
+    /// is left to [`parse_verified`](Self::parse_verified).
+    pub fn parse(data: &[u8]) -> Result<Script, BcsError> {
+        let mut lex = Lexer::new(data);
+        lex.marker("SC")?;
+        let mut blocks = Vec::new();
+        while lex.peek_marker() == Some(*b"CR") {
+            blocks.push(parse_block(&mut lex)?);
+        }
+        lex.marker("SC")?;
+        lex.skip_space();
+        if lex.pos < data.len() {
+            return Err(BcsError::Trailing { at: lex.pos });
+        }
+
+        Ok(Script {
+            blocks,
+            exact: None,
+            vocabulary: None,
+            comments: Comments::default(),
+        })
+    }
+
+    /// Parse and check the round trip, so a view can warn when re-encoding would
+    /// not reproduce the original bytes. Use for the single script a user asks
+    /// to see, not the many a search sweeps.
+    pub fn parse_verified(data: &[u8]) -> Result<Script, BcsError> {
+        let mut script = Script::parse(data)?;
+        script.exact = Some(script.encode() == data);
+        Ok(script)
+    }
+
+    /// Build a script from blocks, as the BAF compiler does. Unverified: only a
+    /// parse from bytes can check the round trip.
+    pub fn from_blocks(blocks: Vec<Block>) -> Script {
+        Script {
+            blocks,
+            exact: None,
+            vocabulary: None,
+            comments: Comments::default(),
+        }
+    }
+
+    /// Attach the vocabulary that names this script's calls.
+    pub fn set_vocabulary(&mut self, vocabulary: Rc<Vocabulary>) {
+        self.vocabulary = Some(vocabulary);
+    }
+
+    /// Attach the resolved end-of-line comments.
+    pub fn set_comments(&mut self, comments: Comments) {
+        self.comments = comments;
+    }
+
+    /// Whether a verified script re-encodes to the bytes it was read from.
+    /// `None` when the round trip was never checked (the search path). A false
+    /// means the writer does not reproduce this file's layout — the parse is
+    /// still usable, but it could not be written back safely.
+    pub fn is_exact(&self) -> Option<bool> {
+        self.exact
+    }
+
+    /// Visit everything in the script the manager can resolve into a comment: a
+    /// strref, a string resref (a spell named by number shows its symbol
+    /// instead, so is skipped), and a death-variable object name.
+    pub fn for_each_reference(
+        &self,
+        vocabulary: &Vocabulary,
+        mut strref: impl FnMut(u32),
+        mut resource: impl FnMut(u16, &str),
+        mut object: impl FnMut(&str),
+    ) {
+        for block in &self.blocks {
+            for trigger in &block.triggers {
+                for arg in vocabulary.trigger_args(trigger) {
+                    reference_arg(arg, &mut strref, &mut resource);
+                }
+                death_variable(&trigger.object, &mut object);
             }
-            BcsError::BadNumber { text, at } => {
-                write!(f, "malformed BCS: {text:?} at byte {at} is not an integer")
-            }
-            BcsError::UnterminatedString { at } => {
-                write!(f, "malformed BCS: unterminated string at byte {at}")
-            }
-            BcsError::Trailing { at } => {
-                write!(f, "malformed BCS: trailing bytes at {at}")
+            for response in &block.responses {
+                for action in &response.actions {
+                    for arg in vocabulary.action_args(action) {
+                        reference_arg(arg, &mut strref, &mut resource);
+                    }
+                    for obj in &action.objects {
+                        death_variable(obj, &mut object);
+                    }
+                }
             }
         }
     }
+
+    /// The resources this script names, for a reverse search. Needs the
+    /// vocabulary to know which argument of each call names what; a compiled
+    /// call is otherwise just numbers.
+    pub fn references<'a>(&'a self, vocabulary: &Vocabulary) -> Vec<ResrefUse<'a>> {
+        let mut uses = Vec::new();
+        self.for_each_arg(vocabulary, |b, arg| {
+            if let Arg::Resource {
+                kind,
+                resref,
+                param,
+            } = arg
+            {
+                uses.push(ResrefUse::new(kind, resref, format!("block[{b}].{param}")));
+            }
+        });
+        uses
+    }
+
+    /// The dialog strings this script names, for a reverse search.
+    pub fn strref_uses(&self, vocabulary: &Vocabulary) -> Vec<StrrefUse> {
+        let mut uses = Vec::new();
+        self.for_each_arg(vocabulary, |b, arg| {
+            if let Arg::Strref { value, param } = arg {
+                uses.push(StrrefUse::new(value, format!("block[{b}].{param}")));
+            }
+        });
+        uses
+    }
+
+    /// Write the script back in the engine's layout. Exact for anything
+    /// [`parse`](Self::parse) accepted, which is what lets a decompiler check
+    /// its own work.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = String::from("SC\n");
+        for block in &self.blocks {
+            out.push_str("CR\nCO\n");
+            for trigger in &block.triggers {
+                encode_trigger(&mut out, trigger);
+            }
+            out.push_str("CO\nRS\n");
+            for response in &block.responses {
+                let _ = write!(out, "RE\n{}", response.weight);
+                for action in &response.actions {
+                    encode_action(&mut out, action);
+                }
+                out.push_str("RE\n");
+            }
+            out.push_str("RS\nCR\n");
+        }
+        out.push_str("SC\n");
+        out.into_bytes()
+    }
+
+    /// Write the machine-readable view: one `key=value` line per stored field,
+    /// including the slots no call reads.
+    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
+        writeln!(out, "blocks={}", self.blocks.len())?;
+        for (b, block) in self.blocks.iter().enumerate() {
+            for (t, trigger) in block.triggers.iter().enumerate() {
+                let key = format!("block.{b}.trigger.{t}");
+                writeln!(out, "{key}.id={}", trigger.id)?;
+                writeln!(out, "{key}.flags={}", trigger.flags)?;
+                for (i, value) in trigger.ints.iter().enumerate() {
+                    writeln!(out, "{key}.int.{i}={value}")?;
+                }
+                writeln!(out, "{key}.string.0={}", trigger.strings[0])?;
+                writeln!(out, "{key}.string.1={}", trigger.strings[1])?;
+                writeln!(out, "{key}.object={}", raw_object(&trigger.object))?;
+            }
+            for (r, response) in block.responses.iter().enumerate() {
+                writeln!(out, "block.{b}.response.{r}.weight={}", response.weight)?;
+                for (a, action) in response.actions.iter().enumerate() {
+                    let key = format!("block.{b}.response.{r}.action.{a}");
+                    writeln!(out, "{key}.id={}", action.id)?;
+                    for (i, object) in action.objects.iter().enumerate() {
+                        writeln!(out, "{key}.object.{i}={}", raw_object(object))?;
+                    }
+                    for (i, value) in action.ints.iter().enumerate() {
+                        writeln!(out, "{key}.int.{i}={value}")?;
+                    }
+                    writeln!(out, "{key}.point={},{}", action.point.0, action.point.1)?;
+                    writeln!(out, "{key}.string.0={}", action.strings[0])?;
+                    writeln!(out, "{key}.string.1={}", action.strings[1])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit every argument of every call, tagged with its block index.
+    fn for_each_arg<'a>(&'a self, vocabulary: &Vocabulary, mut visit: impl FnMut(usize, Arg<'a>)) {
+        for (b, block) in self.blocks.iter().enumerate() {
+            for trigger in &block.triggers {
+                for arg in vocabulary.trigger_args(trigger) {
+                    visit(b, arg);
+                }
+            }
+            for response in &block.responses {
+                for action in &response.actions {
+                    for arg in vocabulary.action_args(action) {
+                        visit(b, arg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Calls the vocabulary could not account for, and so left numeric.
+    ///
+    /// Distinct from [`is_exact`](Self::is_exact), which asks whether the
+    /// *bytes* survive a round trip. A script can re-encode perfectly and still
+    /// count here: the record is stored faithfully, but no signature explains
+    /// the slots it fills, so naming it would mean dropping something.
+    fn unnamed(&self) -> usize {
+        let Some(vocabulary) = self.vocabulary.as_deref() else {
+            return 0;
+        };
+        let triggers = self
+            .blocks
+            .iter()
+            .flat_map(|block| block.triggers.iter())
+            .filter(|trigger| vocabulary.trigger(trigger).is_none())
+            .count();
+        let actions = self
+            .blocks
+            .iter()
+            .flat_map(|block| block.responses.iter())
+            .flat_map(|response| response.actions.iter())
+            .filter(|action| vocabulary.action(action).is_none())
+            .count();
+        triggers + actions
+    }
 }
 
-impl std::error::Error for BcsError {}
+/// The decompiled BAF view: `IF` triggers `THEN` responses `END`, the text
+/// WeiDU compiles back to BCS. Calls stay numeric only when the vocabulary is
+/// absent (no game to read `ACTION.IDS`), which does not round-trip but keeps
+/// the structure legible.
+impl fmt::Display for Script {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_exact() == Some(false) {
+            writeln!(f, "// warning: does not re-encode to the bytes read")?;
+        }
+        if let n @ 1.. = self.unnamed() {
+            writeln!(
+                f,
+                "// note: {n} call(s) carry data no signature explains, kept in comments"
+            )?;
+        }
+
+        let view = View {
+            vocab: self.vocabulary.as_deref(),
+            comments: &self.comments,
+        };
+        for block in &self.blocks {
+            writeln!(f, "IF")?;
+            write_condition(f, &view, &block.triggers)?;
+            writeln!(f, "THEN")?;
+            for response in &block.responses {
+                writeln!(f, "  RESPONSE #{}", response.weight)?;
+                for action in &response.actions {
+                    write_call(f, "    ", render_action(&view, action))?;
+                }
+            }
+            writeln!(f, "END")?;
+            writeln!(f)?;
+        }
+
+        Ok(())
+    }
+}
 
 /// A creature or thing a call acts on, matched by attributes, by a chain of
 /// `OBJECT.IDS` identifiers, or by death-variable name.
@@ -141,25 +398,6 @@ pub struct Block {
     pub responses: Vec<Response>,
 }
 
-/// A compiled script: blocks evaluated in order, the first whose condition
-/// holds taking effect.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Script {
-    pub blocks: Vec<Block>,
-    /// Whether re-encoding reproduced the bytes read, or `None` when the check
-    /// was skipped. [`parse_verified`](Self::parse_verified) sets it so a view
-    /// can flag a script this layer does not fully model; the search path leaves
-    /// it unchecked.
-    exact: Option<bool>,
-    /// The install's call vocabulary, attached after parsing. Without it the
-    /// views can only show numeric ids.
-    vocabulary: Option<Rc<Vocabulary>>,
-    /// End-of-line comments the manager resolves at decode time, since the
-    /// writer cannot reach the TLK: a strref's text (and sound), and a named
-    /// resource's display name. Keyed by the value the comment explains.
-    comments: Comments,
-}
-
 /// The resolved comments a decompiled view shows after its calls.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Comments {
@@ -173,235 +411,142 @@ pub struct Comments {
     pub objects: HashMap<String, String>,
 }
 
-impl Script {
-    /// Read a compiled script. Whitespace between tokens is taken leniently,
-    /// since only the writer needs to match the engine's exact layout.
-    ///
-    /// Does *not* verify the round trip: a whole-install reverse search parses
-    /// thousands of scripts and never asks whether they re-encode, so the check
-    /// is left to [`parse_verified`](Self::parse_verified).
-    pub fn parse(data: &[u8]) -> Result<Script, BcsError> {
-        let mut lex = Lexer::new(data);
-        lex.marker("SC")?;
-        let mut blocks = Vec::new();
-        while lex.peek_marker() == Some(*b"CR") {
-            blocks.push(parse_block(&mut lex)?);
-        }
-        lex.marker("SC")?;
-        lex.skip_space();
-        if lex.pos < data.len() {
-            return Err(BcsError::Trailing { at: lex.pos });
-        }
+/// What the renderer needs beyond the record: the vocabulary that names calls,
+/// and the comments the manager resolved from the TLK.
+struct View<'a> {
+    vocab: Option<&'a Vocabulary>,
+    comments: &'a Comments,
+}
 
-        Ok(Script {
-            blocks,
-            exact: None,
-            vocabulary: None,
-            comments: Comments::default(),
-        })
+/// The BAF text for one call, plus the end-of-line comment (everything after
+/// `//`): a resolved strref or resource name, or junk the signature cannot
+/// explain — WeiDU drops the latter, this keeps it.
+struct Call {
+    text: String,
+    comment: Option<String>,
+}
+
+/// A token reader over the raw bytes. Every accessor is bounds-checked and
+/// reports the byte offset it failed at.
+struct Lexer<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Lexer<'a> {
+    fn new(data: &'a [u8]) -> Lexer<'a> {
+        Lexer { data, pos: 0 }
     }
 
-    /// Parse and check the round trip, so a view can warn when re-encoding would
-    /// not reproduce the original bytes. Use for the single script a user asks
-    /// to see, not the many a search sweeps.
-    pub fn parse_verified(data: &[u8]) -> Result<Script, BcsError> {
-        let mut script = Script::parse(data)?;
-        script.exact = Some(script.encode() == data);
-        Ok(script)
-    }
-
-    /// Build a script from blocks, as the BAF compiler does. Unverified: only a
-    /// parse from bytes can check the round trip.
-    pub fn from_blocks(blocks: Vec<Block>) -> Script {
-        Script {
-            blocks,
-            exact: None,
-            vocabulary: None,
-            comments: Comments::default(),
+    fn skip_space(&mut self) {
+        while self
+            .data
+            .get(self.pos)
+            .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            self.pos += 1;
         }
     }
 
-    /// Attach the vocabulary that names this script's calls.
-    pub fn set_vocabulary(&mut self, vocabulary: Rc<Vocabulary>) {
-        self.vocabulary = Some(vocabulary);
-    }
-
-    /// Attach the resolved end-of-line comments.
-    pub fn set_comments(&mut self, comments: Comments) {
-        self.comments = comments;
-    }
-
-    /// Visit everything in the script the manager can resolve into a comment: a
-    /// strref, a string resref (a spell named by number shows its symbol
-    /// instead, so is skipped), and a death-variable object name.
-    pub fn for_each_reference(
-        &self,
-        vocabulary: &Vocabulary,
-        mut strref: impl FnMut(u32),
-        mut resource: impl FnMut(u16, &str),
-        mut object: impl FnMut(&str),
-    ) {
-        for block in &self.blocks {
-            for trigger in &block.triggers {
-                for arg in vocabulary.trigger_args(trigger) {
-                    reference_arg(arg, &mut strref, &mut resource);
-                }
-                death_variable(&trigger.object, &mut object);
-            }
-            for response in &block.responses {
-                for action in &response.actions {
-                    for arg in vocabulary.action_args(action) {
-                        reference_arg(arg, &mut strref, &mut resource);
-                    }
-                    for obj in &action.objects {
-                        death_variable(obj, &mut object);
-                    }
-                }
-            }
+    /// The next two-letter marker, without consuming it. Drives the choice
+    /// between "another item" and "the closing marker" at every level.
+    fn peek_marker(&self) -> Option<[u8; 2]> {
+        let mut at = self.pos;
+        while self.data.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        let rest = self.data.get(at..)?;
+        match rest {
+            [a, b, ..] if a.is_ascii_uppercase() && b.is_ascii_uppercase() => Some([*a, *b]),
+            _ => None,
         }
     }
 
-    /// Whether a verified script re-encodes to the bytes it was read from.
-    /// `None` when the round trip was never checked (the search path). A false
-    /// means the writer does not reproduce this file's layout — the parse is
-    /// still usable, but it could not be written back safely.
-    pub fn is_exact(&self) -> Option<bool> {
-        self.exact
-    }
-
-    /// The resources this script names, for a reverse search. Needs the
-    /// vocabulary to know which argument of each call names what; a compiled
-    /// call is otherwise just numbers.
-    pub fn references<'a>(&'a self, vocabulary: &Vocabulary) -> Vec<ResrefUse<'a>> {
-        let mut uses = Vec::new();
-        self.for_each_arg(vocabulary, |b, arg| {
-            if let Arg::Resource {
-                kind,
-                resref,
-                param,
-            } = arg
-            {
-                uses.push(ResrefUse::new(kind, resref, format!("block[{b}].{param}")));
-            }
-        });
-        uses
-    }
-
-    /// The dialog strings this script names, for a reverse search.
-    pub fn strref_uses(&self, vocabulary: &Vocabulary) -> Vec<StrrefUse> {
-        let mut uses = Vec::new();
-        self.for_each_arg(vocabulary, |b, arg| {
-            if let Arg::Strref { value, param } = arg {
-                uses.push(StrrefUse::new(value, format!("block[{b}].{param}")));
-            }
-        });
-        uses
-    }
-
-    /// Visit every argument of every call, tagged with its block index.
-    fn for_each_arg<'a>(&'a self, vocabulary: &Vocabulary, mut visit: impl FnMut(usize, Arg<'a>)) {
-        for (b, block) in self.blocks.iter().enumerate() {
-            for trigger in &block.triggers {
-                for arg in vocabulary.trigger_args(trigger) {
-                    visit(b, arg);
-                }
-            }
-            for response in &block.responses {
-                for action in &response.actions {
-                    for arg in vocabulary.action_args(action) {
-                        visit(b, arg);
-                    }
-                }
-            }
+    fn marker(&mut self, want: &'static str) -> Result<(), BcsError> {
+        self.skip_space();
+        let at = self.pos;
+        let found = self.data.get(at..).and_then(|r| r.get(..want.len()));
+        if found == Some(want.as_bytes()) {
+            self.pos = at + want.len();
+            Ok(())
+        } else {
+            Err(BcsError::Expected { want, at })
         }
     }
 
-    /// Write the script back in the engine's layout. Exact for anything
-    /// [`parse`](Self::parse) accepted, which is what lets a decompiler check
-    /// its own work.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = String::from("SC\n");
-        for block in &self.blocks {
-            out.push_str("CR\nCO\n");
-            for trigger in &block.triggers {
-                encode_trigger(&mut out, trigger);
-            }
-            out.push_str("CO\nRS\n");
-            for response in &block.responses {
-                let _ = write!(out, "RE\n{}", response.weight);
-                for action in &response.actions {
-                    encode_action(&mut out, action);
-                }
-                out.push_str("RE\n");
-            }
-            out.push_str("RS\nCR\n");
+    fn int(&mut self) -> Result<i32, BcsError> {
+        self.skip_space();
+        let start = self.pos;
+        if self.data.get(self.pos) == Some(&b'-') {
+            self.pos += 1;
         }
-        out.push_str("SC\n");
-        out.into_bytes()
+        while self.data.get(self.pos).is_some_and(|b| b.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        let text = self.data.get(start..self.pos).unwrap_or_default();
+        std::str::from_utf8(text)
+            .ok()
+            .and_then(|t| t.parse::<i32>().ok())
+            .ok_or_else(|| BcsError::BadNumber {
+                text: String::from_utf8_lossy(text).into_owned(),
+                at: start,
+            })
     }
 
-    /// Calls the vocabulary could not account for, and so left numeric.
-    ///
-    /// Distinct from [`is_exact`](Self::is_exact), which asks whether the
-    /// *bytes* survive a round trip. A script can re-encode perfectly and still
-    /// count here: the record is stored faithfully, but no signature explains
-    /// the slots it fills, so naming it would mean dropping something.
-    fn unnamed(&self) -> usize {
-        let Some(vocabulary) = self.vocabulary.as_deref() else {
-            return 0;
-        };
-        let triggers = self
-            .blocks
-            .iter()
-            .flat_map(|block| block.triggers.iter())
-            .filter(|trigger| vocabulary.trigger(trigger).is_none())
-            .count();
-        let actions = self
-            .blocks
-            .iter()
-            .flat_map(|block| block.responses.iter())
-            .flat_map(|response| response.actions.iter())
-            .filter(|action| vocabulary.action(action).is_none())
-            .count();
-        triggers + actions
-    }
-
-    /// Write the machine-readable view: one `key=value` line per stored field,
-    /// including the slots no call reads.
-    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
-        writeln!(out, "blocks={}", self.blocks.len())?;
-        for (b, block) in self.blocks.iter().enumerate() {
-            for (t, trigger) in block.triggers.iter().enumerate() {
-                let key = format!("block.{b}.trigger.{t}");
-                writeln!(out, "{key}.id={}", trigger.id)?;
-                writeln!(out, "{key}.flags={}", trigger.flags)?;
-                for (i, value) in trigger.ints.iter().enumerate() {
-                    writeln!(out, "{key}.int.{i}={value}")?;
-                }
-                writeln!(out, "{key}.string.0={}", trigger.strings[0])?;
-                writeln!(out, "{key}.string.1={}", trigger.strings[1])?;
-                writeln!(out, "{key}.object={}", raw_object(&trigger.object))?;
-            }
-            for (r, response) in block.responses.iter().enumerate() {
-                writeln!(out, "block.{b}.response.{r}.weight={}", response.weight)?;
-                for (a, action) in response.actions.iter().enumerate() {
-                    let key = format!("block.{b}.response.{r}.action.{a}");
-                    writeln!(out, "{key}.id={}", action.id)?;
-                    for (i, object) in action.objects.iter().enumerate() {
-                        writeln!(out, "{key}.object.{i}={}", raw_object(object))?;
-                    }
-                    for (i, value) in action.ints.iter().enumerate() {
-                        writeln!(out, "{key}.int.{i}={value}")?;
-                    }
-                    writeln!(out, "{key}.point={},{}", action.point.0, action.point.1)?;
-                    writeln!(out, "{key}.string.0={}", action.strings[0])?;
-                    writeln!(out, "{key}.string.1={}", action.strings[1])?;
-                }
-            }
+    /// A double-quoted string. The format has no escape, so the first closing
+    /// quote ends it and the body is taken verbatim — a name may be a single
+    /// space, and dropping it would change the script.
+    fn string(&mut self) -> Result<String, BcsError> {
+        self.skip_space();
+        let at = self.pos;
+        if self.data.get(at) != Some(&b'"') {
+            return Err(BcsError::Expected { want: "\"", at });
         }
-        Ok(())
+        let body = at + 1;
+        let len = self
+            .data
+            .get(body..)
+            .and_then(|rest| rest.iter().position(|&b| b == b'"'))
+            .ok_or(BcsError::UnterminatedString { at })?;
+        let text = self.data.get(body..body + len).unwrap_or_default();
+        self.pos = body + len + 1;
+        Ok(String::from_utf8_lossy(text).into_owned())
     }
 }
+
+/// Anything that can go wrong while reading a compiled script.
+#[derive(Debug)]
+pub enum BcsError {
+    /// A marker, quote or number was required here and something else was found.
+    Expected { want: &'static str, at: usize },
+    /// Digits were expected but the run did not parse as a 32-bit integer.
+    BadNumber { text: String, at: usize },
+    /// A quoted string ran to the end of the file.
+    UnterminatedString { at: usize },
+    /// Bytes follow the closing `SC`.
+    Trailing { at: usize },
+}
+
+impl fmt::Display for BcsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BcsError::Expected { want, at } => {
+                write!(f, "malformed BCS: expected {want:?} at byte {at}")
+            }
+            BcsError::BadNumber { text, at } => {
+                write!(f, "malformed BCS: {text:?} at byte {at} is not an integer")
+            }
+            BcsError::UnterminatedString { at } => {
+                write!(f, "malformed BCS: unterminated string at byte {at}")
+            }
+            BcsError::Trailing { at } => {
+                write!(f, "malformed BCS: trailing bytes at {at}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BcsError {}
 
 /// Route one argument to the strref or resource callback. A borrowed resref is a
 /// string argument; an owned one is a spell named by number, which shows its
@@ -429,59 +574,6 @@ fn death_variable(object: &Object, visit: &mut impl FnMut(&str)) {
 fn raw_object(object: &Object) -> String {
     let fields: Vec<String> = object.fields.iter().map(|f| f.to_string()).collect();
     format!("{} \"{}\"", fields.join(","), object.name)
-}
-
-/// The decompiled BAF view: `IF` triggers `THEN` responses `END`, the text
-/// WeiDU compiles back to BCS. Calls stay numeric only when the vocabulary is
-/// absent (no game to read `ACTION.IDS`), which does not round-trip but keeps
-/// the structure legible.
-impl fmt::Display for Script {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.is_exact() == Some(false) {
-            writeln!(f, "// warning: does not re-encode to the bytes read")?;
-        }
-        if let n @ 1.. = self.unnamed() {
-            writeln!(
-                f,
-                "// note: {n} call(s) carry data no signature explains, kept in comments"
-            )?;
-        }
-
-        let view = View {
-            vocab: self.vocabulary.as_deref(),
-            comments: &self.comments,
-        };
-        for block in &self.blocks {
-            writeln!(f, "IF")?;
-            write_condition(f, &view, &block.triggers)?;
-            writeln!(f, "THEN")?;
-            for response in &block.responses {
-                writeln!(f, "  RESPONSE #{}", response.weight)?;
-                for action in &response.actions {
-                    write_call(f, "    ", render_action(&view, action))?;
-                }
-            }
-            writeln!(f, "END")?;
-            writeln!(f)?;
-        }
-
-        Ok(())
-    }
-}
-
-/// What the renderer needs beyond the record: the vocabulary that names calls,
-/// and the comments the manager resolved from the TLK.
-struct View<'a> {
-    vocab: Option<&'a Vocabulary>,
-    comments: &'a Comments,
-}
-
-/// The BAF text for one call, plus the end-of-line comment (everything after
-/// `//`): a resolved strref or resource name, or junk the signature cannot
-/// explain — WeiDU drops the latter, this keeps it.
-struct Call {
-    text: String,
-    comment: Option<String>,
 }
 
 /// Write a call line at `indent`, appending its comment if any.
@@ -780,10 +872,6 @@ fn arguments(
     args
 }
 
-/// Width of the scope prefix glued onto a variable name. Area names are six
-/// characters, and so are `GLOBAL` and `LOCALS`.
-const SCOPE_WIDTH: usize = 6;
-
 /// An object as WeiDU writes it: the identifiers chain outwards around a base
 /// of the death-variable name or the attribute bracket.
 ///
@@ -993,94 +1081,6 @@ fn encode_object(out: &mut String, object: &Object) {
         let _ = write!(out, "{field} ");
     }
     let _ = writeln!(out, "\"{}\"OB", object.name);
-}
-
-/// A token reader over the raw bytes. Every accessor is bounds-checked and
-/// reports the byte offset it failed at.
-struct Lexer<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Lexer<'a> {
-    fn new(data: &'a [u8]) -> Lexer<'a> {
-        Lexer { data, pos: 0 }
-    }
-
-    fn skip_space(&mut self) {
-        while self
-            .data
-            .get(self.pos)
-            .is_some_and(|b| b.is_ascii_whitespace())
-        {
-            self.pos += 1;
-        }
-    }
-
-    /// The next two-letter marker, without consuming it. Drives the choice
-    /// between "another item" and "the closing marker" at every level.
-    fn peek_marker(&self) -> Option<[u8; 2]> {
-        let mut at = self.pos;
-        while self.data.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
-            at += 1;
-        }
-        let rest = self.data.get(at..)?;
-        match rest {
-            [a, b, ..] if a.is_ascii_uppercase() && b.is_ascii_uppercase() => Some([*a, *b]),
-            _ => None,
-        }
-    }
-
-    fn marker(&mut self, want: &'static str) -> Result<(), BcsError> {
-        self.skip_space();
-        let at = self.pos;
-        let found = self.data.get(at..).and_then(|r| r.get(..want.len()));
-        if found == Some(want.as_bytes()) {
-            self.pos = at + want.len();
-            Ok(())
-        } else {
-            Err(BcsError::Expected { want, at })
-        }
-    }
-
-    fn int(&mut self) -> Result<i32, BcsError> {
-        self.skip_space();
-        let start = self.pos;
-        if self.data.get(self.pos) == Some(&b'-') {
-            self.pos += 1;
-        }
-        while self.data.get(self.pos).is_some_and(|b| b.is_ascii_digit()) {
-            self.pos += 1;
-        }
-        let text = self.data.get(start..self.pos).unwrap_or_default();
-        std::str::from_utf8(text)
-            .ok()
-            .and_then(|t| t.parse::<i32>().ok())
-            .ok_or_else(|| BcsError::BadNumber {
-                text: String::from_utf8_lossy(text).into_owned(),
-                at: start,
-            })
-    }
-
-    /// A double-quoted string. The format has no escape, so the first closing
-    /// quote ends it and the body is taken verbatim — a name may be a single
-    /// space, and dropping it would change the script.
-    fn string(&mut self) -> Result<String, BcsError> {
-        self.skip_space();
-        let at = self.pos;
-        if self.data.get(at) != Some(&b'"') {
-            return Err(BcsError::Expected { want: "\"", at });
-        }
-        let body = at + 1;
-        let len = self
-            .data
-            .get(body..)
-            .and_then(|rest| rest.iter().position(|&b| b == b'"'))
-            .ok_or(BcsError::UnterminatedString { at })?;
-        let text = self.data.get(body..body + len).unwrap_or_default();
-        self.pos = body + len + 1;
-        Ok(String::from_utf8_lossy(text).into_owned())
-    }
 }
 
 #[cfg(test)]

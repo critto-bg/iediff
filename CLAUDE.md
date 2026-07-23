@@ -30,6 +30,34 @@ Comments explain _why_, not _what_ — the code already says what it does.
 - Keep the load-bearing "why": a non-obvious format quirk, a decision that could
   look wrong, an invariant a reader must not break.
 
+## File structure
+
+Every source file follows this order, top to bottom:
+
+1. Module doc comment (`//!`) and any inner attributes (`#![…]`).
+2. `mod` / `pub mod` declarations.
+3. `use` statements, grouped std → external crates → local (`crate::`), and
+   alphabetized within each group. (External is usually empty — stdlib only.)
+4. Constants and statics.
+5. Types, each **immediately followed by its own impls** — `struct Foo`, then
+   `impl Foo`, then the next type. Not all types first and all impls after.
+   - Order types by importance: the module's central type first, supporting
+     types (error enums, small records) after.
+   - Derive attributes sit directly above their type.
+   - Within a type's impls: the inherent `impl Foo` first, then trait impls
+     (`Display`, `Error`, `From`, …). A trait impl lives with its `Self` type —
+     `impl From<Bar> for Foo` goes with `Foo`, not `Bar`.
+6. Free functions, most-public/most-important first, most-internal last.
+7. `#[cfg(test)] mod tests` at the very bottom; its contents follow 1–6, with
+   all setup (helpers, fixtures) before the `#[test]` cases.
+
+Two cross-cutting rules for ordering methods (in 5) and free functions (in 6):
+
+- **Visibility first:** `pub` → `pub(crate)` → private.
+- **Cohesion as the tiebreaker:** within a visibility tier, group by role
+  (construct → transform → consume/emit) so related items stay together. A small
+  private helper used by one method may sit right after it rather than at the end.
+
 ## Layout
 
 - `src/main.rs` — crate root: shared, format-agnostic building blocks

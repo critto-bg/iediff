@@ -30,6 +30,40 @@ pub const SPELL_BY_NUMBER: &str = "SPWI001";
 /// The strref the fixture script passes to `DisplayString`.
 pub const SCRIPT_STRREF: u32 = 12345;
 
+// What every reference in the fixture points at. Distinct per type, so an
+// assertion can never be satisfied by the wrong kind.
+pub const ITM_TARGET: &str = "SW1H01";
+pub const SPL_TARGET: &str = "MAGICMIS";
+pub const CRE_TARGET: &str = "SUMMON1";
+pub const DLG_TARGET: &str = "CHATTER";
+pub const ARE_TARGET: &str = "AR0001";
+pub const PRO_TARGET: &str = "PROJ01";
+pub const EFF_TARGET: &str = "EFFECT1";
+pub const BCS_TARGET: &str = "SCRIPT1";
+pub const TWODA_TARGET: &str = "TABLE1";
+pub const BAM_TARGET: &str = "ANIM1";
+pub const OVERLAY_TARGET: &str = "OVERLAY1";
+pub const WAV_TARGET: &str = "SOUND1";
+pub const WED_TARGET: &str = "TILEMAP1";
+pub const BMP_TARGET: &str = "PORTRAIT";
+pub const MVE_TARGET: &str = "MOVIE1";
+
+/// One casting effect per resource-bearing opcode family, so a single spell
+/// witnesses most of the opcode table.
+const SPELL_EFFECTS: [(u16, &str); 11] = [
+    (122, ITM_TARGET),     // creates an item
+    (318, ITM_TARGET),     // "spell or item" — soft, under both readings
+    (146, SPL_TARGET),     // casts a spell
+    (67, CRE_TARGET),      // summons a creature
+    (177, EFF_TARGET),     // applies an EFF file
+    (214, TWODA_TARGET),   // custom spell table
+    (152, MVE_TARGET),     // plays a movie
+    (107, BMP_TARGET),     // changes the portrait
+    (215, OVERLAY_TARGET), // VVC-or-BAM animation — soft, under both
+    (82, BCS_TARGET),      // sets an AI script
+    (186, ARE_TARGET),     // moves to an area
+];
+
 /// A fixture game tree that deletes itself when dropped.
 pub struct FixtureGame {
     root: PathBuf,
@@ -55,24 +89,6 @@ struct Entry {
     res_type: u16,
     data: Vec<u8>,
 }
-
-// What every reference in the fixture points at. Distinct per type, so an
-// assertion can never be satisfied by the wrong kind.
-pub const ITM_TARGET: &str = "SW1H01";
-pub const SPL_TARGET: &str = "MAGICMIS";
-pub const CRE_TARGET: &str = "SUMMON1";
-pub const DLG_TARGET: &str = "CHATTER";
-pub const ARE_TARGET: &str = "AR0001";
-pub const PRO_TARGET: &str = "PROJ01";
-pub const EFF_TARGET: &str = "EFFECT1";
-pub const BCS_TARGET: &str = "SCRIPT1";
-pub const TWODA_TARGET: &str = "TABLE1";
-pub const BAM_TARGET: &str = "ANIM1";
-pub const OVERLAY_TARGET: &str = "OVERLAY1";
-pub const WAV_TARGET: &str = "SOUND1";
-pub const WED_TARGET: &str = "TILEMAP1";
-pub const BMP_TARGET: &str = "PORTRAIT";
-pub const MVE_TARGET: &str = "MOVIE1";
 
 /// Build the fixture game in a fresh temporary directory.
 ///
@@ -244,23 +260,7 @@ fn cre(items: &[&str]) -> Vec<u8> {
     d
 }
 
-/// One casting effect per resource-bearing opcode family, so a single spell
-/// witnesses most of the opcode table.
-const SPELL_EFFECTS: [(u16, &str); 11] = [
-    (122, ITM_TARGET),     // creates an item
-    (318, ITM_TARGET),     // "spell or item" — soft, under both readings
-    (146, SPL_TARGET),     // casts a spell
-    (67, CRE_TARGET),      // summons a creature
-    (177, EFF_TARGET),     // applies an EFF file
-    (214, TWODA_TARGET),   // custom spell table
-    (152, MVE_TARGET),     // plays a movie
-    (107, BMP_TARGET),     // changes the portrait
-    (215, OVERLAY_TARGET), // VVC-or-BAM animation — soft, under both
-    (82, BCS_TARGET),      // sets an AI script
-    (186, ARE_TARGET),     // moves to an area
-];
-
-/// An SPL with a completion sound and the casting-effect pool above.
+/// An SPL with a completion sound and the casting-effect pool ([`SPELL_EFFECTS`]).
 fn spl() -> Vec<u8> {
     let mut d = vec![0u8; 0x9a];
     d[0x00..0x04].copy_from_slice(b"SPL ");

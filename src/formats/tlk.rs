@@ -24,6 +24,121 @@ const TLK_VERSION: &[u8; 4] = b"V1  ";
 const HEADER_LEN: usize = 0x12;
 const ENTRY_LEN: usize = 26;
 
+/// An opened TLK file. Holds the entry table plus an open handle for reading
+/// string bytes on demand.
+pub struct TlkFile {
+    file: File,
+    /// Absolute offset of the string-data section.
+    string_section: u32,
+    entries: Vec<StringEntry>,
+}
+
+impl TlkFile {
+    /// Open a TLK and parse its header and entry table. Does not read any
+    /// string data.
+    pub fn open(path: &Path) -> Result<TlkFile, TlkError> {
+        let mut file = File::open(path)?;
+
+        let mut header = [0u8; HEADER_LEN];
+        file.read_exact(&mut header)?;
+        let reader = Reader::new(&header);
+
+        let signature = reader.tag_at(0x00, "signature")?;
+        if &signature != TLK_SIGNATURE {
+            return Err(TlkError::BadSignature(signature));
+        }
+
+        let version = reader.tag_at(0x04, "version")?;
+        if &version != TLK_VERSION {
+            return Err(TlkError::BadVersion(version));
+        }
+
+        // Bytes 8-9 (language id) are unused for now.
+        let entry_count = reader.u32_at(0x0a, "string count")? as usize;
+        let string_section = reader.u32_at(0x0e, "string data offset")?;
+
+        let entries = Self::read_table(&mut file, entry_count)?;
+
+        Ok(TlkFile {
+            file,
+            string_section,
+            entries,
+        })
+    }
+
+    /// Resolve a strref to its string. Empty entries (no text) yield an empty
+    /// string; an index past the end of the table is an error.
+    pub fn string(&mut self, strref: u32) -> Result<String, TlkError> {
+        let entry = self
+            .entries
+            .get(strref as usize)
+            .cloned()
+            .ok_or(TlkError::StrrefOutOfRange(strref))?;
+
+        if entry.length == 0 {
+            return Ok(String::new());
+        }
+
+        let start = self.string_section as u64 + entry.offset as u64;
+        self.file.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; entry.length as usize];
+        self.file.read_exact(&mut buf)?;
+
+        // Some strings are NUL-terminated within their recorded length, others
+        // not; trim at the first NUL. EE stores UTF-8, so decode lossily.
+        Ok(parse_asciiz(&buf))
+    }
+
+    /// The sound resref that plays with a strref, if any. Empty for a string
+    /// with no attached sound, or a strref past the table.
+    pub fn sound(&self, strref: u32) -> Option<&str> {
+        self.entries
+            .get(strref as usize)
+            .map(|entry| entry.sound.as_str())
+            .filter(|sound| !sound.is_empty())
+    }
+
+    /// Read and parse the entry table (`count * 26` bytes, starting right after
+    /// the header).
+    fn read_table(file: &mut File, count: usize) -> Result<Vec<StringEntry>, TlkError> {
+        let table_len = count
+            .checked_mul(ENTRY_LEN)
+            .ok_or(TlkError::Malformed("entry table size overflow"))?;
+
+        let mut table = vec![0u8; table_len];
+        file.seek(SeekFrom::Start(HEADER_LEN as u64))?;
+        file.read_exact(&mut table)?;
+        let reader = Reader::new(&table);
+
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = i * ENTRY_LEN;
+            // Bytes 0-1 (flags) and 10-17 (volume/pitch variance) are unused;
+            // the sound resref (2-9) and the string's location matter.
+            let sound = reader.resref_at(base + 0x02, "entry sound resref")?;
+            let offset = reader.u32_at(base + 0x12, "entry string offset")?;
+            let length = reader.u32_at(base + 0x16, "entry string length")?;
+            entries.push(StringEntry {
+                sound,
+                offset,
+                length,
+            });
+        }
+
+        Ok(entries)
+    }
+}
+
+/// One string slot: where its bytes sit within the string section, and the
+/// sound that plays with it (empty when there is none).
+#[derive(Clone)]
+struct StringEntry {
+    sound: String,
+    /// Offset of the string relative to the start of the string section.
+    offset: u32,
+    length: u32,
+}
+
 /// Anything that can go wrong while opening or reading a TLK file.
 #[derive(Debug)]
 pub enum TlkError {
@@ -77,120 +192,5 @@ impl From<Truncated> for TlkError {
 impl From<std::io::Error> for TlkError {
     fn from(e: std::io::Error) -> Self {
         TlkError::Io(e)
-    }
-}
-
-/// One string slot: where its bytes sit within the string section, and the
-/// sound that plays with it (empty when there is none).
-#[derive(Clone)]
-struct StringEntry {
-    sound: String,
-    /// Offset of the string relative to the start of the string section.
-    offset: u32,
-    length: u32,
-}
-
-/// An opened TLK file. Holds the entry table plus an open handle for reading
-/// string bytes on demand.
-pub struct TlkFile {
-    file: File,
-    /// Absolute offset of the string-data section.
-    string_section: u32,
-    entries: Vec<StringEntry>,
-}
-
-impl TlkFile {
-    /// Open a TLK and parse its header and entry table. Does not read any
-    /// string data.
-    pub fn open(path: &Path) -> Result<TlkFile, TlkError> {
-        let mut file = File::open(path)?;
-
-        let mut header = [0u8; HEADER_LEN];
-        file.read_exact(&mut header)?;
-        let reader = Reader::new(&header);
-
-        let signature = reader.tag_at(0x00, "signature")?;
-        if &signature != TLK_SIGNATURE {
-            return Err(TlkError::BadSignature(signature));
-        }
-
-        let version = reader.tag_at(0x04, "version")?;
-        if &version != TLK_VERSION {
-            return Err(TlkError::BadVersion(version));
-        }
-
-        // Bytes 8-9 (language id) are unused for now.
-        let entry_count = reader.u32_at(0x0a, "string count")? as usize;
-        let string_section = reader.u32_at(0x0e, "string data offset")?;
-
-        let entries = Self::read_table(&mut file, entry_count)?;
-
-        Ok(TlkFile {
-            file,
-            string_section,
-            entries,
-        })
-    }
-
-    /// Read and parse the entry table (`count * 26` bytes, starting right after
-    /// the header).
-    fn read_table(file: &mut File, count: usize) -> Result<Vec<StringEntry>, TlkError> {
-        let table_len = count
-            .checked_mul(ENTRY_LEN)
-            .ok_or(TlkError::Malformed("entry table size overflow"))?;
-
-        let mut table = vec![0u8; table_len];
-        file.seek(SeekFrom::Start(HEADER_LEN as u64))?;
-        file.read_exact(&mut table)?;
-        let reader = Reader::new(&table);
-
-        let mut entries = Vec::with_capacity(count);
-        for i in 0..count {
-            let base = i * ENTRY_LEN;
-            // Bytes 0-1 (flags) and 10-17 (volume/pitch variance) are unused;
-            // the sound resref (2-9) and the string's location matter.
-            let sound = reader.resref_at(base + 0x02, "entry sound resref")?;
-            let offset = reader.u32_at(base + 0x12, "entry string offset")?;
-            let length = reader.u32_at(base + 0x16, "entry string length")?;
-            entries.push(StringEntry {
-                sound,
-                offset,
-                length,
-            });
-        }
-
-        Ok(entries)
-    }
-
-    /// Resolve a strref to its string. Empty entries (no text) yield an empty
-    /// string; an index past the end of the table is an error.
-    pub fn string(&mut self, strref: u32) -> Result<String, TlkError> {
-        let entry = self
-            .entries
-            .get(strref as usize)
-            .cloned()
-            .ok_or(TlkError::StrrefOutOfRange(strref))?;
-
-        if entry.length == 0 {
-            return Ok(String::new());
-        }
-
-        let start = self.string_section as u64 + entry.offset as u64;
-        self.file.seek(SeekFrom::Start(start))?;
-        let mut buf = vec![0u8; entry.length as usize];
-        self.file.read_exact(&mut buf)?;
-
-        // Some strings are NUL-terminated within their recorded length, others
-        // not; trim at the first NUL. EE stores UTF-8, so decode lossily.
-        Ok(parse_asciiz(&buf))
-    }
-
-    /// The sound resref that plays with a strref, if any. Empty for a string
-    /// with no attached sound, or a strref past the table.
-    pub fn sound(&self, strref: u32) -> Option<&str> {
-        self.entries
-            .get(strref as usize)
-            .map(|entry| entry.sound.as_str())
-            .filter(|sound| !sound.is_empty())
     }
 }

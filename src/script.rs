@@ -31,96 +31,6 @@ use crate::formats::itm::ITM_TYPE;
 use crate::formats::spl::SPL_TYPE;
 use crate::formats::{BMP_TYPE, WAV_TYPE};
 
-/// What a script call's string argument names.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ArgKind {
-    /// A resource of this type.
-    Resource(u16),
-    /// A variable, scope, token or death variable — never a reference.
-    Variable,
-    /// No opinion: the call is unlisted, or its parameter is a generic
-    /// `S:ResRef*` whose meaning depends on the call.
-    Unknown,
-}
-
-/// Which record slot class a parameter occupies. A call's arguments are not
-/// stored in declaration order: each class fills its own slots in order, so
-/// `CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)` puts its integer in
-/// the first integer slot even though it is declared last.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Class {
-    String,
-    Int,
-    Object,
-    Point,
-    /// Only `ActionOverride(O:Actor*,A:Action*)`, which the engine never
-    /// stores: the actor goes in the call's own object slot 0.
-    Action,
-}
-
-/// One declared parameter of a call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Param {
-    pub class: Class,
-    pub name: String,
-    /// The IDS table an integer argument draws its symbols from, when the
-    /// signature names one (`I:Spell*Spell` -> `SPELL.IDS`).
-    pub ids: Option<String>,
-}
-
-/// One `ACTION.IDS` / `TRIGGER.IDS` call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Signature {
-    pub id: i32,
-    pub name: String,
-    pub params: Vec<Param>,
-}
-
-/// How many slots of each class a signature occupies. Slots fill from zero, so
-/// a count is enough to say which are in use.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct Slots {
-    pub ints: usize,
-    pub strings: usize,
-    /// Object slots the call itself uses, ignoring the `ActionOverride` slot.
-    pub objects: usize,
-    pub point: bool,
-}
-
-impl Slots {
-    /// Whether a signature covering `self` can account for a record occupying
-    /// `used` — every slot the record fills must be one the call reads.
-    fn covers(&self, used: &Slots) -> bool {
-        self.ints >= used.ints
-            && self.strings >= used.strings
-            && self.objects >= used.objects
-            && (self.point || !used.point)
-    }
-}
-
-impl Signature {
-    /// The slots this call occupies. A scope parameter shares its predecessor's
-    /// string slot: `Global(S:Name*,S:Area*,…)` stores one string, the scope
-    /// prefixed to the name.
-    pub fn slots(&self) -> Slots {
-        let mut slots = Slots::default();
-        for param in &self.params {
-            match param.class {
-                Class::Int => slots.ints += 1,
-                Class::Object => slots.objects += 1,
-                Class::Point => slots.point = true,
-                Class::Action => {}
-                Class::String => {
-                    if !(slots.strings > 0 && is_scope_param(&self.name, &param.name)) {
-                        slots.strings += 1;
-                    }
-                }
-            }
-        }
-        slots
-    }
-}
-
 /// The `IDS` tables behind an object's seven enumerated attributes, in the
 /// order the fields are stored.
 pub const OBJECT_TABLES: [&str; 7] = [
@@ -150,195 +60,6 @@ pub struct Vocabulary {
     /// symbol back to its number. Names are unique, so this is unambiguous even
     /// where a value carries several.
     values: HashMap<String, HashMap<String, i64>>,
-}
-
-/// Read one table's calls from the install's own `ACTION.IDS` / `TRIGGER.IDS`.
-///
-/// Separate from [`from_signatures`] because a caller holding the manager can
-/// only borrow one IDS table at a time.
-pub fn signatures(table: &IdsFile) -> Vec<Signature> {
-    table
-        .entries()
-        .iter()
-        .filter_map(|entry| {
-            let id = i32::try_from(entry.value).ok()?;
-            parse_call(id, &entry.name)
-        })
-        .collect()
-}
-
-/// Build a vocabulary from `IDS` lines, for tests in this module and in
-/// [`bcs`](crate::formats::bcs).
-#[cfg(test)]
-pub fn from_lines(actions: &[&str], triggers: &[&str]) -> Vocabulary {
-    fn read(lines: &[&str]) -> Vec<Signature> {
-        lines
-            .iter()
-            .filter_map(|line| {
-                let (id, text) = line.trim().split_once(char::is_whitespace)?;
-                parse_call(id.parse().ok()?, text.trim())
-            })
-            .collect()
-    }
-    from_signatures(read(actions), read(triggers))
-}
-
-/// Assemble both tables into the vocabulary, indexing calls by id for
-/// decompiling and by name for the DLG scan.
-pub fn from_signatures(actions: Vec<Signature>, triggers: Vec<Signature>) -> Vocabulary {
-    let mut vocabulary = Vocabulary::default();
-    for (by_id, by_name, table) in [
-        (
-            &mut vocabulary.actions,
-            &mut vocabulary.action_by_name,
-            actions,
-        ),
-        (
-            &mut vocabulary.triggers,
-            &mut vocabulary.trigger_by_name,
-            triggers,
-        ),
-    ] {
-        for signature in table {
-            let name = signature.name.to_ascii_lowercase();
-            // First definition wins, as when a name appears in both tables.
-            by_name.entry(name).or_insert_with(|| signature.clone());
-            by_id.entry(signature.id).or_default().push(signature);
-        }
-    }
-    vocabulary
-}
-
-/// Split `12 CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)`'s call text
-/// into its name and typed parameters. `None` when the text is not a call.
-fn parse_call(id: i32, text: &str) -> Option<Signature> {
-    let (name, rest) = text.split_once('(')?;
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    let args = rest.strip_suffix(')').unwrap_or(rest);
-
-    let params = args
-        .split(',')
-        .filter(|p| !p.trim().is_empty())
-        .filter_map(|p| {
-            let p = p.trim();
-            let (class, tail) = p.split_once(':')?;
-            let class = match class.trim() {
-                "S" => Class::String,
-                "I" => Class::Int,
-                "O" => Class::Object,
-                "P" => Class::Point,
-                "A" => Class::Action,
-                _ => return None,
-            };
-            // `Name*Table`: the text after the asterisk names an IDS table, and
-            // only integer parameters have one.
-            let (name, ids) = tail.split_once('*').unwrap_or((tail, ""));
-            let ids = (!ids.is_empty() && class == Class::Int).then(|| ids.to_string());
-            Some(Param {
-                class,
-                name: name.to_string(),
-                ids,
-            })
-        })
-        .collect();
-
-    Some(Signature {
-        id,
-        name: name.to_string(),
-        params,
-    })
-}
-
-/// Whether a call's scope parameter shares its variable's string slot, stored
-/// as a six-character prefix on the name.
-///
-/// IESDP says the only reliable way to know is to hardcode the calls that do
-/// it, and it is right: the signatures give no clue. `Global(S:Name*,S:Area*)`
-/// packs both into one slot while `GlobalTimerNotExpired(S:Name*,S:Area*)`
-/// keeps them apart, and the two readings of id 446 disagree with each other.
-/// This list was derived by compiling one probe per candidate call with WeiDU
-/// and reading back which slots it filled.
-pub fn is_scope_param(call: &str, param: &str) -> bool {
-    const CONCATENATING: [&str; 16] = [
-        "createcreatureatlocation",
-        "createitemglobal",
-        "global",
-        "globalgt",
-        "globallt",
-        "incrementglobal",
-        "incrementglobalonce",
-        "movetosavedlocation",
-        "movetosavedlocationn",
-        "realsetglobaltimer",
-        "setglobal",
-        "setglobalrandom",
-        "setglobalrandomplus",
-        "setglobaltimer",
-        "setglobaltimerrandom",
-        "settokenglobal",
-    ];
-    is_scope_name(param) && CONCATENATING.iter().any(|c| call.eq_ignore_ascii_case(c))
-}
-
-/// Parameter names that hold a variable's scope rather than a resource.
-fn is_scope_name(param: &str) -> bool {
-    matches!(
-        param.to_ascii_lowercase().as_str(),
-        "area" | "area1" | "area2" | "scope"
-    )
-}
-
-/// The signature chosen to name a record, and whether it accounts for every
-/// slot the record fills. A false [`covered`](Naming::covered) means the record
-/// carries data the call has no parameter for — junk the compiler left behind —
-/// which the caller preserves rather than dropping.
-#[derive(Clone, Copy, Debug)]
-pub struct Naming<'a> {
-    pub signature: &'a Signature,
-    pub covered: bool,
-}
-
-/// The slots a compiled action fills. Slot 0 of the objects is the
-/// `ActionOverride` actor, never an argument.
-fn action_slots(action: &bcs::Action) -> Slots {
-    Slots {
-        ints: highest(&action.ints, |&v| v != 0),
-        strings: highest(&action.strings, |s| !s.is_empty()),
-        objects: highest(&action.objects[1..], |o| !o.is_empty()),
-        point: action.point != (0, 0),
-    }
-}
-
-/// The slots a compiled trigger fills.
-fn trigger_slots(trigger: &bcs::Trigger) -> Slots {
-    Slots {
-        ints: highest(&trigger.ints, |&v| v != 0),
-        strings: highest(&trigger.strings, |s| !s.is_empty()),
-        objects: usize::from(!trigger.object.is_empty()),
-        point: false,
-    }
-}
-
-/// Pick the signature to print for a record, by its string-slot count.
-///
-/// Only strings discriminate: an unread integer slot holds a zero either way
-/// (`StartCutSceneEx("cut212a",FALSE)` takes the spare when offered), but a call
-/// declaring a string the record never filled would name nothing. When none
-/// matches, the record is padding (`ForceRandomEncounterEntry("","")`) and the
-/// last reading wins — as on any tie, since `8 Dialogue`/`8 Dialog` are one call
-/// under two names and WeiDU prints the later.
-///
-/// Chooses even when no reading fully fits; [`Naming::covered`] reports the
-/// shortfall. Fitted to the colliding ids, checked against the whole install.
-fn select<'a>(candidates: &'a [Signature], used: &Slots) -> Option<&'a Signature> {
-    candidates
-        .iter()
-        .rev()
-        .find(|signature| signature.slots().strings == used.strings)
-        .or_else(|| candidates.iter().next_back())
 }
 
 impl Vocabulary {
@@ -486,6 +207,314 @@ impl Vocabulary {
     }
 }
 
+/// One `ACTION.IDS` / `TRIGGER.IDS` call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature {
+    pub id: i32,
+    pub name: String,
+    pub params: Vec<Param>,
+}
+
+impl Signature {
+    /// The slots this call occupies. A scope parameter shares its predecessor's
+    /// string slot: `Global(S:Name*,S:Area*,…)` stores one string, the scope
+    /// prefixed to the name.
+    pub fn slots(&self) -> Slots {
+        let mut slots = Slots::default();
+        for param in &self.params {
+            match param.class {
+                Class::Int => slots.ints += 1,
+                Class::Object => slots.objects += 1,
+                Class::Point => slots.point = true,
+                Class::Action => {}
+                Class::String => {
+                    if !(slots.strings > 0 && is_scope_param(&self.name, &param.name)) {
+                        slots.strings += 1;
+                    }
+                }
+            }
+        }
+        slots
+    }
+}
+
+/// One declared parameter of a call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Param {
+    pub class: Class,
+    pub name: String,
+    /// The IDS table an integer argument draws its symbols from, when the
+    /// signature names one (`I:Spell*Spell` -> `SPELL.IDS`).
+    pub ids: Option<String>,
+}
+
+/// Which record slot class a parameter occupies. A call's arguments are not
+/// stored in declaration order: each class fills its own slots in order, so
+/// `CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)` puts its integer in
+/// the first integer slot even though it is declared last.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Class {
+    String,
+    Int,
+    Object,
+    Point,
+    /// Only `ActionOverride(O:Actor*,A:Action*)`, which the engine never
+    /// stores: the actor goes in the call's own object slot 0.
+    Action,
+}
+
+/// How many slots of each class a signature occupies. Slots fill from zero, so
+/// a count is enough to say which are in use.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Slots {
+    pub ints: usize,
+    pub strings: usize,
+    /// Object slots the call itself uses, ignoring the `ActionOverride` slot.
+    pub objects: usize,
+    pub point: bool,
+}
+
+impl Slots {
+    /// Whether a signature covering `self` can account for a record occupying
+    /// `used` — every slot the record fills must be one the call reads.
+    fn covers(&self, used: &Slots) -> bool {
+        self.ints >= used.ints
+            && self.strings >= used.strings
+            && self.objects >= used.objects
+            && (self.point || !used.point)
+    }
+}
+
+/// What a script call's string argument names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArgKind {
+    /// A resource of this type.
+    Resource(u16),
+    /// A variable, scope, token or death variable — never a reference.
+    Variable,
+    /// No opinion: the call is unlisted, or its parameter is a generic
+    /// `S:ResRef*` whose meaning depends on the call.
+    Unknown,
+}
+
+/// The signature chosen to name a record, and whether it accounts for every
+/// slot the record fills. A false [`covered`](Naming::covered) means the record
+/// carries data the call has no parameter for — junk the compiler left behind —
+/// which the caller preserves rather than dropping.
+#[derive(Clone, Copy, Debug)]
+pub struct Naming<'a> {
+    pub signature: &'a Signature,
+    pub covered: bool,
+}
+
+/// Something a compiled call's argument names, tagged with the parameter it
+/// came from (for the search path).
+pub enum Arg<'a> {
+    /// A resource of a given type. The resref usually borrows from the record,
+    /// but a spell named by number is computed and so owns.
+    Resource {
+        kind: u16,
+        resref: Cow<'a, str>,
+        param: String,
+    },
+    /// A dialog string, by its `dialog.tlk` index.
+    Strref { value: u32, param: String },
+}
+
+/// Read one table's calls from the install's own `ACTION.IDS` / `TRIGGER.IDS`.
+///
+/// Separate from [`from_signatures`] because a caller holding the manager can
+/// only borrow one IDS table at a time.
+pub fn signatures(table: &IdsFile) -> Vec<Signature> {
+    table
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let id = i32::try_from(entry.value).ok()?;
+            parse_call(id, &entry.name)
+        })
+        .collect()
+}
+
+/// Assemble both tables into the vocabulary, indexing calls by id for
+/// decompiling and by name for the DLG scan.
+pub fn from_signatures(actions: Vec<Signature>, triggers: Vec<Signature>) -> Vocabulary {
+    let mut vocabulary = Vocabulary::default();
+    for (by_id, by_name, table) in [
+        (
+            &mut vocabulary.actions,
+            &mut vocabulary.action_by_name,
+            actions,
+        ),
+        (
+            &mut vocabulary.triggers,
+            &mut vocabulary.trigger_by_name,
+            triggers,
+        ),
+    ] {
+        for signature in table {
+            let name = signature.name.to_ascii_lowercase();
+            // First definition wins, as when a name appears in both tables.
+            by_name.entry(name).or_insert_with(|| signature.clone());
+            by_id.entry(signature.id).or_default().push(signature);
+        }
+    }
+    vocabulary
+}
+
+/// Build a vocabulary from `IDS` lines, for tests in this module and in
+/// [`bcs`](crate::formats::bcs).
+#[cfg(test)]
+pub fn from_lines(actions: &[&str], triggers: &[&str]) -> Vocabulary {
+    fn read(lines: &[&str]) -> Vec<Signature> {
+        lines
+            .iter()
+            .filter_map(|line| {
+                let (id, text) = line.trim().split_once(char::is_whitespace)?;
+                parse_call(id.parse().ok()?, text.trim())
+            })
+            .collect()
+    }
+    from_signatures(read(actions), read(triggers))
+}
+
+/// Whether a call's scope parameter shares its variable's string slot, stored
+/// as a six-character prefix on the name.
+///
+/// IESDP says the only reliable way to know is to hardcode the calls that do
+/// it, and it is right: the signatures give no clue. `Global(S:Name*,S:Area*)`
+/// packs both into one slot while `GlobalTimerNotExpired(S:Name*,S:Area*)`
+/// keeps them apart, and the two readings of id 446 disagree with each other.
+/// This list was derived by compiling one probe per candidate call with WeiDU
+/// and reading back which slots it filled.
+pub fn is_scope_param(call: &str, param: &str) -> bool {
+    const CONCATENATING: [&str; 16] = [
+        "createcreatureatlocation",
+        "createitemglobal",
+        "global",
+        "globalgt",
+        "globallt",
+        "incrementglobal",
+        "incrementglobalonce",
+        "movetosavedlocation",
+        "movetosavedlocationn",
+        "realsetglobaltimer",
+        "setglobal",
+        "setglobalrandom",
+        "setglobalrandomplus",
+        "setglobaltimer",
+        "setglobaltimerrandom",
+        "settokenglobal",
+    ];
+    is_scope_name(param) && CONCATENATING.iter().any(|c| call.eq_ignore_ascii_case(c))
+}
+
+/// The `.spl` resref a `SPELL.IDS` number names, by the filename convention: a
+/// four-digit `T·NNN` where `T` selects the prefix — priest, wizard, innate,
+/// class — and `NNN` is the file's numeric suffix (`2001` -> `SPWI001`). `None`
+/// for a number outside the scheme.
+pub fn spell_resref(number: i32) -> Option<String> {
+    let prefix = match number / 1000 {
+        1 => "SPPR",
+        2 => "SPWI",
+        3 => "SPIN",
+        4 => "SPCL",
+        _ => return None,
+    };
+    Some(format!("{prefix}{:03}", number % 1000))
+}
+
+/// Split `12 CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)`'s call text
+/// into its name and typed parameters. `None` when the text is not a call.
+fn parse_call(id: i32, text: &str) -> Option<Signature> {
+    let (name, rest) = text.split_once('(')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let args = rest.strip_suffix(')').unwrap_or(rest);
+
+    let params = args
+        .split(',')
+        .filter(|p| !p.trim().is_empty())
+        .filter_map(|p| {
+            let p = p.trim();
+            let (class, tail) = p.split_once(':')?;
+            let class = match class.trim() {
+                "S" => Class::String,
+                "I" => Class::Int,
+                "O" => Class::Object,
+                "P" => Class::Point,
+                "A" => Class::Action,
+                _ => return None,
+            };
+            // `Name*Table`: the text after the asterisk names an IDS table, and
+            // only integer parameters have one.
+            let (name, ids) = tail.split_once('*').unwrap_or((tail, ""));
+            let ids = (!ids.is_empty() && class == Class::Int).then(|| ids.to_string());
+            Some(Param {
+                class,
+                name: name.to_string(),
+                ids,
+            })
+        })
+        .collect();
+
+    Some(Signature {
+        id,
+        name: name.to_string(),
+        params,
+    })
+}
+
+/// Parameter names that hold a variable's scope rather than a resource.
+fn is_scope_name(param: &str) -> bool {
+    matches!(
+        param.to_ascii_lowercase().as_str(),
+        "area" | "area1" | "area2" | "scope"
+    )
+}
+
+/// The slots a compiled action fills. Slot 0 of the objects is the
+/// `ActionOverride` actor, never an argument.
+fn action_slots(action: &bcs::Action) -> Slots {
+    Slots {
+        ints: highest(&action.ints, |&v| v != 0),
+        strings: highest(&action.strings, |s| !s.is_empty()),
+        objects: highest(&action.objects[1..], |o| !o.is_empty()),
+        point: action.point != (0, 0),
+    }
+}
+
+/// The slots a compiled trigger fills.
+fn trigger_slots(trigger: &bcs::Trigger) -> Slots {
+    Slots {
+        ints: highest(&trigger.ints, |&v| v != 0),
+        strings: highest(&trigger.strings, |s| !s.is_empty()),
+        objects: usize::from(!trigger.object.is_empty()),
+        point: false,
+    }
+}
+
+/// Pick the signature to print for a record, by its string-slot count.
+///
+/// Only strings discriminate: an unread integer slot holds a zero either way
+/// (`StartCutSceneEx("cut212a",FALSE)` takes the spare when offered), but a call
+/// declaring a string the record never filled would name nothing. When none
+/// matches, the record is padding (`ForceRandomEncounterEntry("","")`) and the
+/// last reading wins — as on any tie, since `8 Dialogue`/`8 Dialog` are one call
+/// under two names and WeiDU prints the later.
+///
+/// Chooses even when no reading fully fits; [`Naming::covered`] reports the
+/// shortfall. Fitted to the colliding ids, checked against the whole install.
+fn select<'a>(candidates: &'a [Signature], used: &Slots) -> Option<&'a Signature> {
+    candidates
+        .iter()
+        .rev()
+        .find(|signature| signature.slots().strings == used.strings)
+        .or_else(|| candidates.iter().next_back())
+}
+
 /// What each argument of a call names. Positions count *every* parameter, since
 /// the curated typing is indexed by declaration order.
 fn arg_kinds(signature: &Signature) -> Vec<ArgKind> {
@@ -517,20 +546,6 @@ fn arg_kinds(signature: &Signature) -> Vec<ArgKind> {
             param_kind(&param.name)
         })
         .collect()
-}
-
-/// Something a compiled call's argument names, tagged with the parameter it
-/// came from (for the search path).
-pub enum Arg<'a> {
-    /// A resource of a given type. The resref usually borrows from the record,
-    /// but a spell named by number is computed and so owns.
-    Resource {
-        kind: u16,
-        resref: Cow<'a, str>,
-        param: String,
-    },
-    /// A dialog string, by its `dialog.tlk` index.
-    Strref { value: u32, param: String },
 }
 
 /// What a call's arguments name. Walks the signature the way the renderer does
@@ -608,21 +623,6 @@ fn call_args<'a>(signature: &Signature, ints: &[i32], strings: &'a [String]) -> 
 /// journal strref differently.
 fn is_strref_param(name: &str) -> bool {
     name.eq_ignore_ascii_case("strref") || name.eq_ignore_ascii_case("entry")
-}
-
-/// The `.spl` resref a `SPELL.IDS` number names, by the filename convention: a
-/// four-digit `T·NNN` where `T` selects the prefix — priest, wizard, innate,
-/// class — and `NNN` is the file's numeric suffix (`2001` -> `SPWI001`). `None`
-/// for a number outside the scheme.
-pub fn spell_resref(number: i32) -> Option<String> {
-    let prefix = match number / 1000 {
-        1 => "SPPR",
-        2 => "SPWI",
-        3 => "SPIN",
-        4 => "SPCL",
-        _ => return None,
-    };
-    Some(format!("{prefix}{:03}", number % 1000))
 }
 
 /// One past the last slot holding something other than its default. Slots fill

@@ -32,255 +32,6 @@ const TRAVEL_BASE: usize = 0x100;
 /// Base of the area struct (present for area projectiles only).
 const AREA_BASE: usize = 0x200;
 
-/// Anything that can go wrong while parsing a PRO file.
-#[derive(Debug)]
-pub enum ProError {
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
-}
-
-impl fmt::Display for ProError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProError::Truncated(e) => write!(f, "{e}"),
-            ProError::BadSignature(found) => {
-                write!(f, "not a PRO file: signature was {}", describe_tag(found))
-            }
-            ProError::BadVersion(found) => {
-                write!(f, "unsupported PRO version: {}", describe_tag(found))
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ProError::Truncated(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<Truncated> for ProError {
-    fn from(e: Truncated) -> Self {
-        ProError::Truncated(e)
-    }
-}
-
-/// The 256-byte base header, present in every PRO. The PSTEE-only angle/curve/
-/// THAC0/radius fields are retained verbatim for the raw view but skipped in the
-/// human view, since they are inert in BG2:EE.
-struct ProHeader {
-    projectile_type: u16,
-    speed: u16,
-    behaviour_flags: u32,
-    fire_sound: String,
-    impact_sound: String,
-    source_animation: String,
-    particle_color: u16,
-    width: u16,
-    ext_flags: u32,
-    message: u32,
-    pulse_color: u32,
-    color_speed: u16,
-    screen_shake: u16,
-    creature_value_1: u16,
-    creature_type_1: u16,
-    creature_value_2: u16,
-    creature_type_2: u16,
-    default_spell: String,
-    success_spell: String,
-    angle_increase_min: u16,
-    angle_increase_max: u16,
-    curve_min: u16,
-    curve_max: u16,
-    thac0_bonus: u16,
-    thac0_bonus_nonactor: u16,
-    radius_min: u16,
-    radius_max: u16,
-}
-
-impl ProHeader {
-    fn parse(reader: &Reader) -> Result<ProHeader, Truncated> {
-        Ok(ProHeader {
-            projectile_type: reader.u16_at(0x08, "projectile type")?,
-            speed: reader.u16_at(0x0a, "speed")?,
-            behaviour_flags: reader.u32_at(0x0c, "behaviour flags")?,
-            fire_sound: reader.resref_at(0x10, "fire sound")?,
-            impact_sound: reader.resref_at(0x18, "impact sound")?,
-            source_animation: reader.resref_at(0x20, "source animation")?,
-            particle_color: reader.u16_at(0x28, "particle color")?,
-            width: reader.u16_at(0x2a, "width")?,
-            ext_flags: reader.u32_at(0x2c, "extended flags")?,
-            message: reader.u32_at(0x30, "displayed message")?,
-            pulse_color: reader.u32_at(0x34, "pulse color")?,
-            color_speed: reader.u16_at(0x38, "color speed")?,
-            screen_shake: reader.u16_at(0x3a, "screen shake")?,
-            creature_value_1: reader.u16_at(0x3c, "creature value 1")?,
-            creature_type_1: reader.u16_at(0x3e, "creature type 1")?,
-            creature_value_2: reader.u16_at(0x40, "creature value 2")?,
-            creature_type_2: reader.u16_at(0x42, "creature type 2")?,
-            default_spell: reader.resref_at(0x44, "default spell")?,
-            success_spell: reader.resref_at(0x4c, "success spell")?,
-            angle_increase_min: reader.u16_at(0x54, "angle increase min")?,
-            angle_increase_max: reader.u16_at(0x56, "angle increase max")?,
-            curve_min: reader.u16_at(0x58, "curve min")?,
-            curve_max: reader.u16_at(0x5a, "curve max")?,
-            thac0_bonus: reader.u16_at(0x5c, "thac0 bonus")?,
-            thac0_bonus_nonactor: reader.u16_at(0x5e, "thac0 bonus (non-actor)")?,
-            radius_min: reader.u16_at(0x60, "radius min")?,
-            radius_max: reader.u16_at(0x62, "radius max")?,
-        })
-    }
-}
-
-/// The 256-byte travel struct: the moving projectile's BAM graphics, lighting,
-/// trailing animations, and smoke.
-struct ProTravel {
-    bam_flags: u32,
-    projectile_animation: String,
-    shadow_animation: String,
-    projectile_number: u8,
-    shadow_number: u8,
-    light_spot_intensity: u16,
-    light_spot_width: u16,
-    light_spot_height: u16,
-    palette: String,
-    projectile_colors: [u8; 7],
-    smoke_puff_delay: u8,
-    smoke_colors: [u8; 7],
-    face_target: u8,
-    smoke_animation: u16,
-    trailing_animation: [String; 3],
-    trailing_number: [u16; 3],
-    puff_flags: u32,
-    /// Smoke animation name, resolved by the manager from `animate.ids`.
-    smoke_animation_name: Option<String>,
-}
-
-impl ProTravel {
-    fn parse(reader: &Reader) -> Result<ProTravel, Truncated> {
-        let b = TRAVEL_BASE;
-        Ok(ProTravel {
-            bam_flags: reader.u32_at(b, "bam flags")?,
-            projectile_animation: reader.resref_at(b + 0x04, "projectile animation")?,
-            shadow_animation: reader.resref_at(b + 0x0c, "shadow animation")?,
-            projectile_number: reader.u8_at(b + 0x14, "projectile number")?,
-            shadow_number: reader.u8_at(b + 0x15, "shadow number")?,
-            light_spot_intensity: reader.u16_at(b + 0x16, "light spot intensity")?,
-            light_spot_width: reader.u16_at(b + 0x18, "light spot width")?,
-            light_spot_height: reader.u16_at(b + 0x1a, "light spot height")?,
-            palette: reader.resref_at(b + 0x1c, "palette")?,
-            projectile_colors: reader.array_at(b + 0x24, "projectile colors")?,
-            smoke_puff_delay: reader.u8_at(b + 0x2b, "smoke puff delay")?,
-            smoke_colors: reader.array_at(b + 0x2c, "smoke colors")?,
-            face_target: reader.u8_at(b + 0x33, "face target granularity")?,
-            smoke_animation: reader.u16_at(b + 0x34, "smoke animation")?,
-            trailing_animation: [
-                reader.resref_at(b + 0x36, "trailing animation 1")?,
-                reader.resref_at(b + 0x3e, "trailing animation 2")?,
-                reader.resref_at(b + 0x46, "trailing animation 3")?,
-            ],
-            trailing_number: [
-                reader.u16_at(b + 0x4e, "trailing number 1")?,
-                reader.u16_at(b + 0x50, "trailing number 2")?,
-                reader.u16_at(b + 0x52, "trailing number 3")?,
-            ],
-            puff_flags: reader.u32_at(b + 0x54, "puff flags")?,
-            smoke_animation_name: None,
-        })
-    }
-}
-
-/// The numeric codes an area projectile carries that the manager resolves
-/// against IDS tables.
-#[derive(Clone, Copy)]
-pub struct AreaCodes {
-    pub fragment_animation: u16,
-    pub secondary_projectile: u16,
-    pub explosion_projectile: u16,
-    pub explosion_effect: u8,
-}
-
-/// The 256-byte area struct: the explosion's extent, sound, secondary/explosion
-/// projectiles, and ring/spread animations.
-struct ProArea {
-    area_flags: u16,
-    ray_count: u16,
-    trap_size: u16,
-    explosion_size: u16,
-    explosion_sound: String,
-    explosion_frequency: u16,
-    fragment_animation: u16,
-    secondary_projectile: u16,
-    repetitions: u8,
-    explosion_effect: u8,
-    explosion_color: u8,
-    explosion_projectile: u16,
-    explosion_animation: String,
-    cone_width: u16,
-    rotate_rays: u16,
-    spread_animation: String,
-    ring_animation: String,
-    area_sound: String,
-    area_ext_flags: u32,
-    dice_count: u16,
-    dice_size: u16,
-    anim_granularity: u16,
-    anim_granularity_divider: u16,
-    /// Names resolved by the manager (animate.ids, projectl.ids, fireball.ids).
-    fragment_animation_name: Option<String>,
-    secondary_projectile_name: Option<String>,
-    explosion_projectile_name: Option<String>,
-    explosion_effect_name: Option<String>,
-}
-
-impl ProArea {
-    fn parse(reader: &Reader) -> Result<ProArea, Truncated> {
-        let b = AREA_BASE;
-        Ok(ProArea {
-            area_flags: reader.u16_at(b, "area flags")?,
-            ray_count: reader.u16_at(b + 0x02, "ray count")?,
-            trap_size: reader.u16_at(b + 0x04, "trap size")?,
-            explosion_size: reader.u16_at(b + 0x06, "explosion size")?,
-            explosion_sound: reader.resref_at(b + 0x08, "explosion sound")?,
-            explosion_frequency: reader.u16_at(b + 0x10, "explosion frequency")?,
-            fragment_animation: reader.u16_at(b + 0x12, "fragment animation")?,
-            secondary_projectile: reader.u16_at(b + 0x14, "secondary projectile")?,
-            repetitions: reader.u8_at(b + 0x16, "repetitions")?,
-            explosion_effect: reader.u8_at(b + 0x17, "explosion effect")?,
-            explosion_color: reader.u8_at(b + 0x18, "explosion color")?,
-            explosion_projectile: reader.u16_at(b + 0x1a, "explosion projectile")?,
-            explosion_animation: reader.resref_at(b + 0x1c, "explosion animation")?,
-            cone_width: reader.u16_at(b + 0x24, "cone width")?,
-            rotate_rays: reader.u16_at(b + 0x26, "rotate rays")?,
-            spread_animation: reader.resref_at(b + 0x28, "spread animation")?,
-            ring_animation: reader.resref_at(b + 0x30, "ring animation")?,
-            area_sound: reader.resref_at(b + 0x38, "area sound")?,
-            area_ext_flags: reader.u32_at(b + 0x40, "area extended flags")?,
-            dice_count: reader.u16_at(b + 0x44, "dice count")?,
-            dice_size: reader.u16_at(b + 0x46, "dice size")?,
-            anim_granularity: reader.u16_at(b + 0x48, "animation granularity")?,
-            anim_granularity_divider: reader.u16_at(b + 0x4a, "animation granularity divider")?,
-            fragment_animation_name: None,
-            secondary_projectile_name: None,
-            explosion_projectile_name: None,
-            explosion_effect_name: None,
-        })
-    }
-
-    fn codes(&self) -> AreaCodes {
-        AreaCodes {
-            fragment_animation: self.fragment_animation,
-            secondary_projectile: self.secondary_projectile,
-            explosion_projectile: self.explosion_projectile,
-            explosion_effect: self.explosion_effect,
-        }
-    }
-}
-
 /// A parsed PRO file: the base header plus the travel/area structs that the
 /// projectile type calls for, with names the manager has resolved attached.
 pub struct Pro {
@@ -646,7 +397,130 @@ impl fmt::Display for Pro {
     }
 }
 
+/// The 256-byte base header, present in every PRO. The PSTEE-only angle/curve/
+/// THAC0/radius fields are retained verbatim for the raw view but skipped in the
+/// human view, since they are inert in BG2:EE.
+struct ProHeader {
+    projectile_type: u16,
+    speed: u16,
+    behaviour_flags: u32,
+    fire_sound: String,
+    impact_sound: String,
+    source_animation: String,
+    particle_color: u16,
+    width: u16,
+    ext_flags: u32,
+    message: u32,
+    pulse_color: u32,
+    color_speed: u16,
+    screen_shake: u16,
+    creature_value_1: u16,
+    creature_type_1: u16,
+    creature_value_2: u16,
+    creature_type_2: u16,
+    default_spell: String,
+    success_spell: String,
+    angle_increase_min: u16,
+    angle_increase_max: u16,
+    curve_min: u16,
+    curve_max: u16,
+    thac0_bonus: u16,
+    thac0_bonus_nonactor: u16,
+    radius_min: u16,
+    radius_max: u16,
+}
+
+impl ProHeader {
+    fn parse(reader: &Reader) -> Result<ProHeader, Truncated> {
+        Ok(ProHeader {
+            projectile_type: reader.u16_at(0x08, "projectile type")?,
+            speed: reader.u16_at(0x0a, "speed")?,
+            behaviour_flags: reader.u32_at(0x0c, "behaviour flags")?,
+            fire_sound: reader.resref_at(0x10, "fire sound")?,
+            impact_sound: reader.resref_at(0x18, "impact sound")?,
+            source_animation: reader.resref_at(0x20, "source animation")?,
+            particle_color: reader.u16_at(0x28, "particle color")?,
+            width: reader.u16_at(0x2a, "width")?,
+            ext_flags: reader.u32_at(0x2c, "extended flags")?,
+            message: reader.u32_at(0x30, "displayed message")?,
+            pulse_color: reader.u32_at(0x34, "pulse color")?,
+            color_speed: reader.u16_at(0x38, "color speed")?,
+            screen_shake: reader.u16_at(0x3a, "screen shake")?,
+            creature_value_1: reader.u16_at(0x3c, "creature value 1")?,
+            creature_type_1: reader.u16_at(0x3e, "creature type 1")?,
+            creature_value_2: reader.u16_at(0x40, "creature value 2")?,
+            creature_type_2: reader.u16_at(0x42, "creature type 2")?,
+            default_spell: reader.resref_at(0x44, "default spell")?,
+            success_spell: reader.resref_at(0x4c, "success spell")?,
+            angle_increase_min: reader.u16_at(0x54, "angle increase min")?,
+            angle_increase_max: reader.u16_at(0x56, "angle increase max")?,
+            curve_min: reader.u16_at(0x58, "curve min")?,
+            curve_max: reader.u16_at(0x5a, "curve max")?,
+            thac0_bonus: reader.u16_at(0x5c, "thac0 bonus")?,
+            thac0_bonus_nonactor: reader.u16_at(0x5e, "thac0 bonus (non-actor)")?,
+            radius_min: reader.u16_at(0x60, "radius min")?,
+            radius_max: reader.u16_at(0x62, "radius max")?,
+        })
+    }
+}
+
+/// The 256-byte travel struct: the moving projectile's BAM graphics, lighting,
+/// trailing animations, and smoke.
+struct ProTravel {
+    bam_flags: u32,
+    projectile_animation: String,
+    shadow_animation: String,
+    projectile_number: u8,
+    shadow_number: u8,
+    light_spot_intensity: u16,
+    light_spot_width: u16,
+    light_spot_height: u16,
+    palette: String,
+    projectile_colors: [u8; 7],
+    smoke_puff_delay: u8,
+    smoke_colors: [u8; 7],
+    face_target: u8,
+    smoke_animation: u16,
+    trailing_animation: [String; 3],
+    trailing_number: [u16; 3],
+    puff_flags: u32,
+    /// Smoke animation name, resolved by the manager from `animate.ids`.
+    smoke_animation_name: Option<String>,
+}
+
 impl ProTravel {
+    fn parse(reader: &Reader) -> Result<ProTravel, Truncated> {
+        let b = TRAVEL_BASE;
+        Ok(ProTravel {
+            bam_flags: reader.u32_at(b, "bam flags")?,
+            projectile_animation: reader.resref_at(b + 0x04, "projectile animation")?,
+            shadow_animation: reader.resref_at(b + 0x0c, "shadow animation")?,
+            projectile_number: reader.u8_at(b + 0x14, "projectile number")?,
+            shadow_number: reader.u8_at(b + 0x15, "shadow number")?,
+            light_spot_intensity: reader.u16_at(b + 0x16, "light spot intensity")?,
+            light_spot_width: reader.u16_at(b + 0x18, "light spot width")?,
+            light_spot_height: reader.u16_at(b + 0x1a, "light spot height")?,
+            palette: reader.resref_at(b + 0x1c, "palette")?,
+            projectile_colors: reader.array_at(b + 0x24, "projectile colors")?,
+            smoke_puff_delay: reader.u8_at(b + 0x2b, "smoke puff delay")?,
+            smoke_colors: reader.array_at(b + 0x2c, "smoke colors")?,
+            face_target: reader.u8_at(b + 0x33, "face target granularity")?,
+            smoke_animation: reader.u16_at(b + 0x34, "smoke animation")?,
+            trailing_animation: [
+                reader.resref_at(b + 0x36, "trailing animation 1")?,
+                reader.resref_at(b + 0x3e, "trailing animation 2")?,
+                reader.resref_at(b + 0x46, "trailing animation 3")?,
+            ],
+            trailing_number: [
+                reader.u16_at(b + 0x4e, "trailing number 1")?,
+                reader.u16_at(b + 0x50, "trailing number 2")?,
+                reader.u16_at(b + 0x52, "trailing number 3")?,
+            ],
+            puff_flags: reader.u32_at(b + 0x54, "puff flags")?,
+            smoke_animation_name: None,
+        })
+    }
+
     fn write_human(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.bam_flags != 0 {
             write_bitfield(
@@ -705,7 +579,92 @@ impl ProTravel {
     }
 }
 
+/// The numeric codes an area projectile carries that the manager resolves
+/// against IDS tables.
+#[derive(Clone, Copy)]
+pub struct AreaCodes {
+    pub fragment_animation: u16,
+    pub secondary_projectile: u16,
+    pub explosion_projectile: u16,
+    pub explosion_effect: u8,
+}
+
+/// The 256-byte area struct: the explosion's extent, sound, secondary/explosion
+/// projectiles, and ring/spread animations.
+struct ProArea {
+    area_flags: u16,
+    ray_count: u16,
+    trap_size: u16,
+    explosion_size: u16,
+    explosion_sound: String,
+    explosion_frequency: u16,
+    fragment_animation: u16,
+    secondary_projectile: u16,
+    repetitions: u8,
+    explosion_effect: u8,
+    explosion_color: u8,
+    explosion_projectile: u16,
+    explosion_animation: String,
+    cone_width: u16,
+    rotate_rays: u16,
+    spread_animation: String,
+    ring_animation: String,
+    area_sound: String,
+    area_ext_flags: u32,
+    dice_count: u16,
+    dice_size: u16,
+    anim_granularity: u16,
+    anim_granularity_divider: u16,
+    /// Names resolved by the manager (animate.ids, projectl.ids, fireball.ids).
+    fragment_animation_name: Option<String>,
+    secondary_projectile_name: Option<String>,
+    explosion_projectile_name: Option<String>,
+    explosion_effect_name: Option<String>,
+}
+
 impl ProArea {
+    fn parse(reader: &Reader) -> Result<ProArea, Truncated> {
+        let b = AREA_BASE;
+        Ok(ProArea {
+            area_flags: reader.u16_at(b, "area flags")?,
+            ray_count: reader.u16_at(b + 0x02, "ray count")?,
+            trap_size: reader.u16_at(b + 0x04, "trap size")?,
+            explosion_size: reader.u16_at(b + 0x06, "explosion size")?,
+            explosion_sound: reader.resref_at(b + 0x08, "explosion sound")?,
+            explosion_frequency: reader.u16_at(b + 0x10, "explosion frequency")?,
+            fragment_animation: reader.u16_at(b + 0x12, "fragment animation")?,
+            secondary_projectile: reader.u16_at(b + 0x14, "secondary projectile")?,
+            repetitions: reader.u8_at(b + 0x16, "repetitions")?,
+            explosion_effect: reader.u8_at(b + 0x17, "explosion effect")?,
+            explosion_color: reader.u8_at(b + 0x18, "explosion color")?,
+            explosion_projectile: reader.u16_at(b + 0x1a, "explosion projectile")?,
+            explosion_animation: reader.resref_at(b + 0x1c, "explosion animation")?,
+            cone_width: reader.u16_at(b + 0x24, "cone width")?,
+            rotate_rays: reader.u16_at(b + 0x26, "rotate rays")?,
+            spread_animation: reader.resref_at(b + 0x28, "spread animation")?,
+            ring_animation: reader.resref_at(b + 0x30, "ring animation")?,
+            area_sound: reader.resref_at(b + 0x38, "area sound")?,
+            area_ext_flags: reader.u32_at(b + 0x40, "area extended flags")?,
+            dice_count: reader.u16_at(b + 0x44, "dice count")?,
+            dice_size: reader.u16_at(b + 0x46, "dice size")?,
+            anim_granularity: reader.u16_at(b + 0x48, "animation granularity")?,
+            anim_granularity_divider: reader.u16_at(b + 0x4a, "animation granularity divider")?,
+            fragment_animation_name: None,
+            secondary_projectile_name: None,
+            explosion_projectile_name: None,
+            explosion_effect_name: None,
+        })
+    }
+
+    fn codes(&self) -> AreaCodes {
+        AreaCodes {
+            fragment_animation: self.fragment_animation,
+            secondary_projectile: self.secondary_projectile,
+            explosion_projectile: self.explosion_projectile,
+            explosion_effect: self.explosion_effect,
+        }
+    }
+
     fn write_human(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.area_flags != 0 {
             write_bitfield(
@@ -786,6 +745,43 @@ impl ProArea {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Anything that can go wrong while parsing a PRO file.
+#[derive(Debug)]
+pub enum ProError {
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
+}
+
+impl fmt::Display for ProError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProError::Truncated(e) => write!(f, "{e}"),
+            ProError::BadSignature(found) => {
+                write!(f, "not a PRO file: signature was {}", describe_tag(found))
+            }
+            ProError::BadVersion(found) => {
+                write!(f, "unsupported PRO version: {}", describe_tag(found))
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ProError::Truncated(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Truncated> for ProError {
+    fn from(e: Truncated) -> Self {
+        ProError::Truncated(e)
     }
 }
 

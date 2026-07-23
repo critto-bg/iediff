@@ -36,137 +36,6 @@ const HAS_ACTION: u32 = 1 << 2;
 const TERMINATES: u32 = 1 << 3;
 const HAS_JOURNAL: u32 = 1 << 4;
 
-/// Anything that can go wrong while parsing a DLG file.
-#[derive(Debug)]
-pub enum DlgError {
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
-}
-
-impl fmt::Display for DlgError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DlgError::Truncated(e) => write!(f, "{e}"),
-            DlgError::BadSignature(found) => {
-                write!(f, "not a DLG file: signature was {}", describe_tag(found))
-            }
-            DlgError::BadVersion(found) => {
-                write!(f, "unsupported DLG version: {}", describe_tag(found))
-            }
-        }
-    }
-}
-
-impl std::error::Error for DlgError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            DlgError::Truncated(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<Truncated> for DlgError {
-    fn from(e: Truncated) -> Self {
-        DlgError::Truncated(e)
-    }
-}
-
-/// One actor line: the text spoken, the run of transitions it offers, and the
-/// state trigger that guards it (0x10 bytes).
-pub struct State {
-    response_text: u32,
-    first_transition: u32,
-    transition_count: u32,
-    /// Index into the state-trigger table, or [`NONE`].
-    trigger_index: u32,
-    /// Response text, resolved by the manager from the TLK.
-    response_label: Option<String>,
-}
-
-impl State {
-    fn parse_at(reader: &Reader, base: usize) -> Result<State, Truncated> {
-        Ok(State {
-            response_text: reader.u32_at(base, "state response text")?,
-            first_transition: reader.u32_at(base + 0x04, "state first transition")?,
-            transition_count: reader.u32_at(base + 0x08, "state transition count")?,
-            trigger_index: reader.u32_at(base + 0x0c, "state trigger index")?,
-            response_label: None,
-        })
-    }
-
-    /// The actor response strref, for the manager to resolve against the TLK.
-    pub fn strref(&self) -> u32 {
-        self.response_text
-    }
-
-    /// Attach the resolved response text.
-    pub fn set_label(&mut self, label: Option<String>) {
-        self.response_label = label;
-    }
-}
-
-/// One player reply: its text and journal strrefs (each present only when the
-/// matching flag bit is set), an optional trigger and action, and the link to
-/// the next state (0x20 bytes).
-pub struct Transition {
-    flags: u32,
-    player_text: u32,
-    journal_text: u32,
-    /// Index into the transition-trigger table (valid only with [`HAS_TRIGGER`]).
-    trigger_index: u32,
-    /// Index into the action table (valid only with [`HAS_ACTION`]).
-    action_index: u32,
-    /// DLG holding the next state (empty = this file); unused when [`TERMINATES`].
-    next_dlg: String,
-    next_state: u32,
-    /// Player text, resolved by the manager from the TLK.
-    player_label: Option<String>,
-    /// Journal text, resolved by the manager from the TLK.
-    journal_label: Option<String>,
-}
-
-impl Transition {
-    fn parse_at(reader: &Reader, base: usize) -> Result<Transition, Truncated> {
-        Ok(Transition {
-            flags: reader.u32_at(base, "transition flags")?,
-            player_text: reader.u32_at(base + 0x04, "transition player text")?,
-            journal_text: reader.u32_at(base + 0x08, "transition journal text")?,
-            trigger_index: reader.u32_at(base + 0x0c, "transition trigger index")?,
-            action_index: reader.u32_at(base + 0x10, "transition action index")?,
-            next_dlg: reader.resref_at(base + 0x14, "transition next dlg")?,
-            next_state: reader.u32_at(base + 0x1c, "transition next state")?,
-            player_label: None,
-            journal_label: None,
-        })
-    }
-
-    fn has(&self, bit: u32) -> bool {
-        self.flags & bit != 0
-    }
-
-    /// The player-text strref, present only when the text flag is set.
-    pub fn player_strref(&self) -> Option<u32> {
-        self.has(HAS_TEXT).then_some(self.player_text)
-    }
-
-    /// The journal-text strref, present only when the journal flag is set.
-    pub fn journal_strref(&self) -> Option<u32> {
-        self.has(HAS_JOURNAL).then_some(self.journal_text)
-    }
-
-    /// Attach the resolved player text.
-    pub fn set_player_label(&mut self, label: Option<String>) {
-        self.player_label = label;
-    }
-
-    /// Attach the resolved journal text.
-    pub fn set_journal_label(&mut self, label: Option<String>) {
-        self.journal_label = label;
-    }
-}
-
 /// A parsed DLG file: the states and transitions, plus the trigger and action
 /// script tables they index into.
 pub struct Dlg {
@@ -236,40 +105,6 @@ impl Dlg {
             trans_triggers,
             actions,
         })
-    }
-
-    /// Read a fixed-size record array from a header-declared section. A zero
-    /// count yields an empty vector without touching `offset`.
-    fn read_records<T>(
-        reader: &Reader,
-        offset: usize,
-        count: usize,
-        record_size: usize,
-        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
-    ) -> Result<Vec<T>, Truncated> {
-        let mut records = Vec::new();
-        for i in 0..count {
-            records.push(parse_at(reader, offset + i * record_size)?);
-        }
-        Ok(records)
-    }
-
-    /// Read a script-string table: `count` `(offset, length)` pairs, each
-    /// pointing at a run of non-NUL-terminated source text elsewhere in the file.
-    fn read_strings(
-        reader: &Reader,
-        offset: usize,
-        count: usize,
-    ) -> Result<Vec<String>, Truncated> {
-        let mut out = Vec::new();
-        for i in 0..count {
-            let base = offset + i * STRING_ENTRY_SIZE;
-            let str_off = reader.u32_at(base, "script string offset")? as usize;
-            let str_len = reader.u32_at(base + 0x04, "script string length")? as usize;
-            let bytes = reader.slice(str_off, str_len, "script string")?;
-            out.push(String::from_utf8_lossy(bytes).trim().to_string());
-        }
-        Ok(out)
     }
 
     /// The states, for the manager to resolve their response strrefs.
@@ -373,6 +208,83 @@ impl Dlg {
         out
     }
 
+    /// Write the whole dialogue as flat `key=value` lines: header flags bare,
+    /// each record under `<section>.<n>.`.
+    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
+        writeln!(out, "flags={}", self.flags)?;
+
+        for (i, s) in self.states.iter().enumerate() {
+            writeln!(out, "state.{i}.response={}", strref_raw(s.response_text))?;
+            writeln!(out, "state.{i}.first_transition={}", s.first_transition)?;
+            writeln!(out, "state.{i}.transition_count={}", s.transition_count)?;
+            writeln!(out, "state.{i}.trigger={}", strref_raw(s.trigger_index))?;
+        }
+
+        for (i, t) in self.transitions.iter().enumerate() {
+            writeln!(out, "transition.{i}.flags={}", t.flags)?;
+            writeln!(
+                out,
+                "transition.{i}.player_text={}",
+                strref_raw(t.player_text)
+            )?;
+            writeln!(out, "transition.{i}.journal={}", strref_raw(t.journal_text))?;
+            writeln!(
+                out,
+                "transition.{i}.trigger={}",
+                strref_raw(t.trigger_index)
+            )?;
+            writeln!(out, "transition.{i}.action={}", strref_raw(t.action_index))?;
+            writeln!(out, "transition.{i}.next_dlg={}", t.next_dlg)?;
+            writeln!(out, "transition.{i}.next_state={}", t.next_state)?;
+        }
+
+        for (i, s) in self.state_triggers.iter().enumerate() {
+            writeln!(out, "state_trigger.{i}={s}")?;
+        }
+        for (i, s) in self.trans_triggers.iter().enumerate() {
+            writeln!(out, "transition_trigger.{i}={s}")?;
+        }
+        for (i, s) in self.actions.iter().enumerate() {
+            writeln!(out, "action.{i}={s}")?;
+        }
+
+        Ok(())
+    }
+
+    /// Read a fixed-size record array from a header-declared section. A zero
+    /// count yields an empty vector without touching `offset`.
+    fn read_records<T>(
+        reader: &Reader,
+        offset: usize,
+        count: usize,
+        record_size: usize,
+        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
+    ) -> Result<Vec<T>, Truncated> {
+        let mut records = Vec::new();
+        for i in 0..count {
+            records.push(parse_at(reader, offset + i * record_size)?);
+        }
+        Ok(records)
+    }
+
+    /// Read a script-string table: `count` `(offset, length)` pairs, each
+    /// pointing at a run of non-NUL-terminated source text elsewhere in the file.
+    fn read_strings(
+        reader: &Reader,
+        offset: usize,
+        count: usize,
+    ) -> Result<Vec<String>, Truncated> {
+        let mut out = Vec::new();
+        for i in 0..count {
+            let base = offset + i * STRING_ENTRY_SIZE;
+            let str_off = reader.u32_at(base, "script string offset")? as usize;
+            let str_len = reader.u32_at(base + 0x04, "script string length")? as usize;
+            let bytes = reader.slice(str_off, str_len, "script string")?;
+            out.push(String::from_utf8_lossy(bytes).trim().to_string());
+        }
+        Ok(out)
+    }
+
     /// The three script tables, tagged for the path.
     fn script_tables(&self) -> [(&'static str, &Vec<String>); 3] {
         [
@@ -428,49 +340,6 @@ impl Dlg {
             .get(index as usize)
             .filter(|s| !s.is_empty())
             .map(String::as_str)
-    }
-
-    /// Write the whole dialogue as flat `key=value` lines: header flags bare,
-    /// each record under `<section>.<n>.`.
-    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
-        writeln!(out, "flags={}", self.flags)?;
-
-        for (i, s) in self.states.iter().enumerate() {
-            writeln!(out, "state.{i}.response={}", strref_raw(s.response_text))?;
-            writeln!(out, "state.{i}.first_transition={}", s.first_transition)?;
-            writeln!(out, "state.{i}.transition_count={}", s.transition_count)?;
-            writeln!(out, "state.{i}.trigger={}", strref_raw(s.trigger_index))?;
-        }
-
-        for (i, t) in self.transitions.iter().enumerate() {
-            writeln!(out, "transition.{i}.flags={}", t.flags)?;
-            writeln!(
-                out,
-                "transition.{i}.player_text={}",
-                strref_raw(t.player_text)
-            )?;
-            writeln!(out, "transition.{i}.journal={}", strref_raw(t.journal_text))?;
-            writeln!(
-                out,
-                "transition.{i}.trigger={}",
-                strref_raw(t.trigger_index)
-            )?;
-            writeln!(out, "transition.{i}.action={}", strref_raw(t.action_index))?;
-            writeln!(out, "transition.{i}.next_dlg={}", t.next_dlg)?;
-            writeln!(out, "transition.{i}.next_state={}", t.next_state)?;
-        }
-
-        for (i, s) in self.state_triggers.iter().enumerate() {
-            writeln!(out, "state_trigger.{i}={s}")?;
-        }
-        for (i, s) in self.trans_triggers.iter().enumerate() {
-            writeln!(out, "transition_trigger.{i}={s}")?;
-        }
-        for (i, s) in self.actions.iter().enumerate() {
-            writeln!(out, "action.{i}={s}")?;
-        }
-
-        Ok(())
     }
 }
 
@@ -528,6 +397,137 @@ impl fmt::Display for Dlg {
         }
 
         Ok(())
+    }
+}
+
+/// One actor line: the text spoken, the run of transitions it offers, and the
+/// state trigger that guards it (0x10 bytes).
+pub struct State {
+    response_text: u32,
+    first_transition: u32,
+    transition_count: u32,
+    /// Index into the state-trigger table, or [`NONE`].
+    trigger_index: u32,
+    /// Response text, resolved by the manager from the TLK.
+    response_label: Option<String>,
+}
+
+impl State {
+    fn parse_at(reader: &Reader, base: usize) -> Result<State, Truncated> {
+        Ok(State {
+            response_text: reader.u32_at(base, "state response text")?,
+            first_transition: reader.u32_at(base + 0x04, "state first transition")?,
+            transition_count: reader.u32_at(base + 0x08, "state transition count")?,
+            trigger_index: reader.u32_at(base + 0x0c, "state trigger index")?,
+            response_label: None,
+        })
+    }
+
+    /// The actor response strref, for the manager to resolve against the TLK.
+    pub fn strref(&self) -> u32 {
+        self.response_text
+    }
+
+    /// Attach the resolved response text.
+    pub fn set_label(&mut self, label: Option<String>) {
+        self.response_label = label;
+    }
+}
+
+/// One player reply: its text and journal strrefs (each present only when the
+/// matching flag bit is set), an optional trigger and action, and the link to
+/// the next state (0x20 bytes).
+pub struct Transition {
+    flags: u32,
+    player_text: u32,
+    journal_text: u32,
+    /// Index into the transition-trigger table (valid only with [`HAS_TRIGGER`]).
+    trigger_index: u32,
+    /// Index into the action table (valid only with [`HAS_ACTION`]).
+    action_index: u32,
+    /// DLG holding the next state (empty = this file); unused when [`TERMINATES`].
+    next_dlg: String,
+    next_state: u32,
+    /// Player text, resolved by the manager from the TLK.
+    player_label: Option<String>,
+    /// Journal text, resolved by the manager from the TLK.
+    journal_label: Option<String>,
+}
+
+impl Transition {
+    fn parse_at(reader: &Reader, base: usize) -> Result<Transition, Truncated> {
+        Ok(Transition {
+            flags: reader.u32_at(base, "transition flags")?,
+            player_text: reader.u32_at(base + 0x04, "transition player text")?,
+            journal_text: reader.u32_at(base + 0x08, "transition journal text")?,
+            trigger_index: reader.u32_at(base + 0x0c, "transition trigger index")?,
+            action_index: reader.u32_at(base + 0x10, "transition action index")?,
+            next_dlg: reader.resref_at(base + 0x14, "transition next dlg")?,
+            next_state: reader.u32_at(base + 0x1c, "transition next state")?,
+            player_label: None,
+            journal_label: None,
+        })
+    }
+
+    fn has(&self, bit: u32) -> bool {
+        self.flags & bit != 0
+    }
+
+    /// The player-text strref, present only when the text flag is set.
+    pub fn player_strref(&self) -> Option<u32> {
+        self.has(HAS_TEXT).then_some(self.player_text)
+    }
+
+    /// The journal-text strref, present only when the journal flag is set.
+    pub fn journal_strref(&self) -> Option<u32> {
+        self.has(HAS_JOURNAL).then_some(self.journal_text)
+    }
+
+    /// Attach the resolved player text.
+    pub fn set_player_label(&mut self, label: Option<String>) {
+        self.player_label = label;
+    }
+
+    /// Attach the resolved journal text.
+    pub fn set_journal_label(&mut self, label: Option<String>) {
+        self.journal_label = label;
+    }
+}
+
+/// Anything that can go wrong while parsing a DLG file.
+#[derive(Debug)]
+pub enum DlgError {
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
+}
+
+impl fmt::Display for DlgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DlgError::Truncated(e) => write!(f, "{e}"),
+            DlgError::BadSignature(found) => {
+                write!(f, "not a DLG file: signature was {}", describe_tag(found))
+            }
+            DlgError::BadVersion(found) => {
+                write!(f, "unsupported DLG version: {}", describe_tag(found))
+            }
+        }
+    }
+}
+
+impl std::error::Error for DlgError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DlgError::Truncated(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Truncated> for DlgError {
+    fn from(e: Truncated) -> Self {
+        DlgError::Truncated(e)
     }
 }
 

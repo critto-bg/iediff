@@ -26,251 +26,6 @@ const EXT_HEADER_SIZE: usize = 40;
 const SPL_SIGNATURE: &[u8; 4] = b"SPL ";
 const SPL_VERSION: &[u8; 4] = b"V1  ";
 
-/// Anything that can go wrong while parsing an SPL file.
-#[derive(Debug)]
-pub enum SplError {
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
-}
-
-impl fmt::Display for SplError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SplError::Truncated(e) => write!(f, "{e}"),
-            SplError::BadSignature(found) => {
-                write!(f, "not an SPL file: signature was {}", describe_tag(found))
-            }
-            SplError::BadVersion(found) => {
-                write!(f, "unsupported SPL version: {}", describe_tag(found))
-            }
-        }
-    }
-}
-
-impl std::error::Error for SplError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SplError::Truncated(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<Truncated> for SplError {
-    fn from(e: Truncated) -> Self {
-        SplError::Truncated(e)
-    }
-}
-
-/// The 114-byte SPL header. All documented fields are retained verbatim,
-/// including the ones the engine leaves unused (leftovers of the shared ITM
-/// layout); the structural offset/count words are read but not stored.
-struct SplHeader {
-    version: String,
-    unidentified_name: u32,
-    identified_name: u32,
-    completion_sound: String,
-    flags: u32,
-    spell_type: u16,
-    exclusion_flags: u32,
-    casting_graphics: u16,
-    min_level: u8,
-    primary_type: u8,
-    min_strength: u8,
-    secondary_type: u8,
-    min_strength_bonus: u8,
-    usability_1: u8,
-    min_intelligence: u8,
-    usability_2: u8,
-    min_dexterity: u8,
-    usability_3: u8,
-    min_wisdom: u8,
-    usability_4: u8,
-    min_constitution: u16,
-    min_charisma: u16,
-    spell_level: u32,
-    stack_amount: u16,
-    spellbook_icon: String,
-    lore_to_id: u16,
-    ground_icon: String,
-    weight: u32,
-    unidentified_description: u32,
-    identified_description: u32,
-    description_icon: String,
-    enchantment: u32,
-}
-
-impl SplHeader {
-    fn parse(reader: &Reader) -> Result<SplHeader, Truncated> {
-        Ok(SplHeader {
-            version: parse_asciiz(&reader.tag_at(0x04, "version")?),
-            unidentified_name: reader.u32_at(0x08, "unidentified name")?,
-            identified_name: reader.u32_at(0x0c, "identified name")?,
-            completion_sound: reader.resref_at(0x10, "completion sound")?,
-            flags: reader.u32_at(0x18, "flags")?,
-            spell_type: reader.u16_at(0x1c, "spell type")?,
-            exclusion_flags: reader.u32_at(0x1e, "exclusion flags")?,
-            casting_graphics: reader.u16_at(0x22, "casting graphics")?,
-            min_level: reader.u8_at(0x24, "min level")?,
-            primary_type: reader.u8_at(0x25, "primary type")?,
-            min_strength: reader.u8_at(0x26, "min strength")?,
-            secondary_type: reader.u8_at(0x27, "secondary type")?,
-            min_strength_bonus: reader.u8_at(0x28, "min strength bonus")?,
-            usability_1: reader.u8_at(0x29, "usability 1")?,
-            min_intelligence: reader.u8_at(0x2a, "min intelligence")?,
-            usability_2: reader.u8_at(0x2b, "usability 2")?,
-            min_dexterity: reader.u8_at(0x2c, "min dexterity")?,
-            usability_3: reader.u8_at(0x2d, "usability 3")?,
-            min_wisdom: reader.u8_at(0x2e, "min wisdom")?,
-            usability_4: reader.u8_at(0x2f, "usability 4")?,
-            min_constitution: reader.u16_at(0x30, "min constitution")?,
-            min_charisma: reader.u16_at(0x32, "min charisma")?,
-            spell_level: reader.u32_at(0x34, "spell level")?,
-            stack_amount: reader.u16_at(0x38, "stack amount")?,
-            spellbook_icon: reader.resref_at(0x3a, "spellbook icon")?,
-            lore_to_id: reader.u16_at(0x42, "lore to id")?,
-            ground_icon: reader.resref_at(0x44, "ground icon")?,
-            weight: reader.u32_at(0x4c, "weight")?,
-            unidentified_description: reader.u32_at(0x50, "unidentified description")?,
-            identified_description: reader.u32_at(0x54, "identified description")?,
-            description_icon: reader.resref_at(0x58, "description icon")?,
-            enchantment: reader.u32_at(0x60, "enchantment")?,
-        })
-    }
-}
-
-/// One extended header — a caster-level variant of the spell — plus its effects.
-pub struct SplExtHeader {
-    spell_form: u8,
-    friendly: u8,
-    location: u16,
-    memorised_icon: String,
-    target_type: u8,
-    target_count: u8,
-    range: u16,
-    level_required: u16,
-    casting_time: u16,
-    times_per_day: u16,
-    dice_sides: u16,
-    dice_thrown: u16,
-    enchanted: u16,
-    damage_type: u16,
-    charges: u16,
-    charge_depletion: u16,
-    projectile: u16,
-    /// Effects this header applies (its slice of the shared feature pool).
-    features: Vec<Feature>,
-    /// Projectile name, resolved by the manager from `projectl.ids`.
-    projectile_name: Option<String>,
-}
-
-impl SplExtHeader {
-    /// Parse the 40-byte extended header at `base`. Its effects are read
-    /// separately by [`Spl::parse`], which knows the feature-pool offset.
-    fn parse_at(reader: &Reader, base: usize) -> Result<SplExtHeader, Truncated> {
-        Ok(SplExtHeader {
-            spell_form: reader.u8_at(base, "spell form")?,
-            friendly: reader.u8_at(base + 0x01, "friendly flag")?,
-            location: reader.u16_at(base + 0x02, "location")?,
-            memorised_icon: reader.resref_at(base + 0x04, "memorised icon")?,
-            target_type: reader.u8_at(base + 0x0c, "target type")?,
-            target_count: reader.u8_at(base + 0x0d, "target count")?,
-            range: reader.u16_at(base + 0x0e, "range")?,
-            level_required: reader.u16_at(base + 0x10, "level required")?,
-            casting_time: reader.u16_at(base + 0x12, "casting time")?,
-            times_per_day: reader.u16_at(base + 0x14, "times per day")?,
-            dice_sides: reader.u16_at(base + 0x16, "dice sides")?,
-            dice_thrown: reader.u16_at(base + 0x18, "dice thrown")?,
-            enchanted: reader.u16_at(base + 0x1a, "enchanted")?,
-            damage_type: reader.u16_at(base + 0x1c, "damage type")?,
-            charges: reader.u16_at(base + 0x22, "charges")?,
-            charge_depletion: reader.u16_at(base + 0x24, "charge depletion")?,
-            projectile: reader.u16_at(base + 0x26, "projectile")?,
-            features: Vec::new(),
-            projectile_name: None,
-        })
-    }
-
-    /// The projectile number, for the manager to resolve against `projectl.ids`.
-    pub fn projectile(&self) -> u16 {
-        self.projectile
-    }
-
-    /// Attach the projectile name resolved from `projectl.ids`.
-    pub fn set_projectile_name(&mut self, name: Option<String>) {
-        self.projectile_name = name;
-    }
-
-    /// Render the header and its effects in the human-readable view. `index` is
-    /// the header's position, used only for the heading.
-    fn write_human(&self, f: &mut fmt::Formatter<'_>, index: usize) -> fmt::Result {
-        writeln!(f, "  header {index}: level {}+", self.level_required)?;
-        let d = "    ";
-        writeln!(
-            f,
-            "{d}{:<11} {} ({})",
-            "target:",
-            self.target_type,
-            spell_target_name(self.target_type)
-        )?;
-        writeln!(
-            f,
-            "{d}{:<11} {} ({})",
-            "location:",
-            self.location,
-            location_name(self.location)
-        )?;
-        if self.range != 0 {
-            writeln!(f, "{d}{:<11} {}", "range:", self.range)?;
-        }
-        if self.casting_time != 0 {
-            writeln!(f, "{d}{:<11} {} (speed)", "cast:", self.casting_time)?;
-        }
-        if self.times_per_day != 0 {
-            writeln!(f, "{d}{:<11} {}", "per day:", self.times_per_day)?;
-        }
-        if self.projectile != 0 {
-            match &self.projectile_name {
-                Some(name) => writeln!(f, "{d}{:<11} {} ({name})", "projectile:", self.projectile)?,
-                None => writeln!(f, "{d}{:<11} {}", "projectile:", self.projectile)?,
-            }
-        }
-        writeln!(f, "{d}{:<11} {}", "effects:", self.features.len())?;
-        for feat in &self.features {
-            feat.write_human(f, "      ")?;
-        }
-        Ok(())
-    }
-
-    /// Write the header's fields and effects as `key=value` lines under `prefix`
-    /// (e.g. `"ext.0."`). Structural offset/count words are omitted — the effect
-    /// count is implicit in the `effect.<n>` keys.
-    fn write_raw(&self, out: &mut dyn Write, prefix: &str) -> io::Result<()> {
-        writeln!(out, "{prefix}spell_form={}", self.spell_form)?;
-        writeln!(out, "{prefix}friendly={}", self.friendly)?;
-        writeln!(out, "{prefix}location={}", self.location)?;
-        writeln!(out, "{prefix}memorised_icon={}", self.memorised_icon)?;
-        writeln!(out, "{prefix}target_type={}", self.target_type)?;
-        writeln!(out, "{prefix}target_count={}", self.target_count)?;
-        writeln!(out, "{prefix}range={}", self.range)?;
-        writeln!(out, "{prefix}level_required={}", self.level_required)?;
-        writeln!(out, "{prefix}casting_time={}", self.casting_time)?;
-        writeln!(out, "{prefix}times_per_day={}", self.times_per_day)?;
-        writeln!(out, "{prefix}dice_sides={}", self.dice_sides)?;
-        writeln!(out, "{prefix}dice_thrown={}", self.dice_thrown)?;
-        writeln!(out, "{prefix}enchanted={}", self.enchanted)?;
-        writeln!(out, "{prefix}damage_type={}", self.damage_type)?;
-        writeln!(out, "{prefix}charges={}", self.charges)?;
-        writeln!(out, "{prefix}charge_depletion={}", self.charge_depletion)?;
-        writeln!(out, "{prefix}projectile={}", self.projectile)?;
-        for (j, feat) in self.features.iter().enumerate() {
-            feat.write_raw(out, &format!("{prefix}effect.{j}."))?;
-        }
-        Ok(())
-    }
-}
-
 /// A parsed SPL file: the header, the on-cast effects, and the spell's
 /// caster-level headers (each with its own effects).
 pub struct Spl {
@@ -569,6 +324,251 @@ impl fmt::Display for Spl {
         }
 
         Ok(())
+    }
+}
+
+/// The 114-byte SPL header. All documented fields are retained verbatim,
+/// including the ones the engine leaves unused (leftovers of the shared ITM
+/// layout); the structural offset/count words are read but not stored.
+struct SplHeader {
+    version: String,
+    unidentified_name: u32,
+    identified_name: u32,
+    completion_sound: String,
+    flags: u32,
+    spell_type: u16,
+    exclusion_flags: u32,
+    casting_graphics: u16,
+    min_level: u8,
+    primary_type: u8,
+    min_strength: u8,
+    secondary_type: u8,
+    min_strength_bonus: u8,
+    usability_1: u8,
+    min_intelligence: u8,
+    usability_2: u8,
+    min_dexterity: u8,
+    usability_3: u8,
+    min_wisdom: u8,
+    usability_4: u8,
+    min_constitution: u16,
+    min_charisma: u16,
+    spell_level: u32,
+    stack_amount: u16,
+    spellbook_icon: String,
+    lore_to_id: u16,
+    ground_icon: String,
+    weight: u32,
+    unidentified_description: u32,
+    identified_description: u32,
+    description_icon: String,
+    enchantment: u32,
+}
+
+impl SplHeader {
+    fn parse(reader: &Reader) -> Result<SplHeader, Truncated> {
+        Ok(SplHeader {
+            version: parse_asciiz(&reader.tag_at(0x04, "version")?),
+            unidentified_name: reader.u32_at(0x08, "unidentified name")?,
+            identified_name: reader.u32_at(0x0c, "identified name")?,
+            completion_sound: reader.resref_at(0x10, "completion sound")?,
+            flags: reader.u32_at(0x18, "flags")?,
+            spell_type: reader.u16_at(0x1c, "spell type")?,
+            exclusion_flags: reader.u32_at(0x1e, "exclusion flags")?,
+            casting_graphics: reader.u16_at(0x22, "casting graphics")?,
+            min_level: reader.u8_at(0x24, "min level")?,
+            primary_type: reader.u8_at(0x25, "primary type")?,
+            min_strength: reader.u8_at(0x26, "min strength")?,
+            secondary_type: reader.u8_at(0x27, "secondary type")?,
+            min_strength_bonus: reader.u8_at(0x28, "min strength bonus")?,
+            usability_1: reader.u8_at(0x29, "usability 1")?,
+            min_intelligence: reader.u8_at(0x2a, "min intelligence")?,
+            usability_2: reader.u8_at(0x2b, "usability 2")?,
+            min_dexterity: reader.u8_at(0x2c, "min dexterity")?,
+            usability_3: reader.u8_at(0x2d, "usability 3")?,
+            min_wisdom: reader.u8_at(0x2e, "min wisdom")?,
+            usability_4: reader.u8_at(0x2f, "usability 4")?,
+            min_constitution: reader.u16_at(0x30, "min constitution")?,
+            min_charisma: reader.u16_at(0x32, "min charisma")?,
+            spell_level: reader.u32_at(0x34, "spell level")?,
+            stack_amount: reader.u16_at(0x38, "stack amount")?,
+            spellbook_icon: reader.resref_at(0x3a, "spellbook icon")?,
+            lore_to_id: reader.u16_at(0x42, "lore to id")?,
+            ground_icon: reader.resref_at(0x44, "ground icon")?,
+            weight: reader.u32_at(0x4c, "weight")?,
+            unidentified_description: reader.u32_at(0x50, "unidentified description")?,
+            identified_description: reader.u32_at(0x54, "identified description")?,
+            description_icon: reader.resref_at(0x58, "description icon")?,
+            enchantment: reader.u32_at(0x60, "enchantment")?,
+        })
+    }
+}
+
+/// One extended header — a caster-level variant of the spell — plus its effects.
+pub struct SplExtHeader {
+    spell_form: u8,
+    friendly: u8,
+    location: u16,
+    memorised_icon: String,
+    target_type: u8,
+    target_count: u8,
+    range: u16,
+    level_required: u16,
+    casting_time: u16,
+    times_per_day: u16,
+    dice_sides: u16,
+    dice_thrown: u16,
+    enchanted: u16,
+    damage_type: u16,
+    charges: u16,
+    charge_depletion: u16,
+    projectile: u16,
+    /// Effects this header applies (its slice of the shared feature pool).
+    features: Vec<Feature>,
+    /// Projectile name, resolved by the manager from `projectl.ids`.
+    projectile_name: Option<String>,
+}
+
+impl SplExtHeader {
+    /// Parse the 40-byte extended header at `base`. Its effects are read
+    /// separately by [`Spl::parse`], which knows the feature-pool offset.
+    fn parse_at(reader: &Reader, base: usize) -> Result<SplExtHeader, Truncated> {
+        Ok(SplExtHeader {
+            spell_form: reader.u8_at(base, "spell form")?,
+            friendly: reader.u8_at(base + 0x01, "friendly flag")?,
+            location: reader.u16_at(base + 0x02, "location")?,
+            memorised_icon: reader.resref_at(base + 0x04, "memorised icon")?,
+            target_type: reader.u8_at(base + 0x0c, "target type")?,
+            target_count: reader.u8_at(base + 0x0d, "target count")?,
+            range: reader.u16_at(base + 0x0e, "range")?,
+            level_required: reader.u16_at(base + 0x10, "level required")?,
+            casting_time: reader.u16_at(base + 0x12, "casting time")?,
+            times_per_day: reader.u16_at(base + 0x14, "times per day")?,
+            dice_sides: reader.u16_at(base + 0x16, "dice sides")?,
+            dice_thrown: reader.u16_at(base + 0x18, "dice thrown")?,
+            enchanted: reader.u16_at(base + 0x1a, "enchanted")?,
+            damage_type: reader.u16_at(base + 0x1c, "damage type")?,
+            charges: reader.u16_at(base + 0x22, "charges")?,
+            charge_depletion: reader.u16_at(base + 0x24, "charge depletion")?,
+            projectile: reader.u16_at(base + 0x26, "projectile")?,
+            features: Vec::new(),
+            projectile_name: None,
+        })
+    }
+
+    /// The projectile number, for the manager to resolve against `projectl.ids`.
+    pub fn projectile(&self) -> u16 {
+        self.projectile
+    }
+
+    /// Attach the projectile name resolved from `projectl.ids`.
+    pub fn set_projectile_name(&mut self, name: Option<String>) {
+        self.projectile_name = name;
+    }
+
+    /// Render the header and its effects in the human-readable view. `index` is
+    /// the header's position, used only for the heading.
+    fn write_human(&self, f: &mut fmt::Formatter<'_>, index: usize) -> fmt::Result {
+        writeln!(f, "  header {index}: level {}+", self.level_required)?;
+        let d = "    ";
+        writeln!(
+            f,
+            "{d}{:<11} {} ({})",
+            "target:",
+            self.target_type,
+            spell_target_name(self.target_type)
+        )?;
+        writeln!(
+            f,
+            "{d}{:<11} {} ({})",
+            "location:",
+            self.location,
+            location_name(self.location)
+        )?;
+        if self.range != 0 {
+            writeln!(f, "{d}{:<11} {}", "range:", self.range)?;
+        }
+        if self.casting_time != 0 {
+            writeln!(f, "{d}{:<11} {} (speed)", "cast:", self.casting_time)?;
+        }
+        if self.times_per_day != 0 {
+            writeln!(f, "{d}{:<11} {}", "per day:", self.times_per_day)?;
+        }
+        if self.projectile != 0 {
+            match &self.projectile_name {
+                Some(name) => writeln!(f, "{d}{:<11} {} ({name})", "projectile:", self.projectile)?,
+                None => writeln!(f, "{d}{:<11} {}", "projectile:", self.projectile)?,
+            }
+        }
+        writeln!(f, "{d}{:<11} {}", "effects:", self.features.len())?;
+        for feat in &self.features {
+            feat.write_human(f, "      ")?;
+        }
+        Ok(())
+    }
+
+    /// Write the header's fields and effects as `key=value` lines under `prefix`
+    /// (e.g. `"ext.0."`). Structural offset/count words are omitted — the effect
+    /// count is implicit in the `effect.<n>` keys.
+    fn write_raw(&self, out: &mut dyn Write, prefix: &str) -> io::Result<()> {
+        writeln!(out, "{prefix}spell_form={}", self.spell_form)?;
+        writeln!(out, "{prefix}friendly={}", self.friendly)?;
+        writeln!(out, "{prefix}location={}", self.location)?;
+        writeln!(out, "{prefix}memorised_icon={}", self.memorised_icon)?;
+        writeln!(out, "{prefix}target_type={}", self.target_type)?;
+        writeln!(out, "{prefix}target_count={}", self.target_count)?;
+        writeln!(out, "{prefix}range={}", self.range)?;
+        writeln!(out, "{prefix}level_required={}", self.level_required)?;
+        writeln!(out, "{prefix}casting_time={}", self.casting_time)?;
+        writeln!(out, "{prefix}times_per_day={}", self.times_per_day)?;
+        writeln!(out, "{prefix}dice_sides={}", self.dice_sides)?;
+        writeln!(out, "{prefix}dice_thrown={}", self.dice_thrown)?;
+        writeln!(out, "{prefix}enchanted={}", self.enchanted)?;
+        writeln!(out, "{prefix}damage_type={}", self.damage_type)?;
+        writeln!(out, "{prefix}charges={}", self.charges)?;
+        writeln!(out, "{prefix}charge_depletion={}", self.charge_depletion)?;
+        writeln!(out, "{prefix}projectile={}", self.projectile)?;
+        for (j, feat) in self.features.iter().enumerate() {
+            feat.write_raw(out, &format!("{prefix}effect.{j}."))?;
+        }
+        Ok(())
+    }
+}
+
+/// Anything that can go wrong while parsing an SPL file.
+#[derive(Debug)]
+pub enum SplError {
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
+}
+
+impl fmt::Display for SplError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SplError::Truncated(e) => write!(f, "{e}"),
+            SplError::BadSignature(found) => {
+                write!(f, "not an SPL file: signature was {}", describe_tag(found))
+            }
+            SplError::BadVersion(found) => {
+                write!(f, "unsupported SPL version: {}", describe_tag(found))
+            }
+        }
+    }
+}
+
+impl std::error::Error for SplError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SplError::Truncated(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Truncated> for SplError {
+    fn from(e: Truncated) -> Self {
+        SplError::Truncated(e)
     }
 }
 

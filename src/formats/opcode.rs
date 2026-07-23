@@ -17,12 +17,6 @@ use crate::formats::spl::SPL_TYPE;
 use crate::formats::twoda::TWODA_TYPE;
 use crate::formats::{BAM_TYPE, BMP_TYPE, MVE_TYPE, VVC_TYPE, WAV_TYPE};
 
-/// Human name for an effect `opcode`, or `None` if it is outside the range
-/// this engine defines (0–367). Used only to annotate readable output.
-pub fn opcode_name(opcode: u32) -> Option<&'static str> {
-    OPCODE_NAMES.get(opcode as usize).copied()
-}
-
 /// An effect field that can hold a TLK strref, for the opcodes that display a
 /// string. [`Param1`](StrrefSlot::Param1) is the first parameter (V1 0x04 /
 /// V2 body 0x14); [`Special`](StrrefSlot::Special) is the Special field (V1 0x2c
@@ -31,27 +25,6 @@ pub fn opcode_name(opcode: u32) -> Option<&'static str> {
 pub enum StrrefSlot {
     Param1,
     Special,
-}
-
-/// Which effect field(s) *unconditionally* carry a TLK strref for `opcode`, in
-/// the EE engine — the key to finding strrefs buried in item/spell/creature
-/// effects, since the parser stores every parameter as an untyped dword.
-///
-/// Most string opcodes put the strref in Parameter #1; a couple (EE) use the
-/// Special field. Value-dependent cases can't be expressed here (this keys only
-/// on the opcode) and are handled by the caller: op319's Parameter #1 is a
-/// strref when Parameter #2 is 10 (see [`effect_strref_uses`](super::eff)). One
-/// case is deferred entirely — op330's Parameter #3 is the start of a `Count`
-/// (Special)-long *range* of strrefs, only under the EFF-invocation path.
-///
-/// Derived from IESDP (`md/opcodes/bgee.md`); opcodes 13 and 68 are excluded —
-/// their "Text Notification" Parameter #1 is a 0/1 flag, not a strref.
-pub fn opcode_strref_slots(opcode: u32) -> &'static [StrrefSlot] {
-    match opcode {
-        103 | 139 | 180 | 206 | 253 | 254 | 267 | 290 | 330 | 338 => &[StrrefSlot::Param1],
-        181 | 319 => &[StrrefSlot::Special],
-        _ => &[],
-    }
 }
 
 /// One of an effect's resref fields. [`Resource`](ResourceSlot::Resource) is the
@@ -89,76 +62,6 @@ const fn soft(slot: ResourceSlot, kind: u16) -> ResourceRef {
         slot,
         kind,
         soft: true,
-    }
-}
-
-/// Which of an effect's resref fields carry a resource for `opcode`, and what
-/// each names — the key to finding resources buried in item/spell/creature
-/// effects, since the parser stores every resref as an untyped string.
-///
-/// Complete for BG(2):EE as far as IESDP documents it (`md/opcodes/bgee.md`):
-/// every opcode whose resref field names a *file* is listed. Opcodes that put
-/// something else in a resref field are deliberately excluded — #265/#309 store
-/// a variable name, #144/#279 an arbitrary matching key, #319 a scripting name,
-/// #339 an ARE animation label, and #336 only a filename *prefix* that the
-/// engine completes with a sequence number.
-///
-/// A slot may appear more than once with different types. That is how the
-/// genuinely ambiguous fields are expressed: "the spell or item specified in
-/// the Resource field" (#318/#321/#324) yields both an ITM and a SPL reading,
-/// each marked soft, so a search for either finds it as a candidate. IESDP
-/// flags this collision directly — `spwi112.itm` and `spwi112.spl` are
-/// indistinguishable to these opcodes. Animation fields work the same way,
-/// since the engine accepts a VVC or a BAM.
-pub fn opcode_resource_slots(opcode: u32) -> &'static [ResourceRef] {
-    match opcode {
-        // Items: create, remove, restrict, drain.
-        111 | 123 | 143 | 180 | 243 | 255 => &ITEM,
-        112 => &ITEM_AND_SOUND,
-        122 => &ITEM_RANDOM_OF_THREE,
-        182 => &ITEM_THEN_EFFECT,
-        318 | 321 | 324 => &ITEM_OR_SPELL,
-        // Spells: cast, learn, grant, remove, react with.
-        146
-        | 147
-        | 148
-        | 171
-        | 172
-        | 200
-        | 201
-        | 206
-        | 207
-        | 223
-        | 226..=228
-        | 232
-        | 251
-        | 252
-        | 258..=260
-        | 266
-        | 313
-        | 326
-        | 333
-        | 335
-        | 340
-        | 341
-        | 361
-        | 366 => &SPELL,
-        78 => &SPELL_MAYBE,
-        256 => &SEQUENCER,
-        // Creatures: summon, replace, polymorph into.
-        67 => &CREATURE_WITH_ANIMATIONS,
-        135 | 151 => &CREATURE,
-        // Effects applied from another file.
-        177 | 183 | 248 | 249 | 272 | 283 => &EFFECT,
-        // Everything else that names a file.
-        82 => &SCRIPT,
-        107 => &PORTRAIT,
-        127 | 214 | 273 | 331 => &TABLE,
-        152 => &MOVIE,
-        174 => &SOUND,
-        186 => &AREA,
-        68 | 153..=158 | 215 | 296 => &ANIMATION,
-        _ => &[],
     }
 }
 
@@ -240,7 +143,105 @@ static ANIMATION: [ResourceRef; 2] = [
     soft(ResourceSlot::Resource, BAM_TYPE),
 ];
 
-/// Opcode → name, indexed directly by opcode number.
+/// Human name for an effect `opcode`, or `None` if it is outside the range
+/// this engine defines (0–367). Used only to annotate readable output.
+pub fn opcode_name(opcode: u32) -> Option<&'static str> {
+    OPCODE_NAMES.get(opcode as usize).copied()
+}
+
+/// Which effect field(s) *unconditionally* carry a TLK strref for `opcode`, in
+/// the EE engine — the key to finding strrefs buried in item/spell/creature
+/// effects, since the parser stores every parameter as an untyped dword.
+///
+/// Most string opcodes put the strref in Parameter #1; a couple (EE) use the
+/// Special field. Value-dependent cases can't be expressed here (this keys only
+/// on the opcode) and are handled by the caller: op319's Parameter #1 is a
+/// strref when Parameter #2 is 10 (see [`effect_strref_uses`](super::eff)). One
+/// case is deferred entirely — op330's Parameter #3 is the start of a `Count`
+/// (Special)-long *range* of strrefs, only under the EFF-invocation path.
+///
+/// Derived from IESDP (`md/opcodes/bgee.md`); opcodes 13 and 68 are excluded —
+/// their "Text Notification" Parameter #1 is a 0/1 flag, not a strref.
+pub fn opcode_strref_slots(opcode: u32) -> &'static [StrrefSlot] {
+    match opcode {
+        103 | 139 | 180 | 206 | 253 | 254 | 267 | 290 | 330 | 338 => &[StrrefSlot::Param1],
+        181 | 319 => &[StrrefSlot::Special],
+        _ => &[],
+    }
+}
+
+/// Which of an effect's resref fields carry a resource for `opcode`, and what
+/// each names — the key to finding resources buried in item/spell/creature
+/// effects, since the parser stores every resref as an untyped string.
+///
+/// Complete for BG(2):EE as far as IESDP documents it (`md/opcodes/bgee.md`):
+/// every opcode whose resref field names a *file* is listed. Opcodes that put
+/// something else in a resref field are deliberately excluded — #265/#309 store
+/// a variable name, #144/#279 an arbitrary matching key, #319 a scripting name,
+/// #339 an ARE animation label, and #336 only a filename *prefix* that the
+/// engine completes with a sequence number.
+///
+/// A slot may appear more than once with different types. That is how the
+/// genuinely ambiguous fields are expressed: "the spell or item specified in
+/// the Resource field" (#318/#321/#324) yields both an ITM and a SPL reading,
+/// each marked soft, so a search for either finds it as a candidate. IESDP
+/// flags this collision directly — `spwi112.itm` and `spwi112.spl` are
+/// indistinguishable to these opcodes. Animation fields work the same way,
+/// since the engine accepts a VVC or a BAM.
+pub fn opcode_resource_slots(opcode: u32) -> &'static [ResourceRef] {
+    match opcode {
+        // Items: create, remove, restrict, drain.
+        111 | 123 | 143 | 180 | 243 | 255 => &ITEM,
+        112 => &ITEM_AND_SOUND,
+        122 => &ITEM_RANDOM_OF_THREE,
+        182 => &ITEM_THEN_EFFECT,
+        318 | 321 | 324 => &ITEM_OR_SPELL,
+        // Spells: cast, learn, grant, remove, react with.
+        146
+        | 147
+        | 148
+        | 171
+        | 172
+        | 200
+        | 201
+        | 206
+        | 207
+        | 223
+        | 226..=228
+        | 232
+        | 251
+        | 252
+        | 258..=260
+        | 266
+        | 313
+        | 326
+        | 333
+        | 335
+        | 340
+        | 341
+        | 361
+        | 366 => &SPELL,
+        78 => &SPELL_MAYBE,
+        256 => &SEQUENCER,
+        // Creatures: summon, replace, polymorph into.
+        67 => &CREATURE_WITH_ANIMATIONS,
+        135 | 151 => &CREATURE,
+        // Effects applied from another file.
+        177 | 183 | 248 | 249 | 272 | 283 => &EFFECT,
+        // Everything else that names a file.
+        82 => &SCRIPT,
+        107 => &PORTRAIT,
+        127 | 214 | 273 | 331 => &TABLE,
+        152 => &MOVIE,
+        174 => &SOUND,
+        186 => &AREA,
+        68 | 153..=158 | 215 | 296 => &ANIMATION,
+        _ => &[],
+    }
+}
+
+/// Opcode → name, indexed directly by opcode number. Bulk data appendix; the
+/// module's logic is above.
 static OPCODE_NAMES: [&str; 368] = [
     "Stat: AC vs. Damage Type Modifier",               // 0
     "Stat: Attacks Per Round Modifier",                // 1

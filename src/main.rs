@@ -27,16 +27,62 @@ use search::SearchResults;
 const LOCAL_KEY_PATH: &str = "chitin.key";
 const DEFAULT_KEY_PATH: &str = "game/chitin.key";
 
-/// The `chitin.key` to open: the one in the working directory if it exists (a
-/// real game root), otherwise the development copy under `game/`.
-fn key_path() -> &'static Path {
-    let local = Path::new(LOCAL_KEY_PATH);
-    if local.is_file() {
-        local
-    } else {
-        Path::new(DEFAULT_KEY_PATH)
-    }
-}
+/// Maximum matches listed per group before truncating, so a short prefix can't
+/// flood the terminal.
+const SEARCH_LIMIT: usize = 200;
+
+/// Maximum field paths listed per hit. One resource can reference another from
+/// hundreds of places — nearly every transition of a dialogue points at its own
+/// file — and a count answers "how often" better than an unreadable list.
+const FIELD_LIMIT: usize = 8;
+
+/// The 64-byte key used to XOR-encrypt some text resources (mainly IDS, and
+/// occasionally 2DA). See `md/file_formats/ie_formats/encryption.md`.
+const TEXT_XOR_KEY: [u8; 64] = [
+    0x88, 0xa8, 0x8f, 0xba, 0x8a, 0xd3, 0xb9, 0xf5, 0xed, 0xb1, 0xcf, 0xea, 0xaa, 0xe4, 0xb5, 0xfb,
+    0xeb, 0x82, 0xf9, 0x90, 0xca, 0xc9, 0xb5, 0xe7, 0xdc, 0x8e, 0xb7, 0xac, 0xee, 0xf7, 0xe0, 0xca,
+    0x8e, 0xea, 0xca, 0x80, 0xce, 0xc5, 0xad, 0xb7, 0xc4, 0xd0, 0x84, 0x93, 0xd5, 0xf0, 0xeb, 0xc8,
+    0xb4, 0x9d, 0xcc, 0xaf, 0xa5, 0x95, 0xba, 0x99, 0x87, 0xd2, 0x9d, 0xe3, 0x91, 0xba, 0x90, 0xca,
+];
+
+/// Short usage guide. `--help` and a bare invocation print this; it needs no
+/// game data, so it works without a readable KEY.
+const USAGE: &str = "\
+iediff — inspect Infinity Engine resources (BG2:EE)
+
+Usage:
+  iediff <name>[.ext]      print a resource; a bare name or an inexact match runs a prefix search
+  iediff <name>.ext --uses list the resources that reference this resource
+  iediff strref:<n>        resolve a dialog.tlk string by index
+  iediff strref:<n> --uses list the resources that reference the string
+  iediff --file <path>     print a discrete file by path, bypassing the index
+                           (a .baf is compiled to a .bcs next to it)
+  iediff --stats           summarise the KEY index and override directory
+  iediff [--help|-h]       show this help
+
+Options:
+  --raw                 machine-readable key=value output (binary formats)
+  --biff                bypass the override directory; read the archived original
+  --file                read the argument as a filesystem path (type from its extension)
+  --uses                find where a resource or string is referenced; the query
+                        must name a type (sw1h01.itm, strref:8000)
+  --type <ext>          with --uses, scan only one resource type (e.g. itm)
+  --out <dir>           with --file on a .baf, write the .bcs into <dir>
+
+Decoded formats: 2da ids eff itm spl cre pro sto are dlg bcs
+Other resource types are located and summarised (type, size) but not parsed.
+
+--uses searches the decoded binary formats (eff itm spl cre pro sto are dlg bcs)
+for typed references, so it can find these as targets:
+  itm spl cre dlg are pro eff bcs 2da bam vvc wav wed bmp mve
+Effect opcodes are covered in full: every resource an effect names is resolved to
+its type. BCS scripts and a DLG's trigger/action scripts are compiled and their
+calls' arguments typed, so a script naming an item, spell (by number too),
+creature or strref is a hard hit. 2DA/IDS tables are scanned as text and reported
+separately as candidates.
+
+Reads ./chitin.key if present (run from a game root), else game/chitin.key.
+";
 
 /// A read that ran past the end of the available bytes. Shared by all parsers;
 /// each format's error type wraps this via `From`.
@@ -127,14 +173,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// ASCII case-insensitive prefix test, without allocating. Resrefs are ASCII,
-/// so this is the basis of case-insensitive name and prefix matching.
-pub fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
-    let h = haystack.as_bytes();
-    let p = prefix.as_bytes();
-    h.len() >= p.len() && h.iter().zip(p).all(|(a, b)| a.eq_ignore_ascii_case(b))
-}
-
 /// One place a resource references a TLK string: the `strref` value and a short
 /// path naming the field it came from (e.g. `"identified_name"`,
 /// `"soundset[42]"`, `"region[3].info_text"`). Each parsed format yields these
@@ -212,6 +250,25 @@ impl<'a> ResrefUse<'a> {
     }
 }
 
+/// The `chitin.key` to open: the one in the working directory if it exists (a
+/// real game root), otherwise the development copy under `game/`.
+fn key_path() -> &'static Path {
+    let local = Path::new(LOCAL_KEY_PATH);
+    if local.is_file() {
+        local
+    } else {
+        Path::new(DEFAULT_KEY_PATH)
+    }
+}
+
+/// ASCII case-insensitive prefix test, without allocating. Resrefs are ASCII,
+/// so this is the basis of case-insensitive name and prefix matching.
+pub fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    let h = haystack.as_bytes();
+    let p = prefix.as_bytes();
+    h.len() >= p.len() && h.iter().zip(p).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
 /// Decode a NUL-terminated (and possibly NUL-padded) ASCII field. Trailing
 /// garbage after the first NUL is ignored, per the format conventions.
 pub fn parse_asciiz(bytes: &[u8]) -> String {
@@ -248,15 +305,6 @@ pub fn join_bytes(bytes: &[u8]) -> String {
         .join(",")
 }
 
-/// The 64-byte key used to XOR-encrypt some text resources (mainly IDS, and
-/// occasionally 2DA). See `md/file_formats/ie_formats/encryption.md`.
-const TEXT_XOR_KEY: [u8; 64] = [
-    0x88, 0xa8, 0x8f, 0xba, 0x8a, 0xd3, 0xb9, 0xf5, 0xed, 0xb1, 0xcf, 0xea, 0xaa, 0xe4, 0xb5, 0xfb,
-    0xeb, 0x82, 0xf9, 0x90, 0xca, 0xc9, 0xb5, 0xe7, 0xdc, 0x8e, 0xb7, 0xac, 0xee, 0xf7, 0xe0, 0xca,
-    0x8e, 0xea, 0xca, 0x80, 0xce, 0xc5, 0xad, 0xb7, 0xc4, 0xd0, 0x84, 0x93, 0xd5, 0xf0, 0xeb, 0xc8,
-    0xb4, 0x9d, 0xcc, 0xaf, 0xa5, 0x95, 0xba, 0x99, 0x87, 0xd2, 0x9d, 0xe3, 0x91, 0xba, 0x90, 0xca,
-];
-
 /// Decrypt a text resource if it carries the `0xFFFF` encryption marker;
 /// otherwise borrow it unchanged. The cipher is a repeating-key XOR.
 pub fn decrypt_text(bytes: &[u8]) -> Cow<'_, [u8]> {
@@ -270,15 +318,6 @@ pub fn decrypt_text(bytes: &[u8]) -> Cow<'_, [u8]> {
         _ => Cow::Borrowed(bytes),
     }
 }
-
-/// Maximum matches listed per group before truncating, so a short prefix can't
-/// flood the terminal.
-const SEARCH_LIMIT: usize = 200;
-
-/// Maximum field paths listed per hit. One resource can reference another from
-/// hundreds of places — nearly every transition of a dialogue points at its own
-/// file — and a count answers "how often" better than an unreadable list.
-const FIELD_LIMIT: usize = 8;
 
 /// Resolve a query and print it. A query loads a single resource only when it
 /// fully specifies both name and type (`AERIE6.cre`) and that resource exists;
@@ -643,44 +682,26 @@ fn print_hits(
     Ok(())
 }
 
-/// Short usage guide. `--help` and a bare invocation print this; it needs no
-/// game data, so it works without a readable KEY.
-const USAGE: &str = "\
-iediff — inspect Infinity Engine resources (BG2:EE)
-
-Usage:
-  iediff <name>[.ext]      print a resource; a bare name or an inexact match runs a prefix search
-  iediff <name>.ext --uses list the resources that reference this resource
-  iediff strref:<n>        resolve a dialog.tlk string by index
-  iediff strref:<n> --uses list the resources that reference the string
-  iediff --file <path>     print a discrete file by path, bypassing the index
-                           (a .baf is compiled to a .bcs next to it)
-  iediff --stats           summarise the KEY index and override directory
-  iediff [--help|-h]       show this help
-
-Options:
-  --raw                 machine-readable key=value output (binary formats)
-  --biff                bypass the override directory; read the archived original
-  --file                read the argument as a filesystem path (type from its extension)
-  --uses                find where a resource or string is referenced; the query
-                        must name a type (sw1h01.itm, strref:8000)
-  --type <ext>          with --uses, scan only one resource type (e.g. itm)
-  --out <dir>           with --file on a .baf, write the .bcs into <dir>
-
-Decoded formats: 2da ids eff itm spl cre pro sto are dlg bcs
-Other resource types are located and summarised (type, size) but not parsed.
-
---uses searches the decoded binary formats (eff itm spl cre pro sto are dlg bcs)
-for typed references, so it can find these as targets:
-  itm spl cre dlg are pro eff bcs 2da bam vvc wav wed bmp mve
-Effect opcodes are covered in full: every resource an effect names is resolved to
-its type. BCS scripts and a DLG's trigger/action scripts are compiled and their
-calls' arguments typed, so a script naming an item, spell (by number too),
-creature or strref is a hard hit. 2DA/IDS tables are scanned as text and reported
-separately as candidates.
-
-Reads ./chitin.key if present (run from a game root), else game/chitin.key.
-";
+/// Warn (to stderr) when the KEY lists the same resource more than once — a
+/// modded `chitin.key` can do this. Resolution keeps the last entry; this just
+/// surfaces the anomaly so it isn't silent.
+fn warn_duplicates(key: &formats::key::KeyFile) {
+    const SHOWN: usize = 10;
+    let dupes = key.duplicates();
+    if dupes.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: KEY lists {} duplicate resource(s); the last entry of each wins",
+        dupes.len()
+    );
+    for (name, res_type) in dupes.iter().take(SHOWN) {
+        eprintln!("  {}.{}", name, type_extension(*res_type));
+    }
+    if dupes.len() > SHOWN {
+        eprintln!("  … and {} more", dupes.len() - SHOWN);
+    }
+}
 
 fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut query: Option<String> = None;
@@ -770,27 +791,6 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-/// Warn (to stderr) when the KEY lists the same resource more than once — a
-/// modded `chitin.key` can do this. Resolution keeps the last entry; this just
-/// surfaces the anomaly so it isn't silent.
-fn warn_duplicates(key: &formats::key::KeyFile) {
-    const SHOWN: usize = 10;
-    let dupes = key.duplicates();
-    if dupes.is_empty() {
-        return;
-    }
-    eprintln!(
-        "warning: KEY lists {} duplicate resource(s); the last entry of each wins",
-        dupes.len()
-    );
-    for (name, res_type) in dupes.iter().take(SHOWN) {
-        eprintln!("  {}.{}", name, type_extension(*res_type));
-    }
-    if dupes.len() > SHOWN {
-        eprintln!("  … and {} more", dupes.len() - SHOWN);
-    }
 }
 
 fn main() -> ExitCode {

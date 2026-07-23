@@ -19,14 +19,6 @@ use crate::decrypt_text;
 /// Resource type code for IDS files.
 pub const IDS_TYPE: u16 = 0x03f0;
 
-/// One row of an IDS table.
-pub struct IdsEntry {
-    /// Values are `i64` because the corpus spans negatives and 32-bit-wide
-    /// unsigned magnitudes that don't both fit in any 32-bit type.
-    pub value: i64,
-    pub name: String,
-}
-
 /// A parsed IDS table. Preserves entries in file order, and indexes them both
 /// ways for dictionary lookups (value -> name and name -> value).
 pub struct IdsFile {
@@ -34,9 +26,6 @@ pub struct IdsFile {
     /// value -> index into `entries`. First occurrence wins, since a value can
     /// appear more than once with different identifiers.
     by_value: HashMap<i64, usize>,
-    /// UPPERCASE name -> index into `entries`. First occurrence wins; names are
-    /// matched case-insensitively, as elsewhere in the engine.
-    by_name: HashMap<String, usize>,
 }
 
 impl IdsFile {
@@ -48,7 +37,6 @@ impl IdsFile {
 
         let mut entries = Vec::new();
         let mut by_value = HashMap::new();
-        let mut by_name = HashMap::new();
 
         for line in text.lines() {
             let line = line.trim();
@@ -73,18 +61,13 @@ impl IdsFile {
 
             let index = entries.len();
             by_value.entry(value).or_insert(index);
-            by_name.entry(name.to_ascii_uppercase()).or_insert(index);
             entries.push(IdsEntry {
                 value,
                 name: name.to_string(),
             });
         }
 
-        IdsFile {
-            entries,
-            by_value,
-            by_name,
-        }
+        IdsFile { entries, by_value }
     }
 
     /// Every row in file order. A value may repeat: `ACTION.IDS` gives 451
@@ -95,23 +78,11 @@ impl IdsFile {
     }
 
     /// The identifier mapped to a value, if any (e.g. race `2` -> `ELF`).
-    #[allow(dead_code)] // consumed by resource-field annotation (next milestone)
     pub fn lookup_by_value(&self, value: i64) -> Option<&str> {
         self.by_value
             .get(&value)
             .and_then(|&i| self.entries.get(i))
             .map(|entry| entry.name.as_str())
-    }
-
-    /// The value mapped to an identifier, if any (e.g. `ELF` -> `2`). Used when
-    /// a symbolic name needs resolving back to its number, as in decompiled
-    /// scripts. Case-insensitive.
-    #[allow(dead_code)] // consumed by script handling (later milestone)
-    pub fn lookup_by_name(&self, name: &str) -> Option<i64> {
-        self.by_name
-            .get(&name.to_ascii_uppercase())
-            .and_then(|&i| self.entries.get(i))
-            .map(|entry| entry.value)
     }
 }
 
@@ -128,6 +99,14 @@ impl fmt::Display for IdsFile {
         }
         Ok(())
     }
+}
+
+/// One row of an IDS table.
+pub struct IdsEntry {
+    /// Values are `i64` because the corpus spans negatives and 32-bit-wide
+    /// unsigned magnitudes that don't both fit in any 32-bit type.
+    pub value: i64,
+    pub name: String,
 }
 
 /// Parse an IDS value token: hexadecimal (`0x..`) or signed decimal.

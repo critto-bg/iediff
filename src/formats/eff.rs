@@ -28,42 +28,8 @@ const EFF_VERSION: &[u8; 4] = b"V2.0";
 /// 8-byte outer header. See [`Eff::parse_embedded_at`].
 pub const EFF_V2_BODY_SIZE: usize = 0x108;
 
-/// Anything that can go wrong while parsing an EFF file.
-#[derive(Debug)]
-pub enum EffError {
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
-}
-
-impl fmt::Display for EffError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EffError::Truncated(e) => write!(f, "{e}"),
-            EffError::BadSignature(found) => {
-                write!(f, "not an EFF file: signature was {}", describe_tag(found))
-            }
-            EffError::BadVersion(found) => {
-                write!(f, "unsupported EFF version: {}", describe_tag(found))
-            }
-        }
-    }
-}
-
-impl std::error::Error for EffError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            EffError::Truncated(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<Truncated> for EffError {
-    fn from(e: Truncated) -> Self {
-        EffError::Truncated(e)
-    }
-}
+/// Size of one EFF V1 feature block on disk.
+pub const FEATURE_SIZE: usize = 48;
 
 /// A parsed EFF V2.0 effect, holding the complete on-disk record in field
 /// order. [`Display`](fmt::Display) surfaces a human-readable subset; the rest —
@@ -156,67 +122,6 @@ impl Eff {
         Eff::parse_body(reader, base)
     }
 
-    /// Parse the effect body, whose sig/ver echo sits at `body_base`. Every
-    /// other field is read relative to it (opcode at `body_base + 0x08`, …),
-    /// which is what makes the standalone (`body_base = 0x08`) and CRE-embedded
-    /// (`body_base = base`) forms one code path.
-    fn parse_body(reader: &Reader, body_base: usize) -> Result<Eff, Truncated> {
-        let at = |off: usize| body_base + off;
-
-        let mut unknown_tail = [0u32; 15];
-        for (i, slot) in unknown_tail.iter_mut().enumerate() {
-            *slot = reader.u32_at(at(0xcc) + i * 4, "trailing unknown")?;
-        }
-
-        Ok(Eff {
-            signature2: reader.tag_at(at(0x00), "body signature")?,
-            version2: reader.tag_at(at(0x04), "body version")?,
-            opcode: reader.u32_at(at(0x08), "opcode")?,
-            target: reader.u32_at(at(0x0c), "target type")?,
-            power: reader.u32_at(at(0x10), "power")?,
-            param1: reader.u32_at(at(0x14), "parameter 1")?,
-            param2: reader.u32_at(at(0x18), "parameter 2")?,
-            timing_mode: reader.u16_at(at(0x1c), "timing mode")?,
-            timing_unknown: reader.u16_at(at(0x1e), "timing (secondary)")?,
-            duration: reader.u32_at(at(0x20), "duration")?,
-            probability1: reader.u16_at(at(0x24), "probability 1")?,
-            probability2: reader.u16_at(at(0x26), "probability 2")?,
-            resource: reader.resref_at(at(0x28), "resource")?,
-            dice_thrown: reader.u32_at(at(0x30), "dice thrown")?,
-            dice_sides: reader.u32_at(at(0x34), "dice sides")?,
-            save_type: reader.u32_at(at(0x38), "saving throw type")?,
-            save_bonus: reader.u32_at(at(0x3c), "save bonus")?,
-            special: reader.u32_at(at(0x40), "special")?,
-            primary_type: reader.u32_at(at(0x44), "primary type")?,
-            unknown_0x50: reader.u32_at(at(0x48), "unknown")?,
-            affected_level_low: reader.u32_at(at(0x4c), "lowest affected level")?,
-            affected_level_high: reader.u32_at(at(0x50), "highest affected level")?,
-            dispel: reader.u32_at(at(0x54), "dispel/resistance")?,
-            param3: reader.u32_at(at(0x58), "parameter 3")?,
-            param4: reader.u32_at(at(0x5c), "parameter 4")?,
-            param5: reader.u32_at(at(0x60), "parameter 5")?,
-            time_applied: reader.u32_at(at(0x64), "time applied")?,
-            resource2: reader.resref_at(at(0x68), "resource 2")?,
-            resource3: reader.resref_at(at(0x70), "resource 3")?,
-            caster_x: reader.u32_at(at(0x78), "caster x")?,
-            caster_y: reader.u32_at(at(0x7c), "caster y")?,
-            target_x: reader.u32_at(at(0x80), "target x")?,
-            target_y: reader.u32_at(at(0x84), "target y")?,
-            parent_resource_type: reader.u32_at(at(0x88), "parent resource type")?,
-            parent_resource: reader.resref_at(at(0x8c), "parent resource")?,
-            parent_resource_flags: reader.u32_at(at(0x94), "parent resource flags")?,
-            projectile: reader.u32_at(at(0x98), "projectile")?,
-            parent_resource_slot: reader.u32_at(at(0x9c), "parent resource slot")?,
-            variable: parse_asciiz(reader.slice(at(0xa0), 32, "variable name")?),
-            caster_level: reader.u32_at(at(0xc0), "caster level")?,
-            first_apply: reader.u32_at(at(0xc4), "first apply")?,
-            secondary_type: reader.u32_at(at(0xc8), "secondary type")?,
-            unknown_tail,
-            primary_name: None,
-            secondary_name: None,
-        })
-    }
-
     /// The primary type (school), an index into MSCHOOL.2DA.
     pub fn primary_type(&self) -> u32 {
         self.primary_type
@@ -267,75 +172,6 @@ impl Eff {
         uses
     }
 
-    /// Write the effect's fields as `key=value` lines, in disk order, exactly as
-    /// stored (unsigned, undecoded). Each key carries `prefix` so the line is
-    /// self-locating when embedded (e.g. `"effect.3."` in a CRE); the standalone
-    /// resource passes `""`. The format's unknown/structural words and the
-    /// resolved dictionary names are intentionally omitted.
-    pub fn write_raw(&self, out: &mut dyn Write, prefix: &str) -> io::Result<()> {
-        writeln!(out, "{prefix}opcode={}", self.opcode)?;
-        writeln!(out, "{prefix}target={}", self.target)?;
-        writeln!(out, "{prefix}power={}", self.power)?;
-        writeln!(out, "{prefix}param1={}", self.param1)?;
-        writeln!(out, "{prefix}param2={}", self.param2)?;
-        writeln!(out, "{prefix}timing_mode={}", self.timing_mode)?;
-        writeln!(out, "{prefix}duration={}", self.duration)?;
-        writeln!(out, "{prefix}probability1={}", self.probability1)?;
-        writeln!(out, "{prefix}probability2={}", self.probability2)?;
-        writeln!(out, "{prefix}resource={}", self.resource)?;
-        writeln!(out, "{prefix}dice_thrown={}", self.dice_thrown)?;
-        writeln!(out, "{prefix}dice_sides={}", self.dice_sides)?;
-        writeln!(out, "{prefix}save_type={}", self.save_type)?;
-        writeln!(out, "{prefix}save_bonus={}", self.save_bonus)?;
-        writeln!(out, "{prefix}special={}", self.special)?;
-        writeln!(out, "{prefix}primary_type={}", self.primary_type)?;
-        writeln!(
-            out,
-            "{prefix}affected_level_low={}",
-            self.affected_level_low
-        )?;
-        writeln!(
-            out,
-            "{prefix}affected_level_high={}",
-            self.affected_level_high
-        )?;
-        writeln!(out, "{prefix}dispel={}", self.dispel)?;
-        writeln!(out, "{prefix}param3={}", self.param3)?;
-        writeln!(out, "{prefix}param4={}", self.param4)?;
-        writeln!(out, "{prefix}param5={}", self.param5)?;
-        writeln!(out, "{prefix}time_applied={}", self.time_applied)?;
-        writeln!(out, "{prefix}resource2={}", self.resource2)?;
-        writeln!(out, "{prefix}resource3={}", self.resource3)?;
-        writeln!(out, "{prefix}caster_x={}", self.caster_x)?;
-        writeln!(out, "{prefix}caster_y={}", self.caster_y)?;
-        writeln!(out, "{prefix}target_x={}", self.target_x)?;
-        writeln!(out, "{prefix}target_y={}", self.target_y)?;
-        writeln!(
-            out,
-            "{prefix}parent_resource_type={}",
-            self.parent_resource_type
-        )?;
-        writeln!(out, "{prefix}parent_resource={}", self.parent_resource)?;
-        writeln!(
-            out,
-            "{prefix}parent_resource_flags={}",
-            self.parent_resource_flags
-        )?;
-        writeln!(out, "{prefix}projectile={}", self.projectile)?;
-        writeln!(
-            out,
-            "{prefix}parent_resource_slot={}",
-            self.parent_resource_slot
-        )?;
-        writeln!(out, "{prefix}variable={}", self.variable)?;
-        writeln!(out, "{prefix}caster_level={}", self.caster_level)?;
-        writeln!(out, "{prefix}first_apply={}", self.first_apply)?;
-        writeln!(out, "{prefix}secondary_type={}", self.secondary_type)?;
-        Ok(())
-    }
-}
-
-impl Eff {
     /// Render the authored effect fields, each line prefixed with `indent`. The
     /// optional resrefs, dice, and extra parameters appear only when they carry
     /// a value. Shared by the standalone [`Display`](fmt::Display) (indent
@@ -445,6 +281,134 @@ impl Eff {
 
         Ok(())
     }
+
+    /// Write the effect's fields as `key=value` lines, in disk order, exactly as
+    /// stored (unsigned, undecoded). Each key carries `prefix` so the line is
+    /// self-locating when embedded (e.g. `"effect.3."` in a CRE); the standalone
+    /// resource passes `""`. The format's unknown/structural words and the
+    /// resolved dictionary names are intentionally omitted.
+    pub fn write_raw(&self, out: &mut dyn Write, prefix: &str) -> io::Result<()> {
+        writeln!(out, "{prefix}opcode={}", self.opcode)?;
+        writeln!(out, "{prefix}target={}", self.target)?;
+        writeln!(out, "{prefix}power={}", self.power)?;
+        writeln!(out, "{prefix}param1={}", self.param1)?;
+        writeln!(out, "{prefix}param2={}", self.param2)?;
+        writeln!(out, "{prefix}timing_mode={}", self.timing_mode)?;
+        writeln!(out, "{prefix}duration={}", self.duration)?;
+        writeln!(out, "{prefix}probability1={}", self.probability1)?;
+        writeln!(out, "{prefix}probability2={}", self.probability2)?;
+        writeln!(out, "{prefix}resource={}", self.resource)?;
+        writeln!(out, "{prefix}dice_thrown={}", self.dice_thrown)?;
+        writeln!(out, "{prefix}dice_sides={}", self.dice_sides)?;
+        writeln!(out, "{prefix}save_type={}", self.save_type)?;
+        writeln!(out, "{prefix}save_bonus={}", self.save_bonus)?;
+        writeln!(out, "{prefix}special={}", self.special)?;
+        writeln!(out, "{prefix}primary_type={}", self.primary_type)?;
+        writeln!(
+            out,
+            "{prefix}affected_level_low={}",
+            self.affected_level_low
+        )?;
+        writeln!(
+            out,
+            "{prefix}affected_level_high={}",
+            self.affected_level_high
+        )?;
+        writeln!(out, "{prefix}dispel={}", self.dispel)?;
+        writeln!(out, "{prefix}param3={}", self.param3)?;
+        writeln!(out, "{prefix}param4={}", self.param4)?;
+        writeln!(out, "{prefix}param5={}", self.param5)?;
+        writeln!(out, "{prefix}time_applied={}", self.time_applied)?;
+        writeln!(out, "{prefix}resource2={}", self.resource2)?;
+        writeln!(out, "{prefix}resource3={}", self.resource3)?;
+        writeln!(out, "{prefix}caster_x={}", self.caster_x)?;
+        writeln!(out, "{prefix}caster_y={}", self.caster_y)?;
+        writeln!(out, "{prefix}target_x={}", self.target_x)?;
+        writeln!(out, "{prefix}target_y={}", self.target_y)?;
+        writeln!(
+            out,
+            "{prefix}parent_resource_type={}",
+            self.parent_resource_type
+        )?;
+        writeln!(out, "{prefix}parent_resource={}", self.parent_resource)?;
+        writeln!(
+            out,
+            "{prefix}parent_resource_flags={}",
+            self.parent_resource_flags
+        )?;
+        writeln!(out, "{prefix}projectile={}", self.projectile)?;
+        writeln!(
+            out,
+            "{prefix}parent_resource_slot={}",
+            self.parent_resource_slot
+        )?;
+        writeln!(out, "{prefix}variable={}", self.variable)?;
+        writeln!(out, "{prefix}caster_level={}", self.caster_level)?;
+        writeln!(out, "{prefix}first_apply={}", self.first_apply)?;
+        writeln!(out, "{prefix}secondary_type={}", self.secondary_type)?;
+        Ok(())
+    }
+
+    /// Parse the effect body, whose sig/ver echo sits at `body_base`. Every
+    /// other field is read relative to it (opcode at `body_base + 0x08`, …),
+    /// which is what makes the standalone (`body_base = 0x08`) and CRE-embedded
+    /// (`body_base = base`) forms one code path.
+    fn parse_body(reader: &Reader, body_base: usize) -> Result<Eff, Truncated> {
+        let at = |off: usize| body_base + off;
+
+        let mut unknown_tail = [0u32; 15];
+        for (i, slot) in unknown_tail.iter_mut().enumerate() {
+            *slot = reader.u32_at(at(0xcc) + i * 4, "trailing unknown")?;
+        }
+
+        Ok(Eff {
+            signature2: reader.tag_at(at(0x00), "body signature")?,
+            version2: reader.tag_at(at(0x04), "body version")?,
+            opcode: reader.u32_at(at(0x08), "opcode")?,
+            target: reader.u32_at(at(0x0c), "target type")?,
+            power: reader.u32_at(at(0x10), "power")?,
+            param1: reader.u32_at(at(0x14), "parameter 1")?,
+            param2: reader.u32_at(at(0x18), "parameter 2")?,
+            timing_mode: reader.u16_at(at(0x1c), "timing mode")?,
+            timing_unknown: reader.u16_at(at(0x1e), "timing (secondary)")?,
+            duration: reader.u32_at(at(0x20), "duration")?,
+            probability1: reader.u16_at(at(0x24), "probability 1")?,
+            probability2: reader.u16_at(at(0x26), "probability 2")?,
+            resource: reader.resref_at(at(0x28), "resource")?,
+            dice_thrown: reader.u32_at(at(0x30), "dice thrown")?,
+            dice_sides: reader.u32_at(at(0x34), "dice sides")?,
+            save_type: reader.u32_at(at(0x38), "saving throw type")?,
+            save_bonus: reader.u32_at(at(0x3c), "save bonus")?,
+            special: reader.u32_at(at(0x40), "special")?,
+            primary_type: reader.u32_at(at(0x44), "primary type")?,
+            unknown_0x50: reader.u32_at(at(0x48), "unknown")?,
+            affected_level_low: reader.u32_at(at(0x4c), "lowest affected level")?,
+            affected_level_high: reader.u32_at(at(0x50), "highest affected level")?,
+            dispel: reader.u32_at(at(0x54), "dispel/resistance")?,
+            param3: reader.u32_at(at(0x58), "parameter 3")?,
+            param4: reader.u32_at(at(0x5c), "parameter 4")?,
+            param5: reader.u32_at(at(0x60), "parameter 5")?,
+            time_applied: reader.u32_at(at(0x64), "time applied")?,
+            resource2: reader.resref_at(at(0x68), "resource 2")?,
+            resource3: reader.resref_at(at(0x70), "resource 3")?,
+            caster_x: reader.u32_at(at(0x78), "caster x")?,
+            caster_y: reader.u32_at(at(0x7c), "caster y")?,
+            target_x: reader.u32_at(at(0x80), "target x")?,
+            target_y: reader.u32_at(at(0x84), "target y")?,
+            parent_resource_type: reader.u32_at(at(0x88), "parent resource type")?,
+            parent_resource: reader.resref_at(at(0x8c), "parent resource")?,
+            parent_resource_flags: reader.u32_at(at(0x94), "parent resource flags")?,
+            projectile: reader.u32_at(at(0x98), "projectile")?,
+            parent_resource_slot: reader.u32_at(at(0x9c), "parent resource slot")?,
+            variable: parse_asciiz(reader.slice(at(0xa0), 32, "variable name")?),
+            caster_level: reader.u32_at(at(0xc0), "caster level")?,
+            first_apply: reader.u32_at(at(0xc4), "first apply")?,
+            secondary_type: reader.u32_at(at(0xc8), "secondary type")?,
+            unknown_tail,
+            primary_name: None,
+            secondary_name: None,
+        })
+    }
 }
 
 impl fmt::Display for Eff {
@@ -454,43 +418,6 @@ impl fmt::Display for Eff {
         self.write_human(f, "  ")
     }
 }
-
-/// The strref field uses for an effect with these field values, tagged
-/// `op<n>.<field>`. Shared by the standalone/CRE-embedded V2 [`Eff`] and the
-/// ITM/SPL/CRE V1 [`Feature`], which store the same effect at different widths.
-/// Table-driven from [`opcode_strref_slots`], plus op319's value-dependent
-/// Parameter #1 — a strref (the actor name to match) when Parameter #2, the IDS
-/// file, selects "Actor's name" (10). The embedding resource prefixes the paths
-/// with the effect's location (e.g. `equipping[0].`).
-fn effect_strref_uses(opcode: u32, param1: u32, param2: u32, special: u32) -> Vec<StrrefUse> {
-    let mut uses: Vec<StrrefUse> = opcode_strref_slots(opcode)
-        .iter()
-        .map(|slot| {
-            let (value, field) = match slot {
-                StrrefSlot::Param1 => (param1, "param1"),
-                StrrefSlot::Special => (special, "special"),
-            };
-            StrrefUse::new(value, format!("op{opcode}.{field}"))
-        })
-        .collect();
-    if opcode == 319 && param2 == 10 {
-        uses.push(StrrefUse::new(param1, format!("op{opcode}.param1")));
-    }
-    uses
-}
-
-/// Field name for a resource slot, as it appears in a reference path
-/// (`op122.resource2`). Matches the `write_raw` keys.
-fn resource_slot_name(slot: ResourceSlot) -> &'static str {
-    match slot {
-        ResourceSlot::Resource => "resource",
-        ResourceSlot::Resource2 => "resource2",
-        ResourceSlot::Resource3 => "resource3",
-    }
-}
-
-/// Size of one EFF V1 feature block on disk.
-pub const FEATURE_SIZE: usize = 48;
 
 /// A parsed EFF V1 "feature block": the 48-byte embedded effect carried by ITM
 /// and SPL files (as equipping/casting effects and per-ability effects). It is
@@ -569,6 +496,29 @@ impl Feature {
         effect_strref_uses(self.opcode as u32, self.param1, self.param2, self.special)
     }
 
+    /// Resources this effect names, tagged `op<n>.resource`. The V1 layout has
+    /// a single resref field, so any [`ResourceSlot::Resource2`]/`Resource3`
+    /// the opcode would use in a V2 effect simply isn't there to read — the
+    /// `Resource`-slot filter below is what keeps this honest rather than
+    /// reporting the same resref three times for opcode #122.
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        if self.resource.is_empty() {
+            return Vec::new();
+        }
+        opcode_resource_slots(self.opcode as u32)
+            .iter()
+            .filter(|slot| slot.slot == ResourceSlot::Resource)
+            .map(|slot| {
+                let use_ = ResrefUse::new(
+                    slot.kind,
+                    &self.resource,
+                    format!("op{}.resource", self.opcode),
+                );
+                if slot.soft { use_.soft() } else { use_ }
+            })
+            .collect()
+    }
+
     /// Render the feature in the human-readable view, each line prefixed with
     /// `indent`. The optional resrefs, dice, and special word print only when
     /// they carry a value — matching [`Eff`]'s `Display`.
@@ -633,29 +583,6 @@ impl Feature {
         Ok(())
     }
 
-    /// Resources this effect names, tagged `op<n>.resource`. The V1 layout has
-    /// a single resref field, so any [`ResourceSlot::Resource2`]/`Resource3`
-    /// the opcode would use in a V2 effect simply isn't there to read — the
-    /// `Resource`-slot filter below is what keeps this honest rather than
-    /// reporting the same resref three times for opcode #122.
-    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
-        if self.resource.is_empty() {
-            return Vec::new();
-        }
-        opcode_resource_slots(self.opcode as u32)
-            .iter()
-            .filter(|slot| slot.slot == ResourceSlot::Resource)
-            .map(|slot| {
-                let use_ = ResrefUse::new(
-                    slot.kind,
-                    &self.resource,
-                    format!("op{}.resource", self.opcode),
-                );
-                if slot.soft { use_.soft() } else { use_ }
-            })
-            .collect()
-    }
-
     /// Write the feature's fields as `key=value` lines, in disk order, exactly as
     /// stored. Each key is prefixed (e.g. `"ext.0.effect.2."`) so the line is
     /// self-locating in the flat machine-readable view.
@@ -677,6 +604,77 @@ impl Feature {
         writeln!(out, "{prefix}save_bonus={}", self.save_bonus)?;
         writeln!(out, "{prefix}special={}", self.special)?;
         Ok(())
+    }
+}
+
+/// Anything that can go wrong while parsing an EFF file.
+#[derive(Debug)]
+pub enum EffError {
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
+}
+
+impl fmt::Display for EffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EffError::Truncated(e) => write!(f, "{e}"),
+            EffError::BadSignature(found) => {
+                write!(f, "not an EFF file: signature was {}", describe_tag(found))
+            }
+            EffError::BadVersion(found) => {
+                write!(f, "unsupported EFF version: {}", describe_tag(found))
+            }
+        }
+    }
+}
+
+impl std::error::Error for EffError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EffError::Truncated(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Truncated> for EffError {
+    fn from(e: Truncated) -> Self {
+        EffError::Truncated(e)
+    }
+}
+
+/// The strref field uses for an effect with these field values, tagged
+/// `op<n>.<field>`. Shared by the standalone/CRE-embedded V2 [`Eff`] and the
+/// ITM/SPL/CRE V1 [`Feature`], which store the same effect at different widths.
+/// Table-driven from [`opcode_strref_slots`], plus op319's value-dependent
+/// Parameter #1 — a strref (the actor name to match) when Parameter #2, the IDS
+/// file, selects "Actor's name" (10). The embedding resource prefixes the paths
+/// with the effect's location (e.g. `equipping[0].`).
+fn effect_strref_uses(opcode: u32, param1: u32, param2: u32, special: u32) -> Vec<StrrefUse> {
+    let mut uses: Vec<StrrefUse> = opcode_strref_slots(opcode)
+        .iter()
+        .map(|slot| {
+            let (value, field) = match slot {
+                StrrefSlot::Param1 => (param1, "param1"),
+                StrrefSlot::Special => (special, "special"),
+            };
+            StrrefUse::new(value, format!("op{opcode}.{field}"))
+        })
+        .collect();
+    if opcode == 319 && param2 == 10 {
+        uses.push(StrrefUse::new(param1, format!("op{opcode}.param1")));
+    }
+    uses
+}
+
+/// Field name for a resource slot, as it appears in a reference path
+/// (`op122.resource2`). Matches the `write_raw` keys.
+fn resource_slot_name(slot: ResourceSlot) -> &'static str {
+    match slot {
+        ResourceSlot::Resource => "resource",
+        ResourceSlot::Resource2 => "resource2",
+        ResourceSlot::Resource3 => "resource3",
     }
 }
 

@@ -49,60 +49,1026 @@ const PTRAP_SIZE: usize = 0x1c;
 const SONG_SIZE: usize = 0x90;
 const REST_SIZE: usize = 0xe4;
 
-/// Anything that can go wrong while parsing an ARE file.
-#[derive(Debug)]
-pub enum AreError {
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
+/// Names of the six actor script slots, in parse order.
+const SCRIPT_SLOTS: [&str; 6] = [
+    "override", "general", "class", "race", "default", "specific",
+];
+
+/// The hours (schedule bits 0-23) that count as daytime; the rest are night.
+/// Matches the day/night split the engine and editors use.
+const DAY_HOURS: u32 = 0x1f_ffc0;
+const NIGHT_HOURS: u32 = 0x00ff_ffff & !DAY_HOURS;
+
+/// Area type bits (header 0x48), BG2/BGEE meanings.
+const AREA_TYPE_BITS: [&str; 8] = [
+    "outdoor",
+    "day/night",
+    "weather",
+    "city",
+    "forest",
+    "dungeon",
+    "extended night",
+    "rest indoors",
+];
+
+/// Door flags (door 0x28).
+const DOOR_FLAGS: [(u32, &str); 9] = [
+    (0, "open"),
+    (1, "locked"),
+    (4, "broken"),
+    (5, "can't close"),
+    (6, "linked"),
+    (7, "hidden"),
+    (8, "found"),
+    (9, "no LOS block"),
+    (10, "remove key"),
+];
+
+/// A parsed ARE file: the header plus the decoded content sections, with names
+/// the manager has resolved attached.
+pub struct Are {
+    header: AreHeader,
+    actors: Vec<Actor>,
+    regions: Vec<Region>,
+    entrances: Vec<Entrance>,
+    containers: Vec<Container>,
+    items: Vec<Item>,
+    spawns: Vec<Spawn>,
+    ambients: Vec<Ambient>,
+    variables: Vec<Variable>,
+    doors: Vec<Door>,
+    animations: Vec<Animation>,
+    automap: Vec<Automap>,
+    vertices: Vec<(u16, u16)>,
+    tiled_objects: Vec<TiledObject>,
+    proj_traps: Vec<ProjectileTrap>,
+    song: Option<Song>,
+    rest: Option<RestInterruption>,
 }
 
-impl fmt::Display for AreError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AreError::Truncated(e) => write!(f, "{e}"),
-            AreError::BadSignature(found) => {
-                write!(f, "not an ARE file: signature was {}", describe_tag(found))
-            }
-            AreError::BadVersion(found) => {
-                write!(f, "unsupported ARE version: {}", describe_tag(found))
-            }
+impl Are {
+    /// Parse an ARE V1.0 resource. Each section is read from its
+    /// header-declared offset and count; the sections may appear in any order.
+    pub fn parse(data: &[u8]) -> Result<Are, AreError> {
+        let reader = Reader::new(data);
+
+        let signature = reader.tag_at(0x00, "signature")?;
+        if &signature != ARE_SIGNATURE {
+            return Err(AreError::BadSignature(signature));
         }
-    }
-}
 
-impl std::error::Error for AreError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            AreError::Truncated(e) => Some(e),
-            _ => None,
+        let version = reader.tag_at(0x04, "version")?;
+        if &version != ARE_VERSION {
+            return Err(AreError::BadVersion(version));
         }
-    }
-}
 
-impl From<Truncated> for AreError {
-    fn from(e: Truncated) -> Self {
-        AreError::Truncated(e)
-    }
-}
+        let header = AreHeader::parse(&reader)?;
 
-/// Read a fixed 32-byte NUL-padded name field.
-fn name_at(reader: &Reader, offset: usize, context: &'static str) -> Result<String, Truncated> {
-    Ok(parse_asciiz(reader.slice(offset, 32, context)?))
-}
+        // (offset word, count word, count is dword) per section. Counts are a
+        // mix of word and dword fields, so each is read at its own width.
+        let actors = Self::read_records(
+            &reader,
+            reader.u32_at(0x54, "actor offset")? as usize,
+            reader.u16_at(0x58, "actor count")? as usize,
+            ACTOR_SIZE,
+            Actor::parse_at,
+        )?;
+        let regions = Self::read_records(
+            &reader,
+            reader.u32_at(0x5c, "region offset")? as usize,
+            reader.u16_at(0x5a, "region count")? as usize,
+            REGION_SIZE,
+            Region::parse_at,
+        )?;
+        let spawns = Self::read_records(
+            &reader,
+            reader.u32_at(0x60, "spawn offset")? as usize,
+            reader.u32_at(0x64, "spawn count")? as usize,
+            SPAWN_SIZE,
+            Spawn::parse_at,
+        )?;
+        let entrances = Self::read_records(
+            &reader,
+            reader.u32_at(0x68, "entrance offset")? as usize,
+            reader.u32_at(0x6c, "entrance count")? as usize,
+            ENTRANCE_SIZE,
+            Entrance::parse_at,
+        )?;
+        let containers = Self::read_records(
+            &reader,
+            reader.u32_at(0x70, "container offset")? as usize,
+            reader.u16_at(0x74, "container count")? as usize,
+            CONTAINER_SIZE,
+            Container::parse_at,
+        )?;
+        let items = Self::read_records(
+            &reader,
+            reader.u32_at(0x78, "item offset")? as usize,
+            reader.u16_at(0x76, "item count")? as usize,
+            ITEM_SIZE,
+            Item::parse_at,
+        )?;
+        let ambients = Self::read_records(
+            &reader,
+            reader.u32_at(0x84, "ambient offset")? as usize,
+            reader.u16_at(0x82, "ambient count")? as usize,
+            AMBIENT_SIZE,
+            Ambient::parse_at,
+        )?;
+        let variables = Self::read_records(
+            &reader,
+            reader.u32_at(0x88, "variable offset")? as usize,
+            reader.u32_at(0x8c, "variable count")? as usize,
+            VARIABLE_SIZE,
+            Variable::parse_at,
+        )?;
+        let doors = Self::read_records(
+            &reader,
+            reader.u32_at(0xa8, "door offset")? as usize,
+            reader.u32_at(0xa4, "door count")? as usize,
+            DOOR_SIZE,
+            Door::parse_at,
+        )?;
+        let animations = Self::read_records(
+            &reader,
+            reader.u32_at(0xb0, "animation offset")? as usize,
+            reader.u32_at(0xac, "animation count")? as usize,
+            ANIM_SIZE,
+            Animation::parse_at,
+        )?;
+        let automap = Self::read_records(
+            &reader,
+            reader.u32_at(0xc4, "automap offset")? as usize,
+            reader.u32_at(0xc8, "automap count")? as usize,
+            AUTOMAP_SIZE,
+            Automap::parse_at,
+        )?;
 
-/// A neighbouring area link (the four edges of the map).
-struct Neighbor {
-    area: String,
-    flags: u32,
-}
+        // The vertex pool: a flat array of (x, y) words that regions, containers
+        // and doors index into.
+        let vertices = Self::read_records(
+            &reader,
+            reader.u32_at(0x7c, "vertex offset")? as usize,
+            reader.u16_at(0x80, "vertex count")? as usize,
+            VERTEX_SIZE,
+            |r, base| Ok((r.u16_at(base, "vertex x")?, r.u16_at(base + 2, "vertex y")?)),
+        )?;
+        let tiled_objects = Self::read_records(
+            &reader,
+            reader.u32_at(0xb8, "tiled object offset")? as usize,
+            reader.u32_at(0xb4, "tiled object count")? as usize,
+            TILED_SIZE,
+            TiledObject::parse_at,
+        )?;
+        let proj_traps = Self::read_records(
+            &reader,
+            reader.u32_at(0xcc, "projectile trap offset")? as usize,
+            reader.u32_at(0xd0, "projectile trap count")? as usize,
+            PTRAP_SIZE,
+            ProjectileTrap::parse_at,
+        )?;
 
-impl Neighbor {
-    fn parse_at(reader: &Reader, area_at: usize, flags_at: usize) -> Result<Neighbor, Truncated> {
-        Ok(Neighbor {
-            area: reader.resref_at(area_at, "neighbour area")?,
-            flags: reader.u32_at(flags_at, "neighbour flags")?,
+        // Song entries and rest interruptions are each a single fixed struct
+        // located by offset, with no count. Parse when the offset points at a
+        // struct that fits within the file; otherwise treat as absent.
+        let song = Self::read_struct(&reader, data.len(), 0xbc, SONG_SIZE, Song::parse_at)?;
+        let rest = Self::read_struct(
+            &reader,
+            data.len(),
+            0xc0,
+            REST_SIZE,
+            RestInterruption::parse_at,
+        )?
+        .filter(RestInterruption::is_populated);
+
+        Ok(Are {
+            header,
+            actors,
+            regions,
+            entrances,
+            containers,
+            items,
+            spawns,
+            ambients,
+            variables,
+            doors,
+            animations,
+            automap,
+            vertices,
+            tiled_objects,
+            proj_traps,
+            song,
+            rest,
         })
+    }
+
+    /// The actors, for the manager to resolve their CRE names.
+    pub fn actors_mut(&mut self) -> &mut [Actor] {
+        &mut self.actors
+    }
+
+    /// The flat item pool, for the manager to resolve their ITM names.
+    pub fn items_mut(&mut self) -> &mut [Item] {
+        &mut self.items
+    }
+
+    /// The spawn points, for the manager to resolve their creature names.
+    pub fn spawns_mut(&mut self) -> &mut [Spawn] {
+        &mut self.spawns
+    }
+
+    /// The regions, for the manager to resolve their info-text strrefs.
+    pub fn regions_mut(&mut self) -> &mut [Region] {
+        &mut self.regions
+    }
+
+    /// The doors, for the manager to resolve their speaker strrefs.
+    pub fn doors_mut(&mut self) -> &mut [Door] {
+        &mut self.doors
+    }
+
+    /// The automap notes, for the manager to resolve their text strrefs.
+    pub fn automap_mut(&mut self) -> &mut [Automap] {
+        &mut self.automap
+    }
+
+    /// The projectile traps, for the manager to resolve their missile symbols.
+    pub fn proj_traps_mut(&mut self) -> &mut [ProjectileTrap] {
+        &mut self.proj_traps
+    }
+
+    /// The rest-interruption table, if present, for the manager to resolve its
+    /// creature names.
+    pub fn rest_mut(&mut self) -> Option<&mut RestInterruption> {
+        self.rest.as_mut()
+    }
+
+    /// Every TLK strref this area references, tagged with its field: region info
+    /// text and speaker name, container and door lockpick strings, door dialog
+    /// speakers, and automap note text.
+    pub fn strref_uses(&self) -> Vec<StrrefUse> {
+        let mut uses = Vec::new();
+        for (i, r) in self.regions.iter().enumerate() {
+            uses.push(StrrefUse::new(
+                r.info_text,
+                format!("region[{i}].info_text"),
+            ));
+            uses.push(StrrefUse::new(
+                r.speaker_name,
+                format!("region[{i}].speaker_name"),
+            ));
+        }
+        for (i, c) in self.containers.iter().enumerate() {
+            uses.push(StrrefUse::new(
+                c.lockpick_string,
+                format!("container[{i}].lockpick_string"),
+            ));
+        }
+        for (i, d) in self.doors.iter().enumerate() {
+            uses.push(StrrefUse::new(
+                d.lockpick_string,
+                format!("door[{i}].lockpick_string"),
+            ));
+            uses.push(StrrefUse::new(
+                d.dialog_speaker,
+                format!("door[{i}].dialog_speaker"),
+            ));
+        }
+        for (i, n) in self.automap.iter().enumerate() {
+            uses.push(StrrefUse::new(n.strref(), format!("automap[{i}].text")));
+        }
+        uses
+    }
+
+    /// Every resource this area names, tagged with the type it names: the
+    /// tilemap and neighbouring areas, the area and per-record scripts, the CRE
+    /// of every actor / spawn / rest creature, the ITM of every pooled item and
+    /// key, the DLG of every actor and door, and the sounds and animations.
+    ///
+    /// Note that a container's contents are *not* named on the container: every
+    /// item in the area lives in one flat pool, which the containers index into.
+    /// A hit therefore reads `item[12]`, not `container[3].item[0]`.
+    ///
+    /// Skipped as area-internal labels rather than resource references: each
+    /// record's `name`, a door's `door_id` and a tiled object's `tile_id` (both
+    /// name entries inside the WED), and a region's `entrance` (an entrance name
+    /// within the destination area).
+    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
+        let h = &self.header;
+        let mut uses = vec![
+            ResrefUse::new(WED_TYPE, &h.wed, "wed"),
+            ResrefUse::new(BCS_TYPE, &h.script, "script"),
+            ResrefUse::new(ARE_TYPE, &h.north.area, "north"),
+            ResrefUse::new(ARE_TYPE, &h.east.area, "east"),
+            ResrefUse::new(ARE_TYPE, &h.south.area, "south"),
+            ResrefUse::new(ARE_TYPE, &h.west.area, "west"),
+        ];
+
+        for (i, a) in self.actors.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                CRE_TYPE,
+                &a.cre_file,
+                format!("actor[{i}].cre"),
+            ));
+            uses.push(ResrefUse::new(
+                DLG_TYPE,
+                &a.dialog,
+                format!("actor[{i}].dialog"),
+            ));
+            for (j, script) in a.scripts.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    BCS_TYPE,
+                    script,
+                    format!("actor[{i}].script[{j}]"),
+                ));
+            }
+        }
+
+        for (i, r) in self.regions.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ARE_TYPE,
+                &r.destination,
+                format!("region[{i}].destination"),
+            ));
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &r.key_item,
+                format!("region[{i}].key_item"),
+            ));
+            uses.push(ResrefUse::new(
+                BCS_TYPE,
+                &r.script,
+                format!("region[{i}].script"),
+            ));
+        }
+
+        for (i, c) in self.containers.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &c.key_item,
+                format!("container[{i}].key_item"),
+            ));
+        }
+
+        for (i, item) in self.items.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &item.resource,
+                format!("item[{i}]"),
+            ));
+        }
+
+        for (i, s) in self.spawns.iter().enumerate() {
+            for (j, c) in s.creatures.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    CRE_TYPE,
+                    &c.resource,
+                    format!("spawn[{i}].creature[{j}]"),
+                ));
+            }
+        }
+
+        for (i, a) in self.ambients.iter().enumerate() {
+            for (j, sound) in a.sounds.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    WAV_TYPE,
+                    sound,
+                    format!("ambient[{i}].sound[{j}]"),
+                ));
+            }
+        }
+
+        for (i, d) in self.doors.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                ITM_TYPE,
+                &d.key_item,
+                format!("door[{i}].key_item"),
+            ));
+            uses.push(ResrefUse::new(
+                BCS_TYPE,
+                &d.script,
+                format!("door[{i}].script"),
+            ));
+            uses.push(ResrefUse::new(
+                DLG_TYPE,
+                &d.dialog,
+                format!("door[{i}].dialog"),
+            ));
+            uses.push(ResrefUse::new(
+                WAV_TYPE,
+                &d.open_sound,
+                format!("door[{i}].open_sound"),
+            ));
+            uses.push(ResrefUse::new(
+                WAV_TYPE,
+                &d.close_sound,
+                format!("door[{i}].close_sound"),
+            ));
+        }
+
+        for (i, a) in self.animations.iter().enumerate() {
+            // "BGEE: BAM/WBM/PVRZ, Others: BAM" — BAM is the likely reading on
+            // this engine, not the guaranteed one.
+            uses.push(
+                ResrefUse::new(BAM_TYPE, &a.resource, format!("animation[{i}].resource")).soft(),
+            );
+        }
+
+        for (i, t) in self.proj_traps.iter().enumerate() {
+            uses.push(ResrefUse::new(
+                PRO_TYPE,
+                &t.projectile,
+                format!("proj_trap[{i}].projectile"),
+            ));
+        }
+
+        if let Some(song) = &self.song {
+            for (i, sound) in song.day_ambient.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    WAV_TYPE,
+                    sound,
+                    format!("song.day_ambient[{i}]"),
+                ));
+            }
+            for (i, sound) in song.night_ambient.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    WAV_TYPE,
+                    sound,
+                    format!("song.night_ambient[{i}]"),
+                ));
+            }
+        }
+
+        if let Some(rest) = &self.rest {
+            for (i, c) in rest.creatures.iter().enumerate() {
+                uses.push(ResrefUse::new(
+                    CRE_TYPE,
+                    &c.resource,
+                    format!("rest.creature[{i}]"),
+                ));
+            }
+        }
+
+        uses.retain(|u| !u.value.is_empty());
+        uses
+    }
+
+    /// Write the whole area as flat `key=value` lines: header fields bare, each
+    /// section under `<section>.<n>.`.
+    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
+        let h = &self.header;
+        writeln!(out, "wed={}", h.wed)?;
+        writeln!(out, "last_saved={}", h.last_saved)?;
+        writeln!(out, "flags={}", h.flags)?;
+        writeln!(out, "area_type={}", h.area_type)?;
+        writeln!(out, "rain={}", h.rain)?;
+        writeln!(out, "snow={}", h.snow)?;
+        writeln!(out, "fog={}", h.fog)?;
+        writeln!(out, "lightning={}", h.lightning)?;
+        writeln!(out, "script={}", h.script)?;
+        for (label, n) in [
+            ("north", &h.north),
+            ("east", &h.east),
+            ("south", &h.south),
+            ("west", &h.west),
+        ] {
+            writeln!(out, "{label}={}", n.area)?;
+            writeln!(out, "{label}_flags={}", n.flags)?;
+        }
+
+        for (i, a) in self.actors.iter().enumerate() {
+            writeln!(out, "actor.{i}.name={}", a.name)?;
+            writeln!(out, "actor.{i}.x={}", a.x)?;
+            writeln!(out, "actor.{i}.y={}", a.y)?;
+            writeln!(out, "actor.{i}.flags={}", a.flags)?;
+            writeln!(out, "actor.{i}.orientation={}", a.orientation)?;
+            writeln!(out, "actor.{i}.animation={}", a.animation)?;
+            writeln!(
+                out,
+                "actor.{i}.appearance_schedule={}",
+                a.appearance_schedule
+            )?;
+            writeln!(out, "actor.{i}.removal_timer={}", a.removal_timer)?;
+            writeln!(out, "actor.{i}.dest_x={}", a.dest_x)?;
+            writeln!(out, "actor.{i}.dest_y={}", a.dest_y)?;
+            writeln!(out, "actor.{i}.cre={}", a.cre_file)?;
+            writeln!(out, "actor.{i}.dialog={}", a.dialog)?;
+            for (slot, script) in SCRIPT_SLOTS.iter().zip(&a.scripts) {
+                writeln!(out, "actor.{i}.script_{slot}={script}")?;
+            }
+        }
+
+        for (i, r) in self.regions.iter().enumerate() {
+            writeln!(out, "region.{i}.name={}", r.name)?;
+            writeln!(out, "region.{i}.type={}", r.region_type)?;
+            writeln!(out, "region.{i}.vertices={}", r.vertex_count)?;
+            writeln!(out, "region.{i}.trigger_value={}", r.trigger_value)?;
+            writeln!(out, "region.{i}.destination={}", r.destination)?;
+            writeln!(out, "region.{i}.entrance={}", r.entrance)?;
+            writeln!(out, "region.{i}.flags={}", r.flags)?;
+            writeln!(out, "region.{i}.info_text={}", strref_raw(r.info_text))?;
+            writeln!(out, "region.{i}.trapped={}", r.trapped)?;
+            writeln!(out, "region.{i}.key_item={}", r.key_item)?;
+            writeln!(out, "region.{i}.script={}", r.script)?;
+            writeln!(
+                out,
+                "region.{i}.speaker_name={}",
+                strref_raw(r.speaker_name)
+            )?;
+        }
+
+        for (i, e) in self.entrances.iter().enumerate() {
+            writeln!(out, "entrance.{i}.name={}", e.name)?;
+            writeln!(out, "entrance.{i}.x={}", e.x)?;
+            writeln!(out, "entrance.{i}.y={}", e.y)?;
+            writeln!(out, "entrance.{i}.orientation={}", e.orientation)?;
+        }
+
+        for (i, c) in self.containers.iter().enumerate() {
+            writeln!(out, "container.{i}.name={}", c.name)?;
+            writeln!(out, "container.{i}.x={}", c.x)?;
+            writeln!(out, "container.{i}.y={}", c.y)?;
+            writeln!(out, "container.{i}.type={}", c.container_type)?;
+            writeln!(out, "container.{i}.lock={}", c.lock_difficulty)?;
+            writeln!(out, "container.{i}.flags={}", c.flags)?;
+            writeln!(out, "container.{i}.trapped={}", c.trapped)?;
+            writeln!(out, "container.{i}.item_index={}", c.item_index)?;
+            writeln!(out, "container.{i}.item_count={}", c.item_count)?;
+            writeln!(out, "container.{i}.key_item={}", c.key_item)?;
+            writeln!(
+                out,
+                "container.{i}.lockpick_string={}",
+                strref_raw(c.lockpick_string)
+            )?;
+        }
+
+        for (i, it) in self.items.iter().enumerate() {
+            writeln!(out, "item.{i}.resource={}", it.resource)?;
+            for (j, q) in it.quantity.iter().enumerate() {
+                writeln!(out, "item.{i}.quantity_{}={q}", j + 1)?;
+            }
+            writeln!(out, "item.{i}.flags={}", it.flags)?;
+        }
+
+        for (i, s) in self.spawns.iter().enumerate() {
+            writeln!(out, "spawn.{i}.name={}", s.name)?;
+            writeln!(out, "spawn.{i}.x={}", s.x)?;
+            writeln!(out, "spawn.{i}.y={}", s.y)?;
+            writeln!(out, "spawn.{i}.frequency={}", s.frequency)?;
+            writeln!(out, "spawn.{i}.enabled={}", s.enabled)?;
+            writeln!(out, "spawn.{i}.max_spawn={}", s.max_spawn)?;
+            writeln!(out, "spawn.{i}.probability_day={}", s.prob_day)?;
+            writeln!(out, "spawn.{i}.probability_night={}", s.prob_night)?;
+            writeln!(out, "spawn.{i}.method={}", s.method)?;
+            writeln!(out, "spawn.{i}.base_number={}", s.base_number)?;
+            writeln!(out, "spawn.{i}.removal_timer={}", s.removal_timer)?;
+            writeln!(
+                out,
+                "spawn.{i}.appearance_schedule={}",
+                s.appearance_schedule
+            )?;
+            for (j, c) in s.creatures.iter().enumerate() {
+                writeln!(out, "spawn.{i}.creature.{j}={}", c.resource)?;
+            }
+        }
+
+        for (i, a) in self.ambients.iter().enumerate() {
+            writeln!(out, "ambient.{i}.name={}", a.name)?;
+            writeln!(out, "ambient.{i}.x={}", a.x)?;
+            writeln!(out, "ambient.{i}.y={}", a.y)?;
+            writeln!(out, "ambient.{i}.radius={}", a.radius)?;
+            writeln!(out, "ambient.{i}.volume={}", a.volume)?;
+            writeln!(out, "ambient.{i}.flags={}", a.flags)?;
+            for (j, sound) in a.sounds.iter().enumerate() {
+                writeln!(out, "ambient.{i}.sound.{j}={sound}")?;
+            }
+        }
+
+        for (i, v) in self.variables.iter().enumerate() {
+            writeln!(out, "variable.{i}.name={}", v.name)?;
+            writeln!(out, "variable.{i}.type={}", v.var_type)?;
+            writeln!(out, "variable.{i}.value={}", v.value)?;
+        }
+
+        for (i, d) in self.doors.iter().enumerate() {
+            writeln!(out, "door.{i}.name={}", d.name)?;
+            writeln!(out, "door.{i}.id={}", d.door_id)?;
+            writeln!(out, "door.{i}.flags={}", d.flags)?;
+            writeln!(out, "door.{i}.hp={}", d.hp)?;
+            writeln!(out, "door.{i}.ac={}", d.ac)?;
+            writeln!(out, "door.{i}.open_sound={}", d.open_sound)?;
+            writeln!(out, "door.{i}.close_sound={}", d.close_sound)?;
+            writeln!(out, "door.{i}.trapped={}", d.trapped)?;
+            writeln!(out, "door.{i}.key_item={}", d.key_item)?;
+            writeln!(out, "door.{i}.script={}", d.script)?;
+            writeln!(out, "door.{i}.lock={}", d.lock_difficulty)?;
+            writeln!(
+                out,
+                "door.{i}.lockpick_string={}",
+                strref_raw(d.lockpick_string)
+            )?;
+            writeln!(
+                out,
+                "door.{i}.dialog_speaker={}",
+                strref_raw(d.dialog_speaker)
+            )?;
+            writeln!(out, "door.{i}.dialog={}", d.dialog)?;
+        }
+
+        for (i, a) in self.animations.iter().enumerate() {
+            writeln!(out, "animation.{i}.name={}", a.name)?;
+            writeln!(out, "animation.{i}.x={}", a.x)?;
+            writeln!(out, "animation.{i}.y={}", a.y)?;
+            writeln!(out, "animation.{i}.resource={}", a.resource)?;
+            writeln!(out, "animation.{i}.flags={}", a.flags)?;
+            writeln!(out, "animation.{i}.transparency={}", a.transparency)?;
+        }
+
+        for (i, n) in self.automap.iter().enumerate() {
+            writeln!(out, "automap.{i}.x={}", n.x)?;
+            writeln!(out, "automap.{i}.y={}", n.y)?;
+            writeln!(out, "automap.{i}.text={}", strref_raw(n.text))?;
+            writeln!(out, "automap.{i}.color={}", n.color)?;
+        }
+
+        for (i, t) in self.tiled_objects.iter().enumerate() {
+            writeln!(out, "tiled.{i}.name={}", t.name)?;
+            writeln!(out, "tiled.{i}.id={}", t.tile_id)?;
+            writeln!(out, "tiled.{i}.flags={}", t.flags)?;
+        }
+
+        for (i, t) in self.proj_traps.iter().enumerate() {
+            writeln!(out, "trap.{i}.projectile={}", t.projectile)?;
+            writeln!(out, "trap.{i}.missile={}", t.missile)?;
+            writeln!(out, "trap.{i}.x={}", t.x)?;
+            writeln!(out, "trap.{i}.y={}", t.y)?;
+            writeln!(out, "trap.{i}.owner={}", t.owner)?;
+        }
+
+        if let Some(s) = &self.song {
+            writeln!(out, "song.day={}", s.day)?;
+            writeln!(out, "song.night={}", s.night)?;
+            writeln!(out, "song.win={}", s.win)?;
+            writeln!(out, "song.battle={}", s.battle)?;
+            writeln!(out, "song.lose={}", s.lose)?;
+            writeln!(out, "song.day_ambient_1={}", s.day_ambient[0])?;
+            writeln!(out, "song.day_ambient_2={}", s.day_ambient[1])?;
+            writeln!(out, "song.day_volume={}", s.day_volume)?;
+            writeln!(out, "song.night_ambient_1={}", s.night_ambient[0])?;
+            writeln!(out, "song.night_ambient_2={}", s.night_ambient[1])?;
+            writeln!(out, "song.night_volume={}", s.night_volume)?;
+        }
+
+        if let Some(r) = &self.rest {
+            writeln!(out, "rest.name={}", r.name)?;
+            writeln!(out, "rest.difficulty={}", r.difficulty)?;
+            writeln!(out, "rest.max_spawn={}", r.max_spawn)?;
+            writeln!(out, "rest.enabled={}", r.enabled)?;
+            writeln!(out, "rest.probability_day={}", r.prob_day)?;
+            writeln!(out, "rest.probability_night={}", r.prob_night)?;
+            for (j, c) in r.creatures.iter().enumerate() {
+                writeln!(out, "rest.creature.{j}={}", c.resource)?;
+            }
+        }
+
+        for (i, (x, y)) in self.vertices.iter().enumerate() {
+            writeln!(out, "vertex.{i}={x},{y}")?;
+        }
+        writeln!(out, "explored_size={}", self.header.explored_size)?;
+
+        Ok(())
+    }
+
+    /// Read a single fixed struct located by an offset word at `offset_at`, with
+    /// no count. Returns `None` when the offset is zero or the struct would run
+    /// past the end of the file (the section is absent).
+    fn read_struct<T>(
+        reader: &Reader,
+        len: usize,
+        offset_at: usize,
+        size: usize,
+        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
+    ) -> Result<Option<T>, Truncated> {
+        let offset = reader.u32_at(offset_at, "struct offset")? as usize;
+        if offset == 0 || offset.saturating_add(size) > len {
+            return Ok(None);
+        }
+        Ok(Some(parse_at(reader, offset)?))
+    }
+
+    /// Read a fixed-size record array from a header-declared section. A zero
+    /// count yields an empty vector without touching `offset`.
+    fn read_records<T>(
+        reader: &Reader,
+        offset: usize,
+        count: usize,
+        record_size: usize,
+        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
+    ) -> Result<Vec<T>, Truncated> {
+        // Don't pre-size from an untrusted count; a bad offset errors on the
+        // first read below rather than allocating gigabytes up front.
+        let mut records = Vec::new();
+        for i in 0..count {
+            records.push(parse_at(reader, offset + i * record_size)?);
+        }
+        Ok(records)
+    }
+
+    /// The items belonging to a container, sliced out of the flat item pool by
+    /// its `item_index`/`item_count`. Bounds are clamped so a bad index yields
+    /// an empty slice rather than panicking.
+    fn container_items(&self, c: &Container) -> &[Item] {
+        let start = c.item_index as usize;
+        let end = start.saturating_add(c.item_count as usize);
+        self.items
+            .get(start..end.min(self.items.len()))
+            .unwrap_or(&[])
+    }
+}
+
+impl fmt::Display for Are {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let h = &self.header;
+        writeln!(f, "ARE V1.0")?;
+        if !h.wed.is_empty() {
+            writeln!(f, "  wed:         {}", h.wed)?;
+        }
+        if !h.script.is_empty() {
+            writeln!(f, "  script:      {}", h.script)?;
+        }
+        if h.flags != 0 {
+            write_bitfield(f, "  flags:       ", h.flags, &area_flags(h.flags))?;
+        }
+        if h.area_type != 0 {
+            write_bitfield(
+                f,
+                "  type:        ",
+                h.area_type as u32,
+                &set_bits(h.area_type as u32, &AREA_TYPE_BITS),
+            )?;
+        }
+        let weather = [
+            ("rain", h.rain),
+            ("snow", h.snow),
+            ("fog", h.fog),
+            ("lightning", h.lightning),
+        ];
+        if weather.iter().any(|(_, p)| *p != 0) {
+            let parts: Vec<String> = weather
+                .iter()
+                .filter(|(_, p)| *p != 0)
+                .map(|(label, p)| format!("{label} {p}%"))
+                .collect();
+            writeln!(f, "  weather:     {}", parts.join("  "))?;
+        }
+        let neighbours = [
+            ("N", &h.north),
+            ("E", &h.east),
+            ("S", &h.south),
+            ("W", &h.west),
+        ];
+        if neighbours.iter().any(|(_, n)| !n.area.is_empty()) {
+            let parts: Vec<String> = neighbours
+                .iter()
+                .filter(|(_, n)| !n.area.is_empty())
+                .map(|(dir, n)| format!("{dir}={}", n.area))
+                .collect();
+            writeln!(f, "  neighbours:  {}", parts.join("  "))?;
+        }
+
+        if !self.actors.is_empty() {
+            writeln!(f, "\n  actors: ({})", self.actors.len())?;
+            for a in &self.actors {
+                write!(f, "    {}", a.name)?;
+                if let Some(name) = &a.name_text {
+                    write!(f, " ({name})")?;
+                }
+                write!(f, " @{},{}  cre={}", a.x, a.y, a.cre_file)?;
+                if let Some(anim) = &a.animation_name {
+                    write!(f, " anim={anim}")?;
+                }
+                if let Some(sched) = schedule_label(a.appearance_schedule) {
+                    write!(f, " [{sched}]")?;
+                }
+                if !a.dialog.is_empty() {
+                    write!(f, " dialog={}", a.dialog)?;
+                }
+                writeln!(f)?;
+            }
+        }
+
+        if !self.regions.is_empty() {
+            writeln!(f, "\n  regions: ({})", self.regions.len())?;
+            for r in &self.regions {
+                write!(f, "    {} [{}]", r.name, region_type_name(r.region_type))?;
+                if !r.destination.is_empty() {
+                    write!(f, " -> {}", r.destination)?;
+                    if !r.entrance.is_empty() {
+                        write!(f, "({})", r.entrance)?;
+                    }
+                }
+                if let Some(info) = &r.info_label {
+                    write!(f, " {info:?}")?;
+                }
+                if r.trapped != 0 {
+                    write!(f, " trapped")?;
+                }
+                if !r.script.is_empty() {
+                    write!(f, " script={}", r.script)?;
+                }
+                writeln!(f)?;
+            }
+        }
+
+        if !self.entrances.is_empty() {
+            writeln!(f, "\n  entrances: ({})", self.entrances.len())?;
+            for e in &self.entrances {
+                writeln!(f, "    {} @{},{}", e.name, e.x, e.y)?;
+            }
+        }
+
+        if !self.containers.is_empty() {
+            writeln!(f, "\n  containers: ({})", self.containers.len())?;
+            for c in &self.containers {
+                write!(
+                    f,
+                    "    {} [{}]",
+                    c.name,
+                    container_type_name(c.container_type)
+                )?;
+                if c.lock_difficulty != 0 {
+                    write!(f, " lock {}", c.lock_difficulty)?;
+                }
+                if c.trapped != 0 {
+                    write!(f, " trapped")?;
+                }
+                writeln!(f)?;
+                for item in self.container_items(c) {
+                    write!(f, "      {}", item.resource)?;
+                    if let Some(name) = &item.name {
+                        write!(f, " ({name})")?;
+                    }
+                    let charges: Vec<String> = item
+                        .quantity
+                        .iter()
+                        .filter(|q| **q != 0)
+                        .map(|q| q.to_string())
+                        .collect();
+                    if !charges.is_empty() {
+                        write!(f, " x{}", charges.join("/"))?;
+                    }
+                    writeln!(f)?;
+                }
+            }
+        }
+
+        if !self.spawns.is_empty() {
+            writeln!(f, "\n  spawns: ({})", self.spawns.len())?;
+            for s in &self.spawns {
+                write!(f, "    {} @{},{}", s.name, s.x, s.y)?;
+                if s.enabled == 0 {
+                    write!(f, " (inactive)")?;
+                }
+                writeln!(f)?;
+                for c in &s.creatures {
+                    match &c.name {
+                        Some(name) => writeln!(f, "      {} ({name})", c.resource)?,
+                        None => writeln!(f, "      {}", c.resource)?,
+                    }
+                }
+            }
+        }
+
+        if !self.ambients.is_empty() {
+            writeln!(f, "\n  ambients: ({})", self.ambients.len())?;
+            for a in &self.ambients {
+                writeln!(f, "    {} {}", a.name, a.sounds.join(" "))?;
+            }
+        }
+
+        if !self.doors.is_empty() {
+            writeln!(f, "\n  doors: ({})", self.doors.len())?;
+            for d in &self.doors {
+                write!(f, "    {}", d.name)?;
+                let flags = set_flags(d.flags, &DOOR_FLAGS);
+                if !flags.is_empty() {
+                    write!(f, " [{}]", flags.join(", "))?;
+                }
+                if !d.script.is_empty() {
+                    write!(f, " script={}", d.script)?;
+                }
+                // A speaker only means anything alongside a dialog.
+                if !d.dialog.is_empty() {
+                    write!(f, " dialog={}", d.dialog)?;
+                    if let Some(speaker) = &d.speaker_label {
+                        write!(f, " speaker={speaker:?}")?;
+                    }
+                }
+                writeln!(f)?;
+            }
+        }
+
+        if !self.animations.is_empty() {
+            writeln!(f, "\n  animations: ({})", self.animations.len())?;
+            for a in &self.animations {
+                writeln!(f, "    {} {} @{},{}", a.name, a.resource, a.x, a.y)?;
+            }
+        }
+
+        if !self.automap.is_empty() {
+            writeln!(f, "\n  automap notes: ({})", self.automap.len())?;
+            for n in &self.automap {
+                match &n.text_label {
+                    Some(text) => writeln!(f, "    @{},{} {text:?}", n.x, n.y)?,
+                    None => writeln!(f, "    @{},{} {}", n.x, n.y, n.text)?,
+                }
+            }
+        }
+
+        if !self.variables.is_empty() {
+            writeln!(f, "\n  variables: ({})", self.variables.len())?;
+            for v in &self.variables {
+                writeln!(f, "    {} = {}", v.name, v.value)?;
+            }
+        }
+
+        if !self.tiled_objects.is_empty() {
+            writeln!(f, "\n  tiled objects: ({})", self.tiled_objects.len())?;
+            for t in &self.tiled_objects {
+                writeln!(f, "    {} id={}", t.name, t.tile_id)?;
+            }
+        }
+
+        if !self.proj_traps.is_empty() {
+            writeln!(f, "\n  projectile traps: ({})", self.proj_traps.len())?;
+            for t in &self.proj_traps {
+                write!(f, "    {} @{},{}", t.projectile, t.x, t.y)?;
+                if let Some(name) = &t.missile_name {
+                    write!(f, " ({name})")?;
+                }
+                writeln!(f)?;
+            }
+        }
+
+        if let Some(s) = &self.song {
+            let songs = [
+                ("day", s.day),
+                ("night", s.night),
+                ("battle", s.battle),
+                ("win", s.win),
+                ("lose", s.lose),
+            ];
+            let parts: Vec<String> = songs
+                .iter()
+                .map(|(label, n)| format!("{label}={}", song_ref(*n)))
+                .collect();
+            writeln!(f, "\n  songs: {}", parts.join("  "))?;
+            for (when, ambient, volume) in [
+                ("day", &s.day_ambient, s.day_volume),
+                ("night", &s.night_ambient, s.night_volume),
+            ] {
+                let sounds: Vec<&str> = ambient
+                    .iter()
+                    .filter(|a| !a.is_empty())
+                    .map(String::as_str)
+                    .collect();
+                if !sounds.is_empty() {
+                    writeln!(f, "    ambient({when}): {} {volume}%", sounds.join(" "))?;
+                }
+            }
+        }
+
+        if let Some(r) = &self.rest {
+            writeln!(f, "\n  rest interruptions: {}", r.name)?;
+            writeln!(
+                f,
+                "    difficulty {}  max {}  prob day {}% night {}%{}",
+                r.difficulty,
+                r.max_spawn,
+                r.prob_day,
+                r.prob_night,
+                if r.enabled == 0 { "  (inactive)" } else { "" }
+            )?;
+            for c in &r.creatures {
+                match &c.name {
+                    Some(name) => writeln!(f, "    {} ({name})", c.resource)?,
+                    None => writeln!(f, "    {}", c.resource)?,
+                }
+            }
+        }
+
+        // The vertex pool and explored bitmask are geometry/bitmap blobs; report
+        // their extent rather than dumping coordinates.
+        if !self.vertices.is_empty() || h.explored_size != 0 {
+            writeln!(
+                f,
+                "\n  geometry: {} vertices, explored {} bytes",
+                self.vertices.len(),
+                h.explored_size
+            )?;
+        }
+
+        Ok(())
     }
 }
 
@@ -145,6 +1111,21 @@ impl AreHeader {
             lightning: reader.u16_at(0x50, "lightning probability")?,
             script: reader.resref_at(0x94, "area script")?,
             explored_size: reader.u32_at(0x9c, "explored bitmask size")?,
+        })
+    }
+}
+
+/// A neighbouring area link (the four edges of the map).
+struct Neighbor {
+    area: String,
+    flags: u32,
+}
+
+impl Neighbor {
+    fn parse_at(reader: &Reader, area_at: usize, flags_at: usize) -> Result<Neighbor, Truncated> {
+        Ok(Neighbor {
+            area: reader.resref_at(area_at, "neighbour area")?,
+            flags: reader.u32_at(flags_at, "neighbour flags")?,
         })
     }
 }
@@ -218,11 +1199,6 @@ impl Actor {
         self.animation_name = name;
     }
 }
-
-/// Names of the six actor script slots, in parse order.
-const SCRIPT_SLOTS: [&str; 6] = [
-    "override", "general", "class", "race", "default", "specific",
-];
 
 /// A region: a proximity trigger, info point, or travel region (0xC4 bytes).
 pub struct Region {
@@ -732,981 +1708,46 @@ impl RestInterruption {
     }
 }
 
-/// A parsed ARE file: the header plus the decoded content sections, with names
-/// the manager has resolved attached.
-pub struct Are {
-    header: AreHeader,
-    actors: Vec<Actor>,
-    regions: Vec<Region>,
-    entrances: Vec<Entrance>,
-    containers: Vec<Container>,
-    items: Vec<Item>,
-    spawns: Vec<Spawn>,
-    ambients: Vec<Ambient>,
-    variables: Vec<Variable>,
-    doors: Vec<Door>,
-    animations: Vec<Animation>,
-    automap: Vec<Automap>,
-    vertices: Vec<(u16, u16)>,
-    tiled_objects: Vec<TiledObject>,
-    proj_traps: Vec<ProjectileTrap>,
-    song: Option<Song>,
-    rest: Option<RestInterruption>,
+/// Anything that can go wrong while parsing an ARE file.
+#[derive(Debug)]
+pub enum AreError {
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
 }
 
-impl Are {
-    /// Parse an ARE V1.0 resource. Each section is read from its
-    /// header-declared offset and count; the sections may appear in any order.
-    pub fn parse(data: &[u8]) -> Result<Are, AreError> {
-        let reader = Reader::new(data);
-
-        let signature = reader.tag_at(0x00, "signature")?;
-        if &signature != ARE_SIGNATURE {
-            return Err(AreError::BadSignature(signature));
-        }
-
-        let version = reader.tag_at(0x04, "version")?;
-        if &version != ARE_VERSION {
-            return Err(AreError::BadVersion(version));
-        }
-
-        let header = AreHeader::parse(&reader)?;
-
-        // (offset word, count word, count is dword) per section. Counts are a
-        // mix of word and dword fields, so each is read at its own width.
-        let actors = Self::read_records(
-            &reader,
-            reader.u32_at(0x54, "actor offset")? as usize,
-            reader.u16_at(0x58, "actor count")? as usize,
-            ACTOR_SIZE,
-            Actor::parse_at,
-        )?;
-        let regions = Self::read_records(
-            &reader,
-            reader.u32_at(0x5c, "region offset")? as usize,
-            reader.u16_at(0x5a, "region count")? as usize,
-            REGION_SIZE,
-            Region::parse_at,
-        )?;
-        let spawns = Self::read_records(
-            &reader,
-            reader.u32_at(0x60, "spawn offset")? as usize,
-            reader.u32_at(0x64, "spawn count")? as usize,
-            SPAWN_SIZE,
-            Spawn::parse_at,
-        )?;
-        let entrances = Self::read_records(
-            &reader,
-            reader.u32_at(0x68, "entrance offset")? as usize,
-            reader.u32_at(0x6c, "entrance count")? as usize,
-            ENTRANCE_SIZE,
-            Entrance::parse_at,
-        )?;
-        let containers = Self::read_records(
-            &reader,
-            reader.u32_at(0x70, "container offset")? as usize,
-            reader.u16_at(0x74, "container count")? as usize,
-            CONTAINER_SIZE,
-            Container::parse_at,
-        )?;
-        let items = Self::read_records(
-            &reader,
-            reader.u32_at(0x78, "item offset")? as usize,
-            reader.u16_at(0x76, "item count")? as usize,
-            ITEM_SIZE,
-            Item::parse_at,
-        )?;
-        let ambients = Self::read_records(
-            &reader,
-            reader.u32_at(0x84, "ambient offset")? as usize,
-            reader.u16_at(0x82, "ambient count")? as usize,
-            AMBIENT_SIZE,
-            Ambient::parse_at,
-        )?;
-        let variables = Self::read_records(
-            &reader,
-            reader.u32_at(0x88, "variable offset")? as usize,
-            reader.u32_at(0x8c, "variable count")? as usize,
-            VARIABLE_SIZE,
-            Variable::parse_at,
-        )?;
-        let doors = Self::read_records(
-            &reader,
-            reader.u32_at(0xa8, "door offset")? as usize,
-            reader.u32_at(0xa4, "door count")? as usize,
-            DOOR_SIZE,
-            Door::parse_at,
-        )?;
-        let animations = Self::read_records(
-            &reader,
-            reader.u32_at(0xb0, "animation offset")? as usize,
-            reader.u32_at(0xac, "animation count")? as usize,
-            ANIM_SIZE,
-            Animation::parse_at,
-        )?;
-        let automap = Self::read_records(
-            &reader,
-            reader.u32_at(0xc4, "automap offset")? as usize,
-            reader.u32_at(0xc8, "automap count")? as usize,
-            AUTOMAP_SIZE,
-            Automap::parse_at,
-        )?;
-
-        // The vertex pool: a flat array of (x, y) words that regions, containers
-        // and doors index into.
-        let vertices = Self::read_records(
-            &reader,
-            reader.u32_at(0x7c, "vertex offset")? as usize,
-            reader.u16_at(0x80, "vertex count")? as usize,
-            VERTEX_SIZE,
-            |r, base| Ok((r.u16_at(base, "vertex x")?, r.u16_at(base + 2, "vertex y")?)),
-        )?;
-        let tiled_objects = Self::read_records(
-            &reader,
-            reader.u32_at(0xb8, "tiled object offset")? as usize,
-            reader.u32_at(0xb4, "tiled object count")? as usize,
-            TILED_SIZE,
-            TiledObject::parse_at,
-        )?;
-        let proj_traps = Self::read_records(
-            &reader,
-            reader.u32_at(0xcc, "projectile trap offset")? as usize,
-            reader.u32_at(0xd0, "projectile trap count")? as usize,
-            PTRAP_SIZE,
-            ProjectileTrap::parse_at,
-        )?;
-
-        // Song entries and rest interruptions are each a single fixed struct
-        // located by offset, with no count. Parse when the offset points at a
-        // struct that fits within the file; otherwise treat as absent.
-        let song = Self::read_struct(&reader, data.len(), 0xbc, SONG_SIZE, Song::parse_at)?;
-        let rest = Self::read_struct(
-            &reader,
-            data.len(),
-            0xc0,
-            REST_SIZE,
-            RestInterruption::parse_at,
-        )?
-        .filter(RestInterruption::is_populated);
-
-        Ok(Are {
-            header,
-            actors,
-            regions,
-            entrances,
-            containers,
-            items,
-            spawns,
-            ambients,
-            variables,
-            doors,
-            animations,
-            automap,
-            vertices,
-            tiled_objects,
-            proj_traps,
-            song,
-            rest,
-        })
-    }
-
-    /// Read a single fixed struct located by an offset word at `offset_at`, with
-    /// no count. Returns `None` when the offset is zero or the struct would run
-    /// past the end of the file (the section is absent).
-    fn read_struct<T>(
-        reader: &Reader,
-        len: usize,
-        offset_at: usize,
-        size: usize,
-        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
-    ) -> Result<Option<T>, Truncated> {
-        let offset = reader.u32_at(offset_at, "struct offset")? as usize;
-        if offset == 0 || offset.saturating_add(size) > len {
-            return Ok(None);
-        }
-        Ok(Some(parse_at(reader, offset)?))
-    }
-
-    /// Read a fixed-size record array from a header-declared section. A zero
-    /// count yields an empty vector without touching `offset`.
-    fn read_records<T>(
-        reader: &Reader,
-        offset: usize,
-        count: usize,
-        record_size: usize,
-        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
-    ) -> Result<Vec<T>, Truncated> {
-        // Don't pre-size from an untrusted count; a bad offset errors on the
-        // first read below rather than allocating gigabytes up front.
-        let mut records = Vec::new();
-        for i in 0..count {
-            records.push(parse_at(reader, offset + i * record_size)?);
-        }
-        Ok(records)
-    }
-
-    /// The actors, for the manager to resolve their CRE names.
-    pub fn actors_mut(&mut self) -> &mut [Actor] {
-        &mut self.actors
-    }
-
-    /// The flat item pool, for the manager to resolve their ITM names.
-    pub fn items_mut(&mut self) -> &mut [Item] {
-        &mut self.items
-    }
-
-    /// The spawn points, for the manager to resolve their creature names.
-    pub fn spawns_mut(&mut self) -> &mut [Spawn] {
-        &mut self.spawns
-    }
-
-    /// The regions, for the manager to resolve their info-text strrefs.
-    pub fn regions_mut(&mut self) -> &mut [Region] {
-        &mut self.regions
-    }
-
-    /// The doors, for the manager to resolve their speaker strrefs.
-    pub fn doors_mut(&mut self) -> &mut [Door] {
-        &mut self.doors
-    }
-
-    /// The automap notes, for the manager to resolve their text strrefs.
-    pub fn automap_mut(&mut self) -> &mut [Automap] {
-        &mut self.automap
-    }
-
-    /// Every TLK strref this area references, tagged with its field: region info
-    /// text and speaker name, container and door lockpick strings, door dialog
-    /// speakers, and automap note text.
-    pub fn strref_uses(&self) -> Vec<StrrefUse> {
-        let mut uses = Vec::new();
-        for (i, r) in self.regions.iter().enumerate() {
-            uses.push(StrrefUse::new(
-                r.info_text,
-                format!("region[{i}].info_text"),
-            ));
-            uses.push(StrrefUse::new(
-                r.speaker_name,
-                format!("region[{i}].speaker_name"),
-            ));
-        }
-        for (i, c) in self.containers.iter().enumerate() {
-            uses.push(StrrefUse::new(
-                c.lockpick_string,
-                format!("container[{i}].lockpick_string"),
-            ));
-        }
-        for (i, d) in self.doors.iter().enumerate() {
-            uses.push(StrrefUse::new(
-                d.lockpick_string,
-                format!("door[{i}].lockpick_string"),
-            ));
-            uses.push(StrrefUse::new(
-                d.dialog_speaker,
-                format!("door[{i}].dialog_speaker"),
-            ));
-        }
-        for (i, n) in self.automap.iter().enumerate() {
-            uses.push(StrrefUse::new(n.strref(), format!("automap[{i}].text")));
-        }
-        uses
-    }
-
-    /// Every resource this area names, tagged with the type it names: the
-    /// tilemap and neighbouring areas, the area and per-record scripts, the CRE
-    /// of every actor / spawn / rest creature, the ITM of every pooled item and
-    /// key, the DLG of every actor and door, and the sounds and animations.
-    ///
-    /// Note that a container's contents are *not* named on the container: every
-    /// item in the area lives in one flat pool, which the containers index into.
-    /// A hit therefore reads `item[12]`, not `container[3].item[0]`.
-    ///
-    /// Skipped as area-internal labels rather than resource references: each
-    /// record's `name`, a door's `door_id` and a tiled object's `tile_id` (both
-    /// name entries inside the WED), and a region's `entrance` (an entrance name
-    /// within the destination area).
-    pub fn resref_uses(&self) -> Vec<ResrefUse<'_>> {
-        let h = &self.header;
-        let mut uses = vec![
-            ResrefUse::new(WED_TYPE, &h.wed, "wed"),
-            ResrefUse::new(BCS_TYPE, &h.script, "script"),
-            ResrefUse::new(ARE_TYPE, &h.north.area, "north"),
-            ResrefUse::new(ARE_TYPE, &h.east.area, "east"),
-            ResrefUse::new(ARE_TYPE, &h.south.area, "south"),
-            ResrefUse::new(ARE_TYPE, &h.west.area, "west"),
-        ];
-
-        for (i, a) in self.actors.iter().enumerate() {
-            uses.push(ResrefUse::new(
-                CRE_TYPE,
-                &a.cre_file,
-                format!("actor[{i}].cre"),
-            ));
-            uses.push(ResrefUse::new(
-                DLG_TYPE,
-                &a.dialog,
-                format!("actor[{i}].dialog"),
-            ));
-            for (j, script) in a.scripts.iter().enumerate() {
-                uses.push(ResrefUse::new(
-                    BCS_TYPE,
-                    script,
-                    format!("actor[{i}].script[{j}]"),
-                ));
-            }
-        }
-
-        for (i, r) in self.regions.iter().enumerate() {
-            uses.push(ResrefUse::new(
-                ARE_TYPE,
-                &r.destination,
-                format!("region[{i}].destination"),
-            ));
-            uses.push(ResrefUse::new(
-                ITM_TYPE,
-                &r.key_item,
-                format!("region[{i}].key_item"),
-            ));
-            uses.push(ResrefUse::new(
-                BCS_TYPE,
-                &r.script,
-                format!("region[{i}].script"),
-            ));
-        }
-
-        for (i, c) in self.containers.iter().enumerate() {
-            uses.push(ResrefUse::new(
-                ITM_TYPE,
-                &c.key_item,
-                format!("container[{i}].key_item"),
-            ));
-        }
-
-        for (i, item) in self.items.iter().enumerate() {
-            uses.push(ResrefUse::new(
-                ITM_TYPE,
-                &item.resource,
-                format!("item[{i}]"),
-            ));
-        }
-
-        for (i, s) in self.spawns.iter().enumerate() {
-            for (j, c) in s.creatures.iter().enumerate() {
-                uses.push(ResrefUse::new(
-                    CRE_TYPE,
-                    &c.resource,
-                    format!("spawn[{i}].creature[{j}]"),
-                ));
-            }
-        }
-
-        for (i, a) in self.ambients.iter().enumerate() {
-            for (j, sound) in a.sounds.iter().enumerate() {
-                uses.push(ResrefUse::new(
-                    WAV_TYPE,
-                    sound,
-                    format!("ambient[{i}].sound[{j}]"),
-                ));
-            }
-        }
-
-        for (i, d) in self.doors.iter().enumerate() {
-            uses.push(ResrefUse::new(
-                ITM_TYPE,
-                &d.key_item,
-                format!("door[{i}].key_item"),
-            ));
-            uses.push(ResrefUse::new(
-                BCS_TYPE,
-                &d.script,
-                format!("door[{i}].script"),
-            ));
-            uses.push(ResrefUse::new(
-                DLG_TYPE,
-                &d.dialog,
-                format!("door[{i}].dialog"),
-            ));
-            uses.push(ResrefUse::new(
-                WAV_TYPE,
-                &d.open_sound,
-                format!("door[{i}].open_sound"),
-            ));
-            uses.push(ResrefUse::new(
-                WAV_TYPE,
-                &d.close_sound,
-                format!("door[{i}].close_sound"),
-            ));
-        }
-
-        for (i, a) in self.animations.iter().enumerate() {
-            // "BGEE: BAM/WBM/PVRZ, Others: BAM" — BAM is the likely reading on
-            // this engine, not the guaranteed one.
-            uses.push(
-                ResrefUse::new(BAM_TYPE, &a.resource, format!("animation[{i}].resource")).soft(),
-            );
-        }
-
-        for (i, t) in self.proj_traps.iter().enumerate() {
-            uses.push(ResrefUse::new(
-                PRO_TYPE,
-                &t.projectile,
-                format!("proj_trap[{i}].projectile"),
-            ));
-        }
-
-        if let Some(song) = &self.song {
-            for (i, sound) in song.day_ambient.iter().enumerate() {
-                uses.push(ResrefUse::new(
-                    WAV_TYPE,
-                    sound,
-                    format!("song.day_ambient[{i}]"),
-                ));
-            }
-            for (i, sound) in song.night_ambient.iter().enumerate() {
-                uses.push(ResrefUse::new(
-                    WAV_TYPE,
-                    sound,
-                    format!("song.night_ambient[{i}]"),
-                ));
-            }
-        }
-
-        if let Some(rest) = &self.rest {
-            for (i, c) in rest.creatures.iter().enumerate() {
-                uses.push(ResrefUse::new(
-                    CRE_TYPE,
-                    &c.resource,
-                    format!("rest.creature[{i}]"),
-                ));
-            }
-        }
-
-        uses.retain(|u| !u.value.is_empty());
-        uses
-    }
-
-    /// The projectile traps, for the manager to resolve their missile symbols.
-    pub fn proj_traps_mut(&mut self) -> &mut [ProjectileTrap] {
-        &mut self.proj_traps
-    }
-
-    /// The rest-interruption table, if present, for the manager to resolve its
-    /// creature names.
-    pub fn rest_mut(&mut self) -> Option<&mut RestInterruption> {
-        self.rest.as_mut()
-    }
-
-    /// Write the whole area as flat `key=value` lines: header fields bare, each
-    /// section under `<section>.<n>.`.
-    pub fn write_raw(&self, out: &mut dyn Write) -> io::Result<()> {
-        let h = &self.header;
-        writeln!(out, "wed={}", h.wed)?;
-        writeln!(out, "last_saved={}", h.last_saved)?;
-        writeln!(out, "flags={}", h.flags)?;
-        writeln!(out, "area_type={}", h.area_type)?;
-        writeln!(out, "rain={}", h.rain)?;
-        writeln!(out, "snow={}", h.snow)?;
-        writeln!(out, "fog={}", h.fog)?;
-        writeln!(out, "lightning={}", h.lightning)?;
-        writeln!(out, "script={}", h.script)?;
-        for (label, n) in [
-            ("north", &h.north),
-            ("east", &h.east),
-            ("south", &h.south),
-            ("west", &h.west),
-        ] {
-            writeln!(out, "{label}={}", n.area)?;
-            writeln!(out, "{label}_flags={}", n.flags)?;
-        }
-
-        for (i, a) in self.actors.iter().enumerate() {
-            writeln!(out, "actor.{i}.name={}", a.name)?;
-            writeln!(out, "actor.{i}.x={}", a.x)?;
-            writeln!(out, "actor.{i}.y={}", a.y)?;
-            writeln!(out, "actor.{i}.flags={}", a.flags)?;
-            writeln!(out, "actor.{i}.orientation={}", a.orientation)?;
-            writeln!(out, "actor.{i}.animation={}", a.animation)?;
-            writeln!(
-                out,
-                "actor.{i}.appearance_schedule={}",
-                a.appearance_schedule
-            )?;
-            writeln!(out, "actor.{i}.removal_timer={}", a.removal_timer)?;
-            writeln!(out, "actor.{i}.dest_x={}", a.dest_x)?;
-            writeln!(out, "actor.{i}.dest_y={}", a.dest_y)?;
-            writeln!(out, "actor.{i}.cre={}", a.cre_file)?;
-            writeln!(out, "actor.{i}.dialog={}", a.dialog)?;
-            for (slot, script) in SCRIPT_SLOTS.iter().zip(&a.scripts) {
-                writeln!(out, "actor.{i}.script_{slot}={script}")?;
-            }
-        }
-
-        for (i, r) in self.regions.iter().enumerate() {
-            writeln!(out, "region.{i}.name={}", r.name)?;
-            writeln!(out, "region.{i}.type={}", r.region_type)?;
-            writeln!(out, "region.{i}.vertices={}", r.vertex_count)?;
-            writeln!(out, "region.{i}.trigger_value={}", r.trigger_value)?;
-            writeln!(out, "region.{i}.destination={}", r.destination)?;
-            writeln!(out, "region.{i}.entrance={}", r.entrance)?;
-            writeln!(out, "region.{i}.flags={}", r.flags)?;
-            writeln!(out, "region.{i}.info_text={}", strref_raw(r.info_text))?;
-            writeln!(out, "region.{i}.trapped={}", r.trapped)?;
-            writeln!(out, "region.{i}.key_item={}", r.key_item)?;
-            writeln!(out, "region.{i}.script={}", r.script)?;
-            writeln!(
-                out,
-                "region.{i}.speaker_name={}",
-                strref_raw(r.speaker_name)
-            )?;
-        }
-
-        for (i, e) in self.entrances.iter().enumerate() {
-            writeln!(out, "entrance.{i}.name={}", e.name)?;
-            writeln!(out, "entrance.{i}.x={}", e.x)?;
-            writeln!(out, "entrance.{i}.y={}", e.y)?;
-            writeln!(out, "entrance.{i}.orientation={}", e.orientation)?;
-        }
-
-        for (i, c) in self.containers.iter().enumerate() {
-            writeln!(out, "container.{i}.name={}", c.name)?;
-            writeln!(out, "container.{i}.x={}", c.x)?;
-            writeln!(out, "container.{i}.y={}", c.y)?;
-            writeln!(out, "container.{i}.type={}", c.container_type)?;
-            writeln!(out, "container.{i}.lock={}", c.lock_difficulty)?;
-            writeln!(out, "container.{i}.flags={}", c.flags)?;
-            writeln!(out, "container.{i}.trapped={}", c.trapped)?;
-            writeln!(out, "container.{i}.item_index={}", c.item_index)?;
-            writeln!(out, "container.{i}.item_count={}", c.item_count)?;
-            writeln!(out, "container.{i}.key_item={}", c.key_item)?;
-            writeln!(
-                out,
-                "container.{i}.lockpick_string={}",
-                strref_raw(c.lockpick_string)
-            )?;
-        }
-
-        for (i, it) in self.items.iter().enumerate() {
-            writeln!(out, "item.{i}.resource={}", it.resource)?;
-            for (j, q) in it.quantity.iter().enumerate() {
-                writeln!(out, "item.{i}.quantity_{}={q}", j + 1)?;
-            }
-            writeln!(out, "item.{i}.flags={}", it.flags)?;
-        }
-
-        for (i, s) in self.spawns.iter().enumerate() {
-            writeln!(out, "spawn.{i}.name={}", s.name)?;
-            writeln!(out, "spawn.{i}.x={}", s.x)?;
-            writeln!(out, "spawn.{i}.y={}", s.y)?;
-            writeln!(out, "spawn.{i}.frequency={}", s.frequency)?;
-            writeln!(out, "spawn.{i}.enabled={}", s.enabled)?;
-            writeln!(out, "spawn.{i}.max_spawn={}", s.max_spawn)?;
-            writeln!(out, "spawn.{i}.probability_day={}", s.prob_day)?;
-            writeln!(out, "spawn.{i}.probability_night={}", s.prob_night)?;
-            writeln!(out, "spawn.{i}.method={}", s.method)?;
-            writeln!(out, "spawn.{i}.base_number={}", s.base_number)?;
-            writeln!(out, "spawn.{i}.removal_timer={}", s.removal_timer)?;
-            writeln!(
-                out,
-                "spawn.{i}.appearance_schedule={}",
-                s.appearance_schedule
-            )?;
-            for (j, c) in s.creatures.iter().enumerate() {
-                writeln!(out, "spawn.{i}.creature.{j}={}", c.resource)?;
-            }
-        }
-
-        for (i, a) in self.ambients.iter().enumerate() {
-            writeln!(out, "ambient.{i}.name={}", a.name)?;
-            writeln!(out, "ambient.{i}.x={}", a.x)?;
-            writeln!(out, "ambient.{i}.y={}", a.y)?;
-            writeln!(out, "ambient.{i}.radius={}", a.radius)?;
-            writeln!(out, "ambient.{i}.volume={}", a.volume)?;
-            writeln!(out, "ambient.{i}.flags={}", a.flags)?;
-            for (j, sound) in a.sounds.iter().enumerate() {
-                writeln!(out, "ambient.{i}.sound.{j}={sound}")?;
-            }
-        }
-
-        for (i, v) in self.variables.iter().enumerate() {
-            writeln!(out, "variable.{i}.name={}", v.name)?;
-            writeln!(out, "variable.{i}.type={}", v.var_type)?;
-            writeln!(out, "variable.{i}.value={}", v.value)?;
-        }
-
-        for (i, d) in self.doors.iter().enumerate() {
-            writeln!(out, "door.{i}.name={}", d.name)?;
-            writeln!(out, "door.{i}.id={}", d.door_id)?;
-            writeln!(out, "door.{i}.flags={}", d.flags)?;
-            writeln!(out, "door.{i}.hp={}", d.hp)?;
-            writeln!(out, "door.{i}.ac={}", d.ac)?;
-            writeln!(out, "door.{i}.open_sound={}", d.open_sound)?;
-            writeln!(out, "door.{i}.close_sound={}", d.close_sound)?;
-            writeln!(out, "door.{i}.trapped={}", d.trapped)?;
-            writeln!(out, "door.{i}.key_item={}", d.key_item)?;
-            writeln!(out, "door.{i}.script={}", d.script)?;
-            writeln!(out, "door.{i}.lock={}", d.lock_difficulty)?;
-            writeln!(
-                out,
-                "door.{i}.lockpick_string={}",
-                strref_raw(d.lockpick_string)
-            )?;
-            writeln!(
-                out,
-                "door.{i}.dialog_speaker={}",
-                strref_raw(d.dialog_speaker)
-            )?;
-            writeln!(out, "door.{i}.dialog={}", d.dialog)?;
-        }
-
-        for (i, a) in self.animations.iter().enumerate() {
-            writeln!(out, "animation.{i}.name={}", a.name)?;
-            writeln!(out, "animation.{i}.x={}", a.x)?;
-            writeln!(out, "animation.{i}.y={}", a.y)?;
-            writeln!(out, "animation.{i}.resource={}", a.resource)?;
-            writeln!(out, "animation.{i}.flags={}", a.flags)?;
-            writeln!(out, "animation.{i}.transparency={}", a.transparency)?;
-        }
-
-        for (i, n) in self.automap.iter().enumerate() {
-            writeln!(out, "automap.{i}.x={}", n.x)?;
-            writeln!(out, "automap.{i}.y={}", n.y)?;
-            writeln!(out, "automap.{i}.text={}", strref_raw(n.text))?;
-            writeln!(out, "automap.{i}.color={}", n.color)?;
-        }
-
-        for (i, t) in self.tiled_objects.iter().enumerate() {
-            writeln!(out, "tiled.{i}.name={}", t.name)?;
-            writeln!(out, "tiled.{i}.id={}", t.tile_id)?;
-            writeln!(out, "tiled.{i}.flags={}", t.flags)?;
-        }
-
-        for (i, t) in self.proj_traps.iter().enumerate() {
-            writeln!(out, "trap.{i}.projectile={}", t.projectile)?;
-            writeln!(out, "trap.{i}.missile={}", t.missile)?;
-            writeln!(out, "trap.{i}.x={}", t.x)?;
-            writeln!(out, "trap.{i}.y={}", t.y)?;
-            writeln!(out, "trap.{i}.owner={}", t.owner)?;
-        }
-
-        if let Some(s) = &self.song {
-            writeln!(out, "song.day={}", s.day)?;
-            writeln!(out, "song.night={}", s.night)?;
-            writeln!(out, "song.win={}", s.win)?;
-            writeln!(out, "song.battle={}", s.battle)?;
-            writeln!(out, "song.lose={}", s.lose)?;
-            writeln!(out, "song.day_ambient_1={}", s.day_ambient[0])?;
-            writeln!(out, "song.day_ambient_2={}", s.day_ambient[1])?;
-            writeln!(out, "song.day_volume={}", s.day_volume)?;
-            writeln!(out, "song.night_ambient_1={}", s.night_ambient[0])?;
-            writeln!(out, "song.night_ambient_2={}", s.night_ambient[1])?;
-            writeln!(out, "song.night_volume={}", s.night_volume)?;
-        }
-
-        if let Some(r) = &self.rest {
-            writeln!(out, "rest.name={}", r.name)?;
-            writeln!(out, "rest.difficulty={}", r.difficulty)?;
-            writeln!(out, "rest.max_spawn={}", r.max_spawn)?;
-            writeln!(out, "rest.enabled={}", r.enabled)?;
-            writeln!(out, "rest.probability_day={}", r.prob_day)?;
-            writeln!(out, "rest.probability_night={}", r.prob_night)?;
-            for (j, c) in r.creatures.iter().enumerate() {
-                writeln!(out, "rest.creature.{j}={}", c.resource)?;
-            }
-        }
-
-        for (i, (x, y)) in self.vertices.iter().enumerate() {
-            writeln!(out, "vertex.{i}={x},{y}")?;
-        }
-        writeln!(out, "explored_size={}", self.header.explored_size)?;
-
-        Ok(())
-    }
-}
-
-impl fmt::Display for Are {
+impl fmt::Display for AreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let h = &self.header;
-        writeln!(f, "ARE V1.0")?;
-        if !h.wed.is_empty() {
-            writeln!(f, "  wed:         {}", h.wed)?;
-        }
-        if !h.script.is_empty() {
-            writeln!(f, "  script:      {}", h.script)?;
-        }
-        if h.flags != 0 {
-            write_bitfield(f, "  flags:       ", h.flags, &area_flags(h.flags))?;
-        }
-        if h.area_type != 0 {
-            write_bitfield(
-                f,
-                "  type:        ",
-                h.area_type as u32,
-                &set_bits(h.area_type as u32, &AREA_TYPE_BITS),
-            )?;
-        }
-        let weather = [
-            ("rain", h.rain),
-            ("snow", h.snow),
-            ("fog", h.fog),
-            ("lightning", h.lightning),
-        ];
-        if weather.iter().any(|(_, p)| *p != 0) {
-            let parts: Vec<String> = weather
-                .iter()
-                .filter(|(_, p)| *p != 0)
-                .map(|(label, p)| format!("{label} {p}%"))
-                .collect();
-            writeln!(f, "  weather:     {}", parts.join("  "))?;
-        }
-        let neighbours = [
-            ("N", &h.north),
-            ("E", &h.east),
-            ("S", &h.south),
-            ("W", &h.west),
-        ];
-        if neighbours.iter().any(|(_, n)| !n.area.is_empty()) {
-            let parts: Vec<String> = neighbours
-                .iter()
-                .filter(|(_, n)| !n.area.is_empty())
-                .map(|(dir, n)| format!("{dir}={}", n.area))
-                .collect();
-            writeln!(f, "  neighbours:  {}", parts.join("  "))?;
-        }
-
-        if !self.actors.is_empty() {
-            writeln!(f, "\n  actors: ({})", self.actors.len())?;
-            for a in &self.actors {
-                write!(f, "    {}", a.name)?;
-                if let Some(name) = &a.name_text {
-                    write!(f, " ({name})")?;
-                }
-                write!(f, " @{},{}  cre={}", a.x, a.y, a.cre_file)?;
-                if let Some(anim) = &a.animation_name {
-                    write!(f, " anim={anim}")?;
-                }
-                if let Some(sched) = schedule_label(a.appearance_schedule) {
-                    write!(f, " [{sched}]")?;
-                }
-                if !a.dialog.is_empty() {
-                    write!(f, " dialog={}", a.dialog)?;
-                }
-                writeln!(f)?;
+        match self {
+            AreError::Truncated(e) => write!(f, "{e}"),
+            AreError::BadSignature(found) => {
+                write!(f, "not an ARE file: signature was {}", describe_tag(found))
+            }
+            AreError::BadVersion(found) => {
+                write!(f, "unsupported ARE version: {}", describe_tag(found))
             }
         }
-
-        if !self.regions.is_empty() {
-            writeln!(f, "\n  regions: ({})", self.regions.len())?;
-            for r in &self.regions {
-                write!(f, "    {} [{}]", r.name, region_type_name(r.region_type))?;
-                if !r.destination.is_empty() {
-                    write!(f, " -> {}", r.destination)?;
-                    if !r.entrance.is_empty() {
-                        write!(f, "({})", r.entrance)?;
-                    }
-                }
-                if let Some(info) = &r.info_label {
-                    write!(f, " {info:?}")?;
-                }
-                if r.trapped != 0 {
-                    write!(f, " trapped")?;
-                }
-                if !r.script.is_empty() {
-                    write!(f, " script={}", r.script)?;
-                }
-                writeln!(f)?;
-            }
-        }
-
-        if !self.entrances.is_empty() {
-            writeln!(f, "\n  entrances: ({})", self.entrances.len())?;
-            for e in &self.entrances {
-                writeln!(f, "    {} @{},{}", e.name, e.x, e.y)?;
-            }
-        }
-
-        if !self.containers.is_empty() {
-            writeln!(f, "\n  containers: ({})", self.containers.len())?;
-            for c in &self.containers {
-                write!(
-                    f,
-                    "    {} [{}]",
-                    c.name,
-                    container_type_name(c.container_type)
-                )?;
-                if c.lock_difficulty != 0 {
-                    write!(f, " lock {}", c.lock_difficulty)?;
-                }
-                if c.trapped != 0 {
-                    write!(f, " trapped")?;
-                }
-                writeln!(f)?;
-                for item in self.container_items(c) {
-                    write!(f, "      {}", item.resource)?;
-                    if let Some(name) = &item.name {
-                        write!(f, " ({name})")?;
-                    }
-                    let charges: Vec<String> = item
-                        .quantity
-                        .iter()
-                        .filter(|q| **q != 0)
-                        .map(|q| q.to_string())
-                        .collect();
-                    if !charges.is_empty() {
-                        write!(f, " x{}", charges.join("/"))?;
-                    }
-                    writeln!(f)?;
-                }
-            }
-        }
-
-        if !self.spawns.is_empty() {
-            writeln!(f, "\n  spawns: ({})", self.spawns.len())?;
-            for s in &self.spawns {
-                write!(f, "    {} @{},{}", s.name, s.x, s.y)?;
-                if s.enabled == 0 {
-                    write!(f, " (inactive)")?;
-                }
-                writeln!(f)?;
-                for c in &s.creatures {
-                    match &c.name {
-                        Some(name) => writeln!(f, "      {} ({name})", c.resource)?,
-                        None => writeln!(f, "      {}", c.resource)?,
-                    }
-                }
-            }
-        }
-
-        if !self.ambients.is_empty() {
-            writeln!(f, "\n  ambients: ({})", self.ambients.len())?;
-            for a in &self.ambients {
-                writeln!(f, "    {} {}", a.name, a.sounds.join(" "))?;
-            }
-        }
-
-        if !self.doors.is_empty() {
-            writeln!(f, "\n  doors: ({})", self.doors.len())?;
-            for d in &self.doors {
-                write!(f, "    {}", d.name)?;
-                let flags = set_flags(d.flags, &DOOR_FLAGS);
-                if !flags.is_empty() {
-                    write!(f, " [{}]", flags.join(", "))?;
-                }
-                if !d.script.is_empty() {
-                    write!(f, " script={}", d.script)?;
-                }
-                // A speaker only means anything alongside a dialog.
-                if !d.dialog.is_empty() {
-                    write!(f, " dialog={}", d.dialog)?;
-                    if let Some(speaker) = &d.speaker_label {
-                        write!(f, " speaker={speaker:?}")?;
-                    }
-                }
-                writeln!(f)?;
-            }
-        }
-
-        if !self.animations.is_empty() {
-            writeln!(f, "\n  animations: ({})", self.animations.len())?;
-            for a in &self.animations {
-                writeln!(f, "    {} {} @{},{}", a.name, a.resource, a.x, a.y)?;
-            }
-        }
-
-        if !self.automap.is_empty() {
-            writeln!(f, "\n  automap notes: ({})", self.automap.len())?;
-            for n in &self.automap {
-                match &n.text_label {
-                    Some(text) => writeln!(f, "    @{},{} {text:?}", n.x, n.y)?,
-                    None => writeln!(f, "    @{},{} {}", n.x, n.y, n.text)?,
-                }
-            }
-        }
-
-        if !self.variables.is_empty() {
-            writeln!(f, "\n  variables: ({})", self.variables.len())?;
-            for v in &self.variables {
-                writeln!(f, "    {} = {}", v.name, v.value)?;
-            }
-        }
-
-        if !self.tiled_objects.is_empty() {
-            writeln!(f, "\n  tiled objects: ({})", self.tiled_objects.len())?;
-            for t in &self.tiled_objects {
-                writeln!(f, "    {} id={}", t.name, t.tile_id)?;
-            }
-        }
-
-        if !self.proj_traps.is_empty() {
-            writeln!(f, "\n  projectile traps: ({})", self.proj_traps.len())?;
-            for t in &self.proj_traps {
-                write!(f, "    {} @{},{}", t.projectile, t.x, t.y)?;
-                if let Some(name) = &t.missile_name {
-                    write!(f, " ({name})")?;
-                }
-                writeln!(f)?;
-            }
-        }
-
-        if let Some(s) = &self.song {
-            let songs = [
-                ("day", s.day),
-                ("night", s.night),
-                ("battle", s.battle),
-                ("win", s.win),
-                ("lose", s.lose),
-            ];
-            let parts: Vec<String> = songs
-                .iter()
-                .map(|(label, n)| format!("{label}={}", song_ref(*n)))
-                .collect();
-            writeln!(f, "\n  songs: {}", parts.join("  "))?;
-            for (when, ambient, volume) in [
-                ("day", &s.day_ambient, s.day_volume),
-                ("night", &s.night_ambient, s.night_volume),
-            ] {
-                let sounds: Vec<&str> = ambient
-                    .iter()
-                    .filter(|a| !a.is_empty())
-                    .map(String::as_str)
-                    .collect();
-                if !sounds.is_empty() {
-                    writeln!(f, "    ambient({when}): {} {volume}%", sounds.join(" "))?;
-                }
-            }
-        }
-
-        if let Some(r) = &self.rest {
-            writeln!(f, "\n  rest interruptions: {}", r.name)?;
-            writeln!(
-                f,
-                "    difficulty {}  max {}  prob day {}% night {}%{}",
-                r.difficulty,
-                r.max_spawn,
-                r.prob_day,
-                r.prob_night,
-                if r.enabled == 0 { "  (inactive)" } else { "" }
-            )?;
-            for c in &r.creatures {
-                match &c.name {
-                    Some(name) => writeln!(f, "    {} ({name})", c.resource)?,
-                    None => writeln!(f, "    {}", c.resource)?,
-                }
-            }
-        }
-
-        // The vertex pool and explored bitmask are geometry/bitmap blobs; report
-        // their extent rather than dumping coordinates.
-        if !self.vertices.is_empty() || h.explored_size != 0 {
-            writeln!(
-                f,
-                "\n  geometry: {} vertices, explored {} bytes",
-                self.vertices.len(),
-                h.explored_size
-            )?;
-        }
-
-        Ok(())
     }
+}
+
+impl std::error::Error for AreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AreError::Truncated(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Truncated> for AreError {
+    fn from(e: Truncated) -> Self {
+        AreError::Truncated(e)
+    }
+}
+
+/// Read a fixed 32-byte NUL-padded name field.
+fn name_at(reader: &Reader, offset: usize, context: &'static str) -> Result<String, Truncated> {
+    Ok(parse_asciiz(reader.slice(offset, 32, context)?))
 }
 
 /// Render a strref for the machine view, mapping the `0xFFFFFFFF` "no string"
@@ -1718,11 +1759,6 @@ fn strref_raw(value: u32) -> String {
         value.to_string()
     }
 }
-
-/// The hours (schedule bits 0-23) that count as daytime; the rest are night.
-/// Matches the day/night split the engine and editors use.
-const DAY_HOURS: u32 = 0x1f_ffc0;
-const NIGHT_HOURS: u32 = 0x00ff_ffff & !DAY_HOURS;
 
 /// Classify an appearance schedule (bits 0-23) for the human view. Only the
 /// clean day/night cases are named; "always" and mixed schedules stay quiet to
@@ -1746,19 +1782,6 @@ fn song_ref(value: u32) -> String {
     }
 }
 
-impl Are {
-    /// The items belonging to a container, sliced out of the flat item pool by
-    /// its `item_index`/`item_count`. Bounds are clamped so a bad index yields
-    /// an empty slice rather than panicking.
-    fn container_items(&self, c: &Container) -> &[Item] {
-        let start = c.item_index as usize;
-        let end = start.saturating_add(c.item_count as usize);
-        self.items
-            .get(start..end.min(self.items.len()))
-            .unwrap_or(&[])
-    }
-}
-
 /// Area flags (header 0x14), BG2/BGEE meanings.
 fn area_flags(value: u32) -> Vec<&'static str> {
     set_flags(
@@ -1774,31 +1797,6 @@ fn area_flags(value: u32) -> Vec<&'static str> {
         ],
     )
 }
-
-/// Area type bits (header 0x48), BG2/BGEE meanings.
-const AREA_TYPE_BITS: [&str; 8] = [
-    "outdoor",
-    "day/night",
-    "weather",
-    "city",
-    "forest",
-    "dungeon",
-    "extended night",
-    "rest indoors",
-];
-
-/// Door flags (door 0x28).
-const DOOR_FLAGS: [(u32, &str); 9] = [
-    (0, "open"),
-    (1, "locked"),
-    (4, "broken"),
-    (5, "can't close"),
-    (6, "linked"),
-    (7, "hidden"),
-    (8, "found"),
-    (9, "no LOS block"),
-    (10, "remove key"),
-];
 
 /// Name a region type (region 0x20).
 fn region_type_name(value: u16) -> &'static str {

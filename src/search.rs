@@ -31,26 +31,6 @@ use crate::resource::{Origin, ResourceManager, Source};
 use crate::script::Vocabulary;
 use crate::{ResrefUse, StrrefUse};
 
-/// One resource matched by a prefix search: its name and type.
-pub struct SearchHit {
-    pub name: String,
-    pub res_type: u16,
-}
-
-/// Prefix-search results, grouped by where the resources live. Each group is
-/// sorted by name then type.
-pub struct SearchResults {
-    pub over: Vec<SearchHit>,
-    pub biff: Vec<SearchHit>,
-}
-
-impl SearchResults {
-    /// Total number of matches across both layers.
-    pub fn total(&self) -> usize {
-        self.over.len() + self.biff.len()
-    }
-}
-
 /// The decoded binary formats, and so the resources a reverse search reads.
 /// BCS scripts name resources through their calls, so they are scanned too —
 /// but only with a [`Vocabulary`] to say what each call's arguments mean.
@@ -77,13 +57,23 @@ pub const REFERENCEABLE_KINDS: [u16; 15] = [
 /// scanned too, but is already in [`SCANNED_TYPES`] for its typed fields.
 const SOFT_TYPES: [u16; 2] = [TWODA_TYPE, IDS_TYPE];
 
-/// Soft strref matches: 2DA/IDS lines carrying the number. A DLG's script
-/// strrefs are typed by the call now, so they are hard and handled in
-/// [`extract_strrefs`].
-fn soft_matches(res_type: u16, data: &[u8], target: u32) -> Vec<String> {
-    match res_type {
-        TWODA_TYPE | IDS_TYPE => soft_text_matches(data, target),
-        _ => Vec::new(),
+/// One resource matched by a prefix search: its name and type.
+pub struct SearchHit {
+    pub name: String,
+    pub res_type: u16,
+}
+
+/// Prefix-search results, grouped by where the resources live. Each group is
+/// sorted by name then type.
+pub struct SearchResults {
+    pub over: Vec<SearchHit>,
+    pub biff: Vec<SearchHit>,
+}
+
+impl SearchResults {
+    /// Total number of matches across both layers.
+    pub fn total(&self) -> usize {
+        self.over.len() + self.biff.len()
     }
 }
 
@@ -95,212 +85,6 @@ pub struct RefHit {
     pub origin: Origin,
     pub fields: Vec<String>,
     pub soft: bool,
-}
-
-/// The `(name, type)` set to scan. Under `Auto` an override entry shadows the
-/// KEY entry of the same `(name, type)`; `Biff` ignores the override layer.
-/// Duplicates collapse; names compare case-insensitively.
-fn scan_universe(
-    over: &[(&str, u16)],
-    key: &[(&str, u16)],
-    source: Source,
-    type_filter: Option<u16>,
-    types: &[u16],
-) -> Vec<(String, u16)> {
-    let keep = |t: u16| types.contains(&t) && type_filter.is_none_or(|f| f == t);
-    let mut seen: HashSet<(String, u16)> = HashSet::new();
-    let mut out = Vec::new();
-
-    let mut push = |name: &str, res_type: u16| {
-        if keep(res_type) && seen.insert((name.to_ascii_uppercase(), res_type)) {
-            out.push((name.to_string(), res_type));
-        }
-    };
-
-    if source != Source::Biff {
-        for &(name, res_type) in over {
-            push(name, res_type);
-        }
-    }
-    for &(name, res_type) in key {
-        push(name, res_type);
-    }
-    out
-}
-
-/// Collect a resource's strref field uses, skipping the name resolution
-/// [`decode`](ResourceManager::decode) performs. Bytes that don't parse yield
-/// nothing. BCS scripts name strrefs through their calls, so they need the
-/// [`Vocabulary`]; the other formats carry them in typed fields.
-fn extract_strrefs(res_type: u16, data: &[u8], vocabulary: Option<&Vocabulary>) -> Vec<StrrefUse> {
-    match res_type {
-        EFF_TYPE => Eff::parse(data)
-            .map(|e| e.strref_uses())
-            .unwrap_or_default(),
-        ITM_TYPE => Itm::parse(data)
-            .map(|i| i.strref_uses())
-            .unwrap_or_default(),
-        SPL_TYPE => Spl::parse(data)
-            .map(|s| s.strref_uses())
-            .unwrap_or_default(),
-        CRE_TYPE => Cre::parse(data)
-            .map(|c| c.strref_uses())
-            .unwrap_or_default(),
-        PRO_TYPE => Pro::parse(data)
-            .map(|p| p.strref_uses())
-            .unwrap_or_default(),
-        STO_TYPE => Sto::parse(data)
-            .map(|s| s.strref_uses())
-            .unwrap_or_default(),
-        ARE_TYPE => Are::parse(data)
-            .map(|a| a.strref_uses())
-            .unwrap_or_default(),
-        DLG_TYPE => Dlg::parse(data)
-            .map(|d| {
-                let mut uses = d.strref_uses();
-                // The action scripts name strrefs by call too (`DisplayString`,
-                // journal entries), typed exactly when the vocabulary is present.
-                if let Some(vocabulary) = vocabulary {
-                    uses.extend(d.script_strref_uses(vocabulary));
-                }
-                uses
-            })
-            .unwrap_or_default(),
-        BCS_TYPE => match vocabulary {
-            Some(vocabulary) => Script::parse(data)
-                .map(|s| s.strref_uses(vocabulary))
-                .unwrap_or_default(),
-            None => Vec::new(),
-        },
-        _ => Vec::new(),
-    }
-}
-
-/// Where `data` names `name` as a resource of type `kind`, as matching field
-/// paths split into typed ("hard") and judge-me ("soft").
-///
-/// The [`ResrefUse`]s borrow from the parsed resource and die inside each `map`
-/// closure; only the matching paths escape. That is what stops a full-install
-/// scan cloning every resref in the game.
-fn match_resrefs(
-    res_type: u16,
-    data: &[u8],
-    name: &str,
-    kind: u16,
-    vocabulary: Option<&Vocabulary>,
-) -> (Vec<String>, Vec<String>) {
-    match res_type {
-        EFF_TYPE => Eff::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
-            .unwrap_or_default(),
-        ITM_TYPE => Itm::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
-            .unwrap_or_default(),
-        SPL_TYPE => Spl::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
-            .unwrap_or_default(),
-        CRE_TYPE => Cre::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
-            .unwrap_or_default(),
-        PRO_TYPE => Pro::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
-            .unwrap_or_default(),
-        STO_TYPE => Sto::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
-            .unwrap_or_default(),
-        ARE_TYPE => Are::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
-            .unwrap_or_default(),
-        // A dialogue names resources in two ways: `next_dlg` is a typed field,
-        // and its trigger and action scripts name them by call — the latter
-        // compiled and typed exactly, so those are hard too.
-        DLG_TYPE => Dlg::parse(data)
-            .map(|r| {
-                let (mut hard, soft) = split_matches(r.resref_uses(), name, kind);
-                if let Some(vocabulary) = vocabulary {
-                    let (script_hard, _) =
-                        split_matches(r.script_references(vocabulary), name, kind);
-                    hard.extend(script_hard);
-                }
-                (hard, soft)
-            })
-            .unwrap_or_default(),
-        // A compiled script names resources through its calls' arguments, typed
-        // by the same vocabulary — but exactly, from the parsed record rather
-        // than from text, so these are hard matches.
-        BCS_TYPE => match vocabulary {
-            Some(vocabulary) => Script::parse(data)
-                .map(|r| split_matches(r.references(vocabulary), name, kind))
-                .unwrap_or_default(),
-            None => (Vec::new(), Vec::new()),
-        },
-        // Text tables have no typed fields at all, so every match is a
-        // candidate — and an untyped one, which is why `kind` is not consulted:
-        // a bare token in a 2DA says nothing about what type it names.
-        TWODA_TYPE | IDS_TYPE => (Vec::new(), soft_text_resref_matches(data, name)),
-        _ => (Vec::new(), Vec::new()),
-    }
-}
-
-/// Split the uses naming `name` as a `kind` into hard and soft paths. Resrefs
-/// are ASCII and case-insensitive.
-fn split_matches(uses: Vec<ResrefUse<'_>>, name: &str, kind: u16) -> (Vec<String>, Vec<String>) {
-    let mut hard = Vec::new();
-    let mut soft = Vec::new();
-    for u in uses {
-        if u.kind != kind || !u.value.eq_ignore_ascii_case(name) {
-            continue;
-        }
-        if u.soft { &mut soft } else { &mut hard }.push(u.path);
-    }
-    (hard, soft)
-}
-
-/// Soft resref match in a 2DA/IDS table: the 1-based lines where `target` is a
-/// whitespace-delimited token, case-insensitively and ignoring a `.ext` suffix.
-///
-/// Row labels count — `ITEMEXCL.2DA` keys rows *by* item resref. Whole tokens
-/// only, since one resref is so often the prefix of another.
-fn soft_text_resref_matches(data: &[u8], target: &str) -> Vec<String> {
-    let text = crate::decrypt_text(data);
-    let text = String::from_utf8_lossy(&text);
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            line.split_whitespace().any(|token| {
-                let token = token.split_once('.').map_or(token, |(stem, _)| stem);
-                token.eq_ignore_ascii_case(target)
-            })
-        })
-        .map(|(i, _)| format!("line {}", i + 1))
-        .collect()
-}
-
-/// Heuristic ("soft") match for a strref in a text table (2DA/IDS): the 1-based
-/// numbers of the lines on which `target` appears as a whitespace-delimited
-/// integer token. Decrypts an XOR-encrypted table first. A match is only a
-/// candidate — the number could be a strref or any other value.
-fn soft_text_matches(data: &[u8], target: u32) -> Vec<String> {
-    let text = crate::decrypt_text(data);
-    let text = String::from_utf8_lossy(&text);
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| {
-            line.split_whitespace()
-                .any(|token| token.parse::<u32>() == Ok(target))
-        })
-        .map(|(i, _)| format!("line {}", i + 1))
-        .collect()
-}
-
-/// Collect (name, type) pairs into [`SearchHit`]s sorted by name then type. The
-/// KEY guarantees distinct (name, type) entries, so no deduplication is needed.
-fn sorted_hits(items: impl Iterator<Item = (String, u16)>) -> Vec<SearchHit> {
-    let mut hits: Vec<SearchHit> = items
-        .map(|(name, res_type)| SearchHit { name, res_type })
-        .collect();
-    hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.res_type.cmp(&b.res_type)));
-    hits
 }
 
 /// Resources whose name starts with `prefix`, optionally filtered to a single
@@ -451,6 +235,222 @@ pub fn find_resref(
     }
     hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.res_type.cmp(&b.res_type)));
     hits
+}
+
+/// The `(name, type)` set to scan. Under `Auto` an override entry shadows the
+/// KEY entry of the same `(name, type)`; `Biff` ignores the override layer.
+/// Duplicates collapse; names compare case-insensitively.
+fn scan_universe(
+    over: &[(&str, u16)],
+    key: &[(&str, u16)],
+    source: Source,
+    type_filter: Option<u16>,
+    types: &[u16],
+) -> Vec<(String, u16)> {
+    let keep = |t: u16| types.contains(&t) && type_filter.is_none_or(|f| f == t);
+    let mut seen: HashSet<(String, u16)> = HashSet::new();
+    let mut out = Vec::new();
+
+    let mut push = |name: &str, res_type: u16| {
+        if keep(res_type) && seen.insert((name.to_ascii_uppercase(), res_type)) {
+            out.push((name.to_string(), res_type));
+        }
+    };
+
+    if source != Source::Biff {
+        for &(name, res_type) in over {
+            push(name, res_type);
+        }
+    }
+    for &(name, res_type) in key {
+        push(name, res_type);
+    }
+    out
+}
+
+/// Collect (name, type) pairs into [`SearchHit`]s sorted by name then type. The
+/// KEY guarantees distinct (name, type) entries, so no deduplication is needed.
+fn sorted_hits(items: impl Iterator<Item = (String, u16)>) -> Vec<SearchHit> {
+    let mut hits: Vec<SearchHit> = items
+        .map(|(name, res_type)| SearchHit { name, res_type })
+        .collect();
+    hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.res_type.cmp(&b.res_type)));
+    hits
+}
+
+/// Collect a resource's strref field uses, skipping the name resolution
+/// [`decode`](ResourceManager::decode) performs. Bytes that don't parse yield
+/// nothing. BCS scripts name strrefs through their calls, so they need the
+/// [`Vocabulary`]; the other formats carry them in typed fields.
+fn extract_strrefs(res_type: u16, data: &[u8], vocabulary: Option<&Vocabulary>) -> Vec<StrrefUse> {
+    match res_type {
+        EFF_TYPE => Eff::parse(data)
+            .map(|e| e.strref_uses())
+            .unwrap_or_default(),
+        ITM_TYPE => Itm::parse(data)
+            .map(|i| i.strref_uses())
+            .unwrap_or_default(),
+        SPL_TYPE => Spl::parse(data)
+            .map(|s| s.strref_uses())
+            .unwrap_or_default(),
+        CRE_TYPE => Cre::parse(data)
+            .map(|c| c.strref_uses())
+            .unwrap_or_default(),
+        PRO_TYPE => Pro::parse(data)
+            .map(|p| p.strref_uses())
+            .unwrap_or_default(),
+        STO_TYPE => Sto::parse(data)
+            .map(|s| s.strref_uses())
+            .unwrap_or_default(),
+        ARE_TYPE => Are::parse(data)
+            .map(|a| a.strref_uses())
+            .unwrap_or_default(),
+        DLG_TYPE => Dlg::parse(data)
+            .map(|d| {
+                let mut uses = d.strref_uses();
+                // The action scripts name strrefs by call too (`DisplayString`,
+                // journal entries), typed exactly when the vocabulary is present.
+                if let Some(vocabulary) = vocabulary {
+                    uses.extend(d.script_strref_uses(vocabulary));
+                }
+                uses
+            })
+            .unwrap_or_default(),
+        BCS_TYPE => match vocabulary {
+            Some(vocabulary) => Script::parse(data)
+                .map(|s| s.strref_uses(vocabulary))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Soft strref matches: 2DA/IDS lines carrying the number. A DLG's script
+/// strrefs are typed by the call now, so they are hard and handled in
+/// [`extract_strrefs`].
+fn soft_matches(res_type: u16, data: &[u8], target: u32) -> Vec<String> {
+    match res_type {
+        TWODA_TYPE | IDS_TYPE => soft_text_matches(data, target),
+        _ => Vec::new(),
+    }
+}
+
+/// Heuristic ("soft") match for a strref in a text table (2DA/IDS): the 1-based
+/// numbers of the lines on which `target` appears as a whitespace-delimited
+/// integer token. Decrypts an XOR-encrypted table first. A match is only a
+/// candidate — the number could be a strref or any other value.
+fn soft_text_matches(data: &[u8], target: u32) -> Vec<String> {
+    let text = crate::decrypt_text(data);
+    let text = String::from_utf8_lossy(&text);
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.split_whitespace()
+                .any(|token| token.parse::<u32>() == Ok(target))
+        })
+        .map(|(i, _)| format!("line {}", i + 1))
+        .collect()
+}
+
+/// Where `data` names `name` as a resource of type `kind`, as matching field
+/// paths split into typed ("hard") and judge-me ("soft").
+///
+/// The [`ResrefUse`]s borrow from the parsed resource and die inside each `map`
+/// closure; only the matching paths escape. That is what stops a full-install
+/// scan cloning every resref in the game.
+fn match_resrefs(
+    res_type: u16,
+    data: &[u8],
+    name: &str,
+    kind: u16,
+    vocabulary: Option<&Vocabulary>,
+) -> (Vec<String>, Vec<String>) {
+    match res_type {
+        EFF_TYPE => Eff::parse(data)
+            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .unwrap_or_default(),
+        ITM_TYPE => Itm::parse(data)
+            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .unwrap_or_default(),
+        SPL_TYPE => Spl::parse(data)
+            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .unwrap_or_default(),
+        CRE_TYPE => Cre::parse(data)
+            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .unwrap_or_default(),
+        PRO_TYPE => Pro::parse(data)
+            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .unwrap_or_default(),
+        STO_TYPE => Sto::parse(data)
+            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .unwrap_or_default(),
+        ARE_TYPE => Are::parse(data)
+            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .unwrap_or_default(),
+        // A dialogue names resources in two ways: `next_dlg` is a typed field,
+        // and its trigger and action scripts name them by call — the latter
+        // compiled and typed exactly, so those are hard too.
+        DLG_TYPE => Dlg::parse(data)
+            .map(|r| {
+                let (mut hard, soft) = split_matches(r.resref_uses(), name, kind);
+                if let Some(vocabulary) = vocabulary {
+                    let (script_hard, _) =
+                        split_matches(r.script_references(vocabulary), name, kind);
+                    hard.extend(script_hard);
+                }
+                (hard, soft)
+            })
+            .unwrap_or_default(),
+        // A compiled script names resources through its calls' arguments, typed
+        // by the same vocabulary — but exactly, from the parsed record rather
+        // than from text, so these are hard matches.
+        BCS_TYPE => match vocabulary {
+            Some(vocabulary) => Script::parse(data)
+                .map(|r| split_matches(r.references(vocabulary), name, kind))
+                .unwrap_or_default(),
+            None => (Vec::new(), Vec::new()),
+        },
+        // Text tables have no typed fields at all, so every match is a
+        // candidate — and an untyped one, which is why `kind` is not consulted:
+        // a bare token in a 2DA says nothing about what type it names.
+        TWODA_TYPE | IDS_TYPE => (Vec::new(), soft_text_resref_matches(data, name)),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+/// Split the uses naming `name` as a `kind` into hard and soft paths. Resrefs
+/// are ASCII and case-insensitive.
+fn split_matches(uses: Vec<ResrefUse<'_>>, name: &str, kind: u16) -> (Vec<String>, Vec<String>) {
+    let mut hard = Vec::new();
+    let mut soft = Vec::new();
+    for u in uses {
+        if u.kind != kind || !u.value.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if u.soft { &mut soft } else { &mut hard }.push(u.path);
+    }
+    (hard, soft)
+}
+
+/// Soft resref match in a 2DA/IDS table: the 1-based lines where `target` is a
+/// whitespace-delimited token, case-insensitively and ignoring a `.ext` suffix.
+///
+/// Row labels count — `ITEMEXCL.2DA` keys rows *by* item resref. Whole tokens
+/// only, since one resref is so often the prefix of another.
+fn soft_text_resref_matches(data: &[u8], target: &str) -> Vec<String> {
+    let text = crate::decrypt_text(data);
+    let text = String::from_utf8_lossy(&text);
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.split_whitespace().any(|token| {
+                let token = token.split_once('.').map_or(token, |(stem, _)| stem);
+                token.eq_ignore_ascii_case(target)
+            })
+        })
+        .map(|(i, _)| format!("line {}", i + 1))
+        .collect()
 }
 
 #[cfg(test)]

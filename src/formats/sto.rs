@@ -35,190 +35,6 @@ const SALE_SIZE: usize = 0x1c;
 const DRINK_SIZE: usize = 0x14;
 const CURE_SIZE: usize = 0x0c;
 
-/// Anything that can go wrong while parsing a STO file.
-#[derive(Debug)]
-pub enum StoError {
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
-}
-
-impl fmt::Display for StoError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StoError::Truncated(e) => write!(f, "{e}"),
-            StoError::BadSignature(found) => {
-                write!(f, "not a STO file: signature was {}", describe_tag(found))
-            }
-            StoError::BadVersion(found) => {
-                write!(f, "unsupported STO version: {}", describe_tag(found))
-            }
-        }
-    }
-}
-
-impl std::error::Error for StoError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            StoError::Truncated(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<Truncated> for StoError {
-    fn from(e: Truncated) -> Self {
-        StoError::Truncated(e)
-    }
-}
-
-/// The 156-byte STO V1.0 header. Documented fields are kept verbatim; the
-/// structural offset/count words are read locally in [`Sto::parse`] and not
-/// stored, since the section counts are implicit in the parsed vectors.
-struct StoHeader {
-    store_type: u32,
-    name: u32,
-    flags: u32,
-    sell_markup: u32,
-    buy_markup: u32,
-    depreciation: u32,
-    steal_failure: u16,
-    capacity: u16,
-    lore: u32,
-    id_price: u32,
-    rumours_tavern: String,
-    rumours_temple: String,
-    room_flags: u32,
-    room_price_peasant: u32,
-    room_price_merchant: u32,
-    room_price_noble: u32,
-    room_price_royal: u32,
-}
-
-impl StoHeader {
-    fn parse(reader: &Reader) -> Result<StoHeader, Truncated> {
-        Ok(StoHeader {
-            store_type: reader.u32_at(0x08, "store type")?,
-            name: reader.u32_at(0x0c, "name")?,
-            flags: reader.u32_at(0x10, "flags")?,
-            sell_markup: reader.u32_at(0x14, "sell markup")?,
-            buy_markup: reader.u32_at(0x18, "buy markup")?,
-            depreciation: reader.u32_at(0x1c, "depreciation")?,
-            steal_failure: reader.u16_at(0x20, "steal failure")?,
-            capacity: reader.u16_at(0x22, "capacity")?,
-            lore: reader.u32_at(0x3c, "lore")?,
-            id_price: reader.u32_at(0x40, "id price")?,
-            rumours_tavern: reader.resref_at(0x44, "tavern rumours")?,
-            rumours_temple: reader.resref_at(0x54, "temple rumours")?,
-            room_flags: reader.u32_at(0x5c, "room flags")?,
-            room_price_peasant: reader.u32_at(0x60, "peasant room price")?,
-            room_price_merchant: reader.u32_at(0x64, "merchant room price")?,
-            room_price_noble: reader.u32_at(0x68, "noble room price")?,
-            room_price_royal: reader.u32_at(0x6c, "royal room price")?,
-        })
-    }
-}
-
-/// One item the store offers for sale (28 bytes).
-pub struct SaleItem {
-    resource: String,
-    expiration: u16,
-    quantity: [u16; 3],
-    flags: u32,
-    amount: u32,
-    infinite: u32,
-    /// Item display name, resolved by the manager from the ITM header.
-    name: Option<String>,
-}
-
-impl SaleItem {
-    fn parse_at(reader: &Reader, base: usize) -> Result<SaleItem, Truncated> {
-        Ok(SaleItem {
-            resource: reader.resref_at(base, "sale item")?,
-            expiration: reader.u16_at(base + 0x08, "sale expiration")?,
-            quantity: [
-                reader.u16_at(base + 0x0a, "sale quantity 1")?,
-                reader.u16_at(base + 0x0c, "sale quantity 2")?,
-                reader.u16_at(base + 0x0e, "sale quantity 3")?,
-            ],
-            flags: reader.u32_at(base + 0x10, "sale flags")?,
-            amount: reader.u32_at(base + 0x14, "sale amount")?,
-            infinite: reader.u32_at(base + 0x18, "sale infinite")?,
-            name: None,
-        })
-    }
-
-    /// The ITM resref, for the manager to resolve a display name.
-    pub fn resource(&self) -> &str {
-        &self.resource
-    }
-
-    /// Attach the resolved ITM display name.
-    pub fn set_name(&mut self, name: Option<String>) {
-        self.name = name;
-    }
-}
-
-/// One drink a tavern offers (20 bytes).
-pub struct Drink {
-    rumour: String,
-    name: u32,
-    price: u32,
-    strength: u32,
-    /// Drink name, resolved by the manager from the TLK.
-    name_text: Option<String>,
-}
-
-impl Drink {
-    fn parse_at(reader: &Reader, base: usize) -> Result<Drink, Truncated> {
-        Ok(Drink {
-            rumour: reader.resref_at(base, "drink rumour")?,
-            name: reader.u32_at(base + 0x08, "drink name")?,
-            price: reader.u32_at(base + 0x0c, "drink price")?,
-            strength: reader.u32_at(base + 0x10, "drink strength")?,
-            name_text: None,
-        })
-    }
-
-    /// The drink's name strref, for the manager to resolve against the TLK.
-    pub fn name_strref(&self) -> u32 {
-        self.name
-    }
-
-    /// Attach the resolved drink name.
-    pub fn set_name(&mut self, name: Option<String>) {
-        self.name_text = name;
-    }
-}
-
-/// One cure a temple offers (12 bytes).
-pub struct Cure {
-    resource: String,
-    price: u32,
-    /// Spell display name, resolved by the manager from the SPL header.
-    name: Option<String>,
-}
-
-impl Cure {
-    fn parse_at(reader: &Reader, base: usize) -> Result<Cure, Truncated> {
-        Ok(Cure {
-            resource: reader.resref_at(base, "cure spell")?,
-            price: reader.u32_at(base + 0x08, "cure price")?,
-            name: None,
-        })
-    }
-
-    /// The SPL resref, for the manager to resolve a display name.
-    pub fn resource(&self) -> &str {
-        &self.resource
-    }
-
-    /// Attach the resolved SPL display name.
-    pub fn set_name(&mut self, name: Option<String>) {
-        self.name = name;
-    }
-}
-
 /// A parsed STO file: the header plus its four sections, with names the manager
 /// has resolved attached.
 pub struct Sto {
@@ -269,40 +85,6 @@ impl Sto {
             purchased,
             name_text: None,
         })
-    }
-
-    /// Read a section's (offset, count) header pair, or `None` when it is empty.
-    fn read_section(
-        reader: &Reader,
-        offset_at: usize,
-        count_at: usize,
-        context: &'static str,
-    ) -> Result<Option<(usize, usize)>, Truncated> {
-        let count = reader.u32_at(count_at, context)? as usize;
-        if count == 0 {
-            return Ok(None);
-        }
-        let offset = reader.u32_at(offset_at, context)? as usize;
-        Ok(Some((offset, count)))
-    }
-
-    /// Read a fixed-size record array from a header-declared section.
-    fn read_records<T>(
-        reader: &Reader,
-        offset_at: usize,
-        count_at: usize,
-        record_size: usize,
-        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
-    ) -> Result<Vec<T>, Truncated> {
-        let Some((offset, count)) = Self::read_section(reader, offset_at, count_at, "section")?
-        else {
-            return Ok(Vec::new());
-        };
-        let mut records = Vec::with_capacity(count);
-        for i in 0..count {
-            records.push(parse_at(reader, offset + i * record_size)?);
-        }
-        Ok(records)
     }
 
     /// The store's name strref, for the manager to resolve against the TLK.
@@ -429,6 +211,40 @@ impl Sto {
 
         Ok(())
     }
+
+    /// Read a section's (offset, count) header pair, or `None` when it is empty.
+    fn read_section(
+        reader: &Reader,
+        offset_at: usize,
+        count_at: usize,
+        context: &'static str,
+    ) -> Result<Option<(usize, usize)>, Truncated> {
+        let count = reader.u32_at(count_at, context)? as usize;
+        if count == 0 {
+            return Ok(None);
+        }
+        let offset = reader.u32_at(offset_at, context)? as usize;
+        Ok(Some((offset, count)))
+    }
+
+    /// Read a fixed-size record array from a header-declared section.
+    fn read_records<T>(
+        reader: &Reader,
+        offset_at: usize,
+        count_at: usize,
+        record_size: usize,
+        parse_at: impl Fn(&Reader, usize) -> Result<T, Truncated>,
+    ) -> Result<Vec<T>, Truncated> {
+        let Some((offset, count)) = Self::read_section(reader, offset_at, count_at, "section")?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut records = Vec::with_capacity(count);
+        for i in 0..count {
+            records.push(parse_at(reader, offset + i * record_size)?);
+        }
+        Ok(records)
+    }
 }
 
 impl fmt::Display for Sto {
@@ -527,7 +343,92 @@ impl fmt::Display for Sto {
     }
 }
 
+/// The 156-byte STO V1.0 header. Documented fields are kept verbatim; the
+/// structural offset/count words are read locally in [`Sto::parse`] and not
+/// stored, since the section counts are implicit in the parsed vectors.
+struct StoHeader {
+    store_type: u32,
+    name: u32,
+    flags: u32,
+    sell_markup: u32,
+    buy_markup: u32,
+    depreciation: u32,
+    steal_failure: u16,
+    capacity: u16,
+    lore: u32,
+    id_price: u32,
+    rumours_tavern: String,
+    rumours_temple: String,
+    room_flags: u32,
+    room_price_peasant: u32,
+    room_price_merchant: u32,
+    room_price_noble: u32,
+    room_price_royal: u32,
+}
+
+impl StoHeader {
+    fn parse(reader: &Reader) -> Result<StoHeader, Truncated> {
+        Ok(StoHeader {
+            store_type: reader.u32_at(0x08, "store type")?,
+            name: reader.u32_at(0x0c, "name")?,
+            flags: reader.u32_at(0x10, "flags")?,
+            sell_markup: reader.u32_at(0x14, "sell markup")?,
+            buy_markup: reader.u32_at(0x18, "buy markup")?,
+            depreciation: reader.u32_at(0x1c, "depreciation")?,
+            steal_failure: reader.u16_at(0x20, "steal failure")?,
+            capacity: reader.u16_at(0x22, "capacity")?,
+            lore: reader.u32_at(0x3c, "lore")?,
+            id_price: reader.u32_at(0x40, "id price")?,
+            rumours_tavern: reader.resref_at(0x44, "tavern rumours")?,
+            rumours_temple: reader.resref_at(0x54, "temple rumours")?,
+            room_flags: reader.u32_at(0x5c, "room flags")?,
+            room_price_peasant: reader.u32_at(0x60, "peasant room price")?,
+            room_price_merchant: reader.u32_at(0x64, "merchant room price")?,
+            room_price_noble: reader.u32_at(0x68, "noble room price")?,
+            room_price_royal: reader.u32_at(0x6c, "royal room price")?,
+        })
+    }
+}
+
+/// One item the store offers for sale (28 bytes).
+pub struct SaleItem {
+    resource: String,
+    expiration: u16,
+    quantity: [u16; 3],
+    flags: u32,
+    amount: u32,
+    infinite: u32,
+    /// Item display name, resolved by the manager from the ITM header.
+    name: Option<String>,
+}
+
 impl SaleItem {
+    fn parse_at(reader: &Reader, base: usize) -> Result<SaleItem, Truncated> {
+        Ok(SaleItem {
+            resource: reader.resref_at(base, "sale item")?,
+            expiration: reader.u16_at(base + 0x08, "sale expiration")?,
+            quantity: [
+                reader.u16_at(base + 0x0a, "sale quantity 1")?,
+                reader.u16_at(base + 0x0c, "sale quantity 2")?,
+                reader.u16_at(base + 0x0e, "sale quantity 3")?,
+            ],
+            flags: reader.u32_at(base + 0x10, "sale flags")?,
+            amount: reader.u32_at(base + 0x14, "sale amount")?,
+            infinite: reader.u32_at(base + 0x18, "sale infinite")?,
+            name: None,
+        })
+    }
+
+    /// The ITM resref, for the manager to resolve a display name.
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    /// Attach the resolved ITM display name.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+
     fn write_human(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "    {}", self.resource)?;
         if let Some(name) = &self.name {
@@ -556,7 +457,37 @@ impl SaleItem {
     }
 }
 
+/// One drink a tavern offers (20 bytes).
+pub struct Drink {
+    rumour: String,
+    name: u32,
+    price: u32,
+    strength: u32,
+    /// Drink name, resolved by the manager from the TLK.
+    name_text: Option<String>,
+}
+
 impl Drink {
+    fn parse_at(reader: &Reader, base: usize) -> Result<Drink, Truncated> {
+        Ok(Drink {
+            rumour: reader.resref_at(base, "drink rumour")?,
+            name: reader.u32_at(base + 0x08, "drink name")?,
+            price: reader.u32_at(base + 0x0c, "drink price")?,
+            strength: reader.u32_at(base + 0x10, "drink strength")?,
+            name_text: None,
+        })
+    }
+
+    /// The drink's name strref, for the manager to resolve against the TLK.
+    pub fn name_strref(&self) -> u32 {
+        self.name
+    }
+
+    /// Attach the resolved drink name.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name_text = name;
+    }
+
     fn write_human(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.name_text {
             Some(name) => write!(f, "    {} ({name:?})", self.name)?,
@@ -572,13 +503,76 @@ impl Drink {
     }
 }
 
+/// One cure a temple offers (12 bytes).
+pub struct Cure {
+    resource: String,
+    price: u32,
+    /// Spell display name, resolved by the manager from the SPL header.
+    name: Option<String>,
+}
+
 impl Cure {
+    fn parse_at(reader: &Reader, base: usize) -> Result<Cure, Truncated> {
+        Ok(Cure {
+            resource: reader.resref_at(base, "cure spell")?,
+            price: reader.u32_at(base + 0x08, "cure price")?,
+            name: None,
+        })
+    }
+
+    /// The SPL resref, for the manager to resolve a display name.
+    pub fn resource(&self) -> &str {
+        &self.resource
+    }
+
+    /// Attach the resolved SPL display name.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+
     fn write_human(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "    {}", self.resource)?;
         if let Some(name) = &self.name {
             write!(f, " ({name})")?;
         }
         writeln!(f, " {}gp", self.price)
+    }
+}
+
+/// Anything that can go wrong while parsing a STO file.
+#[derive(Debug)]
+pub enum StoError {
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
+}
+
+impl fmt::Display for StoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoError::Truncated(e) => write!(f, "{e}"),
+            StoError::BadSignature(found) => {
+                write!(f, "not a STO file: signature was {}", describe_tag(found))
+            }
+            StoError::BadVersion(found) => {
+                write!(f, "unsupported STO version: {}", describe_tag(found))
+            }
+        }
+    }
+}
+
+impl std::error::Error for StoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StoError::Truncated(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Truncated> for StoError {
+    fn from(e: Truncated) -> Self {
+        StoError::Truncated(e)
     }
 }
 

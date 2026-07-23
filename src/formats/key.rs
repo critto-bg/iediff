@@ -15,72 +15,6 @@ const KEY_VERSION: &[u8; 4] = b"V1  ";
 const BIF_ENTRY_LEN: usize = 12;
 const RESOURCE_ENTRY_LEN: usize = 14;
 
-/// Anything that can go wrong while parsing a KEY file.
-#[derive(Debug)]
-pub enum KeyError {
-    /// A read ran past the end of the file's bytes.
-    Truncated(Truncated),
-    BadSignature([u8; 4]),
-    BadVersion([u8; 4]),
-}
-
-impl fmt::Display for KeyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            KeyError::Truncated(e) => write!(f, "{e}"),
-            KeyError::BadSignature(found) => {
-                write!(f, "not a KEY file: signature was {}", describe_tag(found))
-            }
-            KeyError::BadVersion(found) => {
-                write!(f, "unsupported KEY version: {}", describe_tag(found))
-            }
-        }
-    }
-}
-
-impl std::error::Error for KeyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            KeyError::Truncated(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<Truncated> for KeyError {
-    fn from(e: Truncated) -> Self {
-        KeyError::Truncated(e)
-    }
-}
-
-/// One resource entry: a name + type pointing at a slot inside a BIF.
-pub struct ResourceEntry {
-    name: String,
-    res_type: u16,
-    locator: u32,
-}
-
-impl ResourceEntry {
-    /// The resref as stored in the KEY (original case).
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn res_type(&self) -> u16 {
-        self.res_type
-    }
-
-    /// Index of the owning BIF in [`KeyFile::bifs`] (locator bits 31-20).
-    pub fn source_index(&self) -> usize {
-        (self.locator >> 20) as usize
-    }
-
-    /// Non-tileset file index within the BIF (locator bits 13-0).
-    pub fn file_index(&self) -> u32 {
-        self.locator & 0x3fff
-    }
-}
-
 /// A fully parsed KEY file, with a lookup index for resolving resources by name.
 pub struct KeyFile {
     /// BIF archive paths, relative to the game root, indexed by source index.
@@ -136,41 +70,6 @@ impl KeyFile {
         })
     }
 
-    fn parse_bifs(reader: &Reader, count: usize, offset: usize) -> Result<Vec<String>, KeyError> {
-        let mut bifs = Vec::with_capacity(count);
-        for i in 0..count {
-            let base = offset + i * BIF_ENTRY_LEN;
-            // Bytes 0-3 (file length) and 10-11 (location flags) are unused for now.
-            let name_offset = reader.u32_at(base + 4, "bif name offset")? as usize;
-            let name_length = reader.u16_at(base + 8, "bif name length")? as usize;
-            let raw = reader.slice(name_offset, name_length, "bif name")?;
-            bifs.push(parse_asciiz(raw));
-        }
-
-        Ok(bifs)
-    }
-
-    fn parse_resources(
-        reader: &Reader,
-        count: usize,
-        offset: usize,
-    ) -> Result<Vec<ResourceEntry>, KeyError> {
-        let mut resources = Vec::with_capacity(count);
-        for i in 0..count {
-            let base = offset + i * RESOURCE_ENTRY_LEN;
-            let raw_name = reader.slice(base, 8, "resource name")?;
-            let res_type = reader.u16_at(base + 8, "resource type")?;
-            let locator = reader.u32_at(base + 10, "resource locator")?;
-            resources.push(ResourceEntry {
-                name: parse_asciiz(raw_name),
-                res_type,
-                locator,
-            });
-        }
-
-        Ok(resources)
-    }
-
     /// Every resource entry the KEY lists, in file order.
     pub fn resources(&self) -> &[ResourceEntry] {
         &self.resources
@@ -208,6 +107,69 @@ impl KeyFile {
             by_type,
         }
     }
+
+    fn parse_bifs(reader: &Reader, count: usize, offset: usize) -> Result<Vec<String>, KeyError> {
+        let mut bifs = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = offset + i * BIF_ENTRY_LEN;
+            // Bytes 0-3 (file length) and 10-11 (location flags) are unused for now.
+            let name_offset = reader.u32_at(base + 4, "bif name offset")? as usize;
+            let name_length = reader.u16_at(base + 8, "bif name length")? as usize;
+            let raw = reader.slice(name_offset, name_length, "bif name")?;
+            bifs.push(parse_asciiz(raw));
+        }
+
+        Ok(bifs)
+    }
+
+    fn parse_resources(
+        reader: &Reader,
+        count: usize,
+        offset: usize,
+    ) -> Result<Vec<ResourceEntry>, KeyError> {
+        let mut resources = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = offset + i * RESOURCE_ENTRY_LEN;
+            let raw_name = reader.slice(base, 8, "resource name")?;
+            let res_type = reader.u16_at(base + 8, "resource type")?;
+            let locator = reader.u32_at(base + 10, "resource locator")?;
+            resources.push(ResourceEntry {
+                name: parse_asciiz(raw_name),
+                res_type,
+                locator,
+            });
+        }
+
+        Ok(resources)
+    }
+}
+
+/// One resource entry: a name + type pointing at a slot inside a BIF.
+pub struct ResourceEntry {
+    name: String,
+    res_type: u16,
+    locator: u32,
+}
+
+impl ResourceEntry {
+    /// The resref as stored in the KEY (original case).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn res_type(&self) -> u16 {
+        self.res_type
+    }
+
+    /// Index of the owning BIF in [`KeyFile::bifs`] (locator bits 31-20).
+    pub fn source_index(&self) -> usize {
+        (self.locator >> 20) as usize
+    }
+
+    /// Non-tileset file index within the BIF (locator bits 13-0).
+    pub fn file_index(&self) -> u32 {
+        self.locator & 0x3fff
+    }
 }
 
 /// Summary statistics for a KEY index. See [`KeyFile::stats`].
@@ -232,6 +194,44 @@ impl fmt::Display for KeyStats {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Anything that can go wrong while parsing a KEY file.
+#[derive(Debug)]
+pub enum KeyError {
+    /// A read ran past the end of the file's bytes.
+    Truncated(Truncated),
+    BadSignature([u8; 4]),
+    BadVersion([u8; 4]),
+}
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyError::Truncated(e) => write!(f, "{e}"),
+            KeyError::BadSignature(found) => {
+                write!(f, "not a KEY file: signature was {}", describe_tag(found))
+            }
+            KeyError::BadVersion(found) => {
+                write!(f, "unsupported KEY version: {}", describe_tag(found))
+            }
+        }
+    }
+}
+
+impl std::error::Error for KeyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            KeyError::Truncated(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Truncated> for KeyError {
+    fn from(e: Truncated) -> Self {
+        KeyError::Truncated(e)
     }
 }
 
