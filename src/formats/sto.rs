@@ -716,7 +716,7 @@ mod tests {
         let uses = sto.resref_uses();
         let got: Vec<(u16, &str, &str)> = uses
             .iter()
-            .map(|u| (u.kind, u.value, u.path.as_str()))
+            .map(|u| (u.kind, u.value.as_ref(), u.path.as_str()))
             .collect();
         assert_eq!(
             got,

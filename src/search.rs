@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 
 use crate::formats::are::{ARE_TYPE, Are};
+use crate::formats::bcs::{BCS_TYPE, Script};
 use crate::formats::cre::{CRE_TYPE, Cre};
 use crate::formats::dlg::{DLG_TYPE, Dlg};
 use crate::formats::eff::{EFF_TYPE, Eff};
@@ -25,8 +26,9 @@ use crate::formats::pro::{PRO_TYPE, Pro};
 use crate::formats::spl::{SPL_TYPE, Spl};
 use crate::formats::sto::{STO_TYPE, Sto};
 use crate::formats::twoda::TWODA_TYPE;
-use crate::formats::{BAM_TYPE, BCS_TYPE, BMP_TYPE, MVE_TYPE, VVC_TYPE, WAV_TYPE, WED_TYPE};
+use crate::formats::{BAM_TYPE, BMP_TYPE, MVE_TYPE, VVC_TYPE, WAV_TYPE, WED_TYPE};
 use crate::resource::{Origin, ResourceManager, Source};
+use crate::script::Vocabulary;
 use crate::{ResrefUse, StrrefUse};
 
 /// One resource matched by a prefix search: its name and type.
@@ -50,8 +52,10 @@ impl SearchResults {
 }
 
 /// The decoded binary formats, and so the resources a reverse search reads.
-const SCANNED_TYPES: [u16; 8] = [
-    EFF_TYPE, ITM_TYPE, SPL_TYPE, CRE_TYPE, PRO_TYPE, STO_TYPE, ARE_TYPE, DLG_TYPE,
+/// BCS scripts name resources through their calls, so they are scanned too —
+/// but only with a [`Vocabulary`] to say what each call's arguments mean.
+const SCANNED_TYPES: [u16; 9] = [
+    EFF_TYPE, ITM_TYPE, SPL_TYPE, CRE_TYPE, PRO_TYPE, STO_TYPE, ARE_TYPE, DLG_TYPE, BCS_TYPE,
 ];
 
 /// The types [`find_resref`] can find. A query for anything else has nothing to
@@ -73,14 +77,12 @@ pub const REFERENCEABLE_KINDS: [u16; 15] = [
 /// scanned too, but is already in [`SCANNED_TYPES`] for its typed fields.
 const SOFT_TYPES: [u16; 2] = [TWODA_TYPE, IDS_TYPE];
 
-/// Soft strref matches: 2DA/IDS lines carrying the number, or the
-/// strref-bearing action calls in a DLG's scripts.
+/// Soft strref matches: 2DA/IDS lines carrying the number. A DLG's script
+/// strrefs are typed by the call now, so they are hard and handled in
+/// [`extract_strrefs`].
 fn soft_matches(res_type: u16, data: &[u8], target: u32) -> Vec<String> {
     match res_type {
         TWODA_TYPE | IDS_TYPE => soft_text_matches(data, target),
-        DLG_TYPE => Dlg::parse(data)
-            .map(|d| d.script_strref_candidates(target))
-            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -128,8 +130,9 @@ fn scan_universe(
 
 /// Collect a resource's strref field uses, skipping the name resolution
 /// [`decode`](ResourceManager::decode) performs. Bytes that don't parse yield
-/// nothing.
-fn extract_strrefs(res_type: u16, data: &[u8]) -> Vec<StrrefUse> {
+/// nothing. BCS scripts name strrefs through their calls, so they need the
+/// [`Vocabulary`]; the other formats carry them in typed fields.
+fn extract_strrefs(res_type: u16, data: &[u8], vocabulary: Option<&Vocabulary>) -> Vec<StrrefUse> {
     match res_type {
         EFF_TYPE => Eff::parse(data)
             .map(|e| e.strref_uses())
@@ -153,8 +156,22 @@ fn extract_strrefs(res_type: u16, data: &[u8]) -> Vec<StrrefUse> {
             .map(|a| a.strref_uses())
             .unwrap_or_default(),
         DLG_TYPE => Dlg::parse(data)
-            .map(|d| d.strref_uses())
+            .map(|d| {
+                let mut uses = d.strref_uses();
+                // The action scripts name strrefs by call too (`DisplayString`,
+                // journal entries), typed exactly when the vocabulary is present.
+                if let Some(vocabulary) = vocabulary {
+                    uses.extend(d.script_strref_uses(vocabulary));
+                }
+                uses
+            })
             .unwrap_or_default(),
+        BCS_TYPE => match vocabulary {
+            Some(vocabulary) => Script::parse(data)
+                .map(|s| s.strref_uses(vocabulary))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
@@ -165,7 +182,13 @@ fn extract_strrefs(res_type: u16, data: &[u8]) -> Vec<StrrefUse> {
 /// The [`ResrefUse`]s borrow from the parsed resource and die inside each `map`
 /// closure; only the matching paths escape. That is what stops a full-install
 /// scan cloning every resref in the game.
-fn match_resrefs(res_type: u16, data: &[u8], name: &str, kind: u16) -> (Vec<String>, Vec<String>) {
+fn match_resrefs(
+    res_type: u16,
+    data: &[u8],
+    name: &str,
+    kind: u16,
+    vocabulary: Option<&Vocabulary>,
+) -> (Vec<String>, Vec<String>) {
     match res_type {
         EFF_TYPE => Eff::parse(data)
             .map(|r| split_matches(r.resref_uses(), name, kind))
@@ -189,14 +212,28 @@ fn match_resrefs(res_type: u16, data: &[u8], name: &str, kind: u16) -> (Vec<Stri
             .map(|r| split_matches(r.resref_uses(), name, kind))
             .unwrap_or_default(),
         // A dialogue names resources in two ways: `next_dlg` is a typed field,
-        // while its trigger and action scripts name them as text.
+        // and its trigger and action scripts name them by call — the latter
+        // compiled and typed exactly, so those are hard too.
         DLG_TYPE => Dlg::parse(data)
             .map(|r| {
-                let (hard, mut soft) = split_matches(r.resref_uses(), name, kind);
-                soft.extend(r.script_resref_candidates(name, kind));
+                let (mut hard, soft) = split_matches(r.resref_uses(), name, kind);
+                if let Some(vocabulary) = vocabulary {
+                    let (script_hard, _) =
+                        split_matches(r.script_references(vocabulary), name, kind);
+                    hard.extend(script_hard);
+                }
                 (hard, soft)
             })
             .unwrap_or_default(),
+        // A compiled script names resources through its calls' arguments, typed
+        // by the same vocabulary — but exactly, from the parsed record rather
+        // than from text, so these are hard matches.
+        BCS_TYPE => match vocabulary {
+            Some(vocabulary) => Script::parse(data)
+                .map(|r| split_matches(r.references(vocabulary), name, kind))
+                .unwrap_or_default(),
+            None => (Vec::new(), Vec::new()),
+        },
         // Text tables have no typed fields at all, so every match is a
         // candidate — and an untyped one, which is why `kind` is not consulted:
         // a bare token in a 2DA says nothing about what type it names.
@@ -312,6 +349,10 @@ pub fn find_strref(
     let mut types = SCANNED_TYPES.to_vec();
     types.extend_from_slice(&SOFT_TYPES);
 
+    // Built once from the install's IDS tables, so compiled scripts can be
+    // typed; `None` leaves them unscanned rather than failing the query.
+    let vocabulary = manager.vocabulary();
+
     // Snapshot the universe first: these names borrow the index, which the
     // read loop below needs `&mut manager` for.
     let (over, key) = manager.index_entries();
@@ -326,7 +367,7 @@ pub fn find_strref(
 
         // Exact matches on typed strref fields, and — for DLG scripts and
         // 2DA/IDS text — heuristic candidates.
-        let hard: Vec<String> = extract_strrefs(res_type, &bytes)
+        let hard: Vec<String> = extract_strrefs(res_type, &bytes, vocabulary.as_deref())
             .into_iter()
             .filter(|u| u.value == target)
             .map(|u| u.path)
@@ -373,6 +414,9 @@ pub fn find_resref(
     let mut types = SCANNED_TYPES.to_vec();
     types.extend_from_slice(&SOFT_TYPES);
 
+    // Built once so compiled scripts and DLG script blocks can be typed.
+    let vocabulary = manager.vocabulary();
+
     // Snapshot the universe first: these names borrow the index, which the
     // read loop below needs `&mut manager` for.
     let (over, key) = manager.index_entries();
@@ -385,7 +429,7 @@ pub fn find_resref(
             continue;
         };
 
-        let (hard, soft) = match_resrefs(res_type, &bytes, name, kind);
+        let (hard, soft) = match_resrefs(res_type, &bytes, name, kind, vocabulary.as_deref());
         if !hard.is_empty() {
             hits.push(RefHit {
                 name: res_name.clone(),
@@ -576,6 +620,21 @@ mod tests {
     }
 
     #[test]
+    fn a_compiled_script_names_a_strref_through_its_calls() {
+        // `DisplayString(Myself,12345)` in the BCS witness: the strref rides an
+        // integer argument, typed by the call, and so is a hard match.
+        let game = fixture::build();
+        let mut m = fixture_manager(&game);
+        let found = find_strref(&mut m, fixture::SCRIPT_STRREF, Source::Auto, None);
+        let hit = found
+            .iter()
+            .find(|h| h.name == "AISCRIPT")
+            .expect("the script displays this strref");
+        assert!(!hit.soft, "a strref typed by the call is a hard match");
+        assert_eq!(hit.fields, vec!["block[0].DisplayString.StrRef"]);
+    }
+
+    #[test]
     fn finds_every_referrer_across_both_layers() {
         let game = fixture::build();
         let mut m = fixture_manager(&game);
@@ -584,6 +643,12 @@ mod tests {
         assert_eq!(
             hits(&found, false),
             vec![
+                // A compiled script naming the item in a trigger — hard, from
+                // the parsed record, not text.
+                (
+                    "AISCRIPT.bcs".into(),
+                    vec!["block[0].HasItem.ResRef".to_string()]
+                ),
                 // Archived only.
                 ("ARCHIVED.cre".into(), vec!["item[0]".to_string()]),
                 // Override-only: exists in no BIF and has no KEY entry.
@@ -607,6 +672,16 @@ mod tests {
                 ("SINGLE.eff".into(), vec!["op122.resource".to_string()]),
                 // An item may name itself: SW1H01 degrades into SW1H01.
                 ("SW1H01.itm".into(), vec!["replacement_item".to_string()]),
+                // A dialogue's scripts name the item by call — a trigger and the
+                // action inside its `ActionOverride` — now compiled and typed,
+                // so hard rather than heuristic.
+                (
+                    "TALK.dlg".into(),
+                    vec![
+                        "state_trigger[0].PartyHasItem.Item".to_string(),
+                        "action[0].GiveItemCreate.ResRef".to_string(),
+                    ],
+                ),
             ]
         );
         // DECOY.itm names nothing, so it must not appear at all.
@@ -635,16 +710,8 @@ mod tests {
                     "MAGIC.spl".into(),
                     vec!["casting[1].op318.resource".to_string()]
                 ),
-                // Script text, from both a trigger and an action. The action is
-                // `ActionOverride(Player1,GiveItemCreate("SW1H01",...))`, and it
-                // is attributed to the inner call that actually takes the item.
-                (
-                    "TALK.dlg".into(),
-                    vec![
-                        "state_trigger[0] PartyHasItem".to_string(),
-                        "action[0] GiveItemCreate".to_string(),
-                    ]
-                ),
+                // TALK.dlg's script references are hard now (compiled and typed),
+                // so they no longer appear among the soft candidates.
             ]
         );
     }
@@ -660,12 +727,14 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "AISCRIPT.bcs",
                 "ARCHIVED.cre",
                 "MAGIC.spl",
                 "MAP.are",
                 "SHADOWED.cre",
                 "SINGLE.eff",
-                "SW1H01.itm"
+                "SW1H01.itm",
+                "TALK.dlg",
             ]
         );
         // ...and SHADOWED falls back to the archived body, which names the item
@@ -888,6 +957,31 @@ mod tests {
             "transition[0].next_dlg",
         ),
         ("SINGLE", ITM_TYPE, fixture::ITM_TARGET, "op122.resource"),
+        // BCS: a trigger's string, an action's strings, and a spell by number.
+        (
+            "AISCRIPT",
+            ITM_TYPE,
+            fixture::ITM_TARGET,
+            "block[0].HasItem.ResRef",
+        ),
+        (
+            "AISCRIPT",
+            CRE_TYPE,
+            fixture::CRE_TARGET,
+            "block[0].CreateCreature.NewObject",
+        ),
+        (
+            "AISCRIPT",
+            BCS_TYPE,
+            fixture::BCS_TARGET,
+            "block[0].ChangeAIScript.ScriptFile",
+        ),
+        (
+            "AISCRIPT",
+            SPL_TYPE,
+            fixture::SPELL_BY_NUMBER,
+            "block[0].ForceSpell.Spell",
+        ),
     ];
 
     #[test]

@@ -87,6 +87,13 @@ impl IdsFile {
         }
     }
 
+    /// Every row in file order. A value may repeat: `ACTION.IDS` gives 451
+    /// signatures only 405 distinct ids, so a caller resolving a script call
+    /// needs all the candidates, not just the first.
+    pub fn entries(&self) -> &[IdsEntry] {
+        &self.entries
+    }
+
     /// The identifier mapped to a value, if any (e.g. race `2` -> `ELF`).
     #[allow(dead_code)] // consumed by resource-field annotation (next milestone)
     pub fn lookup_by_value(&self, value: i64) -> Option<&str> {

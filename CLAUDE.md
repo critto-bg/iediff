@@ -17,7 +17,18 @@ tested against a real BG2:EE install. See `README.md` for goals.
   (`unwrap_or`/`unwrap_or_else`/`unwrap_or_default` are fine — they can't panic.)
 - **Incremental.** Add formats and features one at a time; don't scaffold ahead
   of need.
-- Brevity in docs and output.
+- **Brevity.** In docs, output, and comments alike.
+
+## Comments
+
+Comments explain _why_, not _what_ — the code already says what it does.
+
+- State each fact once. Put the rationale at the definition; don't restate it at
+  every call site. A `[link]` beats a repeated paragraph.
+- A short note beats a long one. Cut narration of the obvious, redundant
+  examples, and hedging.
+- Keep the load-bearing "why": a non-obvious format quirk, a decision that could
+  look wrong, an invariant a reader must not break.
 
 ## Layout
 
@@ -31,11 +42,17 @@ tested against a real BG2:EE install. See `README.md` for goals.
   them (`--uses`). Reaches the index through two `pub(crate)` methods on
   `ResourceManager` (`index_entries`, `read_for_scan`) and owns the per-format
   dispatch.
-- `src/script.rs` — what the engine's script calls name: static `ACTION.IDS` /
-  `TRIGGER.IDS` signatures plus the curated meaning of each parameter name, so a
-  quoted resref in a DLG script can be typed by the call that takes it. The
-  vocabulary is static because the calls are implemented in the closed-source
-  executable — a mod cannot add one without patching it.
+- `src/script.rs` — the script-call `Vocabulary`: `ACTION.IDS` / `TRIGGER.IDS`
+  signatures read from the install, plus the curated meaning of each parameter
+  name (which `S:ResRef*` is an item, which is a variable), so a call's argument
+  can be typed. Also the reverse maps (name→signature, symbol→value) the BAF
+  compiler needs. The calls live in the closed-source executable, but their
+  numeric ids and the value tables they point at (`SPELL.IDS`, `OBJECT.IDS`) are
+  read from the game, since mods extend the latter.
+- `src/formats/bcs.rs` — compiled scripts: the raw parse/encode layer (byte-
+  exact), plus decompilation to BAF text using the vocabulary.
+- `src/formats/baf.rs` — the BAF compiler: textual script back to the record
+  form, the inverse of the bcs decompiler.
 - `src/fixture.rs` — test-only. Writes a synthetic game tree (KEY + BIF +
   `override/`) to a temp dir, so search tests can assert exact answers without
   depending on the local install, which shifts with every mod. Between them its
@@ -45,8 +62,8 @@ tested against a real BG2:EE install. See `README.md` for goals.
 - `src/formats/` — one submodule per resource format (`key`, `bif`, …). Each
   owns its own error type that wraps the shared `Truncated` via `From`.
 - `md/` — symlink: IESDP format docs. Authoritative reference for every format.
-  Start at `md/file_formats/index.md`; conventions in
-  `md/file_formats/general.md`.
+  Start at `md/iesdp/file_formats/index.md`; conventions in
+  `md/iesdp/file_formats/general.md`.
 - `game/` — symlink: BG2:EE install used as test data.
 - Both symlinks are git-ignored and local-only, so no test may depend on them:
   each format's unit tests build their own byte fixtures, and whole-install
@@ -54,7 +71,7 @@ tested against a real BG2:EE install. See `README.md` for goals.
 
 ## How the game data fits together
 
-All multi-byte integers are **little-endian**. Core types (`md/file_formats/general.md`):
+All multi-byte integers are **little-endian**. Core types (`md/iesdp/file_formats/general.md`):
 `resref` = 8-byte resource name (NUL-padded); `strref` = 32-bit index into TLK;
 `word` = u16, `dword` = u32.
 
@@ -78,13 +95,50 @@ how they add wholly new ones (which exist only in override, with no KEY entry).
 `ResourceManager` honours this priority by default; `--biff` skips override to
 reach the untouched original.
 
-Each resource type then has its own format under `md/file_formats/ie_formats/`
+Each resource type then has its own format under `md/iesdp/file_formats/ie_formats/`
 (e.g. `cre_v1.md`, `itm_v1.md`, `2da.md`). Many formats are versioned; read the
 4-byte signature + version from the header before parsing. Some text formats
 (2DA, IDS) may be XOR-encrypted (see `encryption.md`).
 
 A natural build order: KEY → BIF → TLK → individual resource formats, since the
 first three are needed to find and name anything.
+
+## BCS / BAF verification
+
+BCS is a compiled script (an ASCII token stream); BAF is its textual form. The
+codec was verified against the install's own scripts and WeiDU (the community
+compiler used as an oracle), by three round-trip metrics:
+
+- **M1** — `encode(parse(bcs)) == bcs`, byte for byte. Holds for all ~5,200
+  scripts in the install.
+- **M2** — our decompiled BAF matches WeiDU's, call for call (~99.4%); the rest
+  is WeiDU sugar we render equivalently.
+- **M3** — `compile(decompile(bcs)) == bcs` through the full BAF compiler. Holds
+  for 5219/5232.
+
+Exceptions that are **normal, not bugs**:
+
+- The 13 scripts M3 cannot round-trip are BioWare movement scripts carrying
+  uninitialised junk in slots no call reads. WeiDU cannot round-trip them
+  either; M1 still holds, and we preserve the junk in a `// unmodelled` comment.
+- A few end-of-line comments differ from WeiDU: a trailing space in a name, and
+  death-variable creature names passed as string arguments, which we don't
+  resolve (they need a curated call list).
+
+### WeiDU (the oracle)
+
+`game/weidu` is the community compiler. **Run it from the game root** — it
+resolves `chitin.key` and `lang/` relative to the working directory, and always
+pass `--out <dir>` so it writes there rather than polluting the game tree.
+
+- Decompile: `./weidu --out <dir> file.bcs` → `<dir>/file.baf`. Output carries
+  `// ~strref~` comments by default; add `--nocom` to drop them (for structural
+  diffs).
+- Compile: `./weidu --out <dir> file.baf` → `<dir>/file.bcs`.
+- Extract archived resources: `./weidu --out <dir> --biff-get '<regexp>'`, e.g.
+  `'^.*\.BCS$'`.
+- `--parse-check <TYPE> <file>` returns 0 if the file parses (`TYPE` = `BAF`,
+  `D`, …).
 
 ## Workflow
 

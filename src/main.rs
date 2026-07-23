@@ -166,13 +166,15 @@ impl StrrefUse {
 /// path locating the field (`"container[3].key_item"`). Each format yields
 /// these via its `resref_uses`.
 ///
-/// `value` borrows rather than owning: a scan builds these for every field of
-/// every resource and discards all but a handful, so cloning would double the
-/// allocations for nothing.
+/// `value` usually borrows rather than owning: a scan builds these for every
+/// field of every resource and discards all but a handful, so cloning would
+/// double the allocations for nothing. It owns only when the resref is
+/// *computed* rather than stored — a compiled script names a spell by number,
+/// so the resref (`SPWI001`) exists nowhere in the bytes to borrow from.
 pub struct ResrefUse<'a> {
     /// The resource type the resref names (`ITM_TYPE`, `BCS_TYPE`, …).
     pub kind: u16,
-    pub value: &'a str,
+    pub value: Cow<'a, str>,
     pub path: String,
     /// Typed only by convention: the engine accepts more than one kind here,
     /// so a consumer must judge it.
@@ -180,10 +182,14 @@ pub struct ResrefUse<'a> {
 }
 
 impl<'a> ResrefUse<'a> {
-    pub fn new(kind: u16, value: &'a str, path: impl Into<String>) -> ResrefUse<'a> {
+    pub fn new(
+        kind: u16,
+        value: impl Into<Cow<'a, str>>,
+        path: impl Into<String>,
+    ) -> ResrefUse<'a> {
         ResrefUse {
             kind,
-            value,
+            value: value.into(),
             path: path.into(),
             soft: false,
         }
@@ -343,12 +349,23 @@ fn print_file(
     manager: &mut ResourceManager,
     path: &str,
     raw: bool,
+    out_dir: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = Path::new(path);
     let ext = file
         .extension()
         .and_then(|e| e.to_str())
         .ok_or_else(|| format!("no extension to identify the resource type: {path:?}"))?;
+
+    // A `.baf` is textual script; compile it to a `.bcs` on disk rather than
+    // echoing it back.
+    if ext.eq_ignore_ascii_case("baf") {
+        return compile_baf(out, manager, file, out_dir);
+    }
+    if out_dir.is_some() {
+        return Err("--out applies only when compiling a .baf".into());
+    }
+
     let res_type = extension_type(&ext.to_ascii_lowercase())
         .ok_or_else(|| format!("unknown resource extension: .{ext}"))?;
 
@@ -360,6 +377,46 @@ fn print_file(
         writeln!(out, "{name}  ({})", loaded.origin)?;
         write!(out, "{}", loaded.resource)?;
     }
+    Ok(())
+}
+
+/// Compile a BAF file to a `.bcs` beside it, or in `out_dir` when given. The
+/// vocabulary comes from the game, so a symbol the install does not know is an
+/// error rather than a silent pass.
+fn compile_baf(
+    out: &mut impl Write,
+    manager: &mut ResourceManager,
+    file: &Path,
+    out_dir: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let text = std::fs::read(file)?;
+    let vocabulary = manager
+        .vocabulary()
+        .ok_or("no ACTION.IDS / TRIGGER.IDS in the game to compile against")?;
+    let script = formats::baf::compile(&text, &vocabulary)?;
+
+    let stem = file
+        .file_stem()
+        .ok_or_else(|| format!("no filename to derive the output from: {}", file.display()))?;
+    // A given `--out` must already be a directory; only the default (beside the
+    // source) is assumed to exist. Writability surfaces at the write itself.
+    let dir = match out_dir {
+        Some(dir) => {
+            let dir = Path::new(dir);
+            if !dir.exists() {
+                return Err(format!("--out directory does not exist: {}", dir.display()).into());
+            }
+            if !dir.is_dir() {
+                return Err(format!("--out is not a directory: {}", dir.display()).into());
+            }
+            dir
+        }
+        None => file.parent().unwrap_or(Path::new(".")),
+    };
+    let target = dir.join(stem).with_extension("bcs");
+    std::fs::write(&target, script.encode())
+        .map_err(|e| format!("could not write {}: {e}", target.display()))?;
+    writeln!(out, "compiled {} -> {}", file.display(), target.display())?;
     Ok(())
 }
 
@@ -427,10 +484,10 @@ fn print_string(
 /// Report every resource that references a strref (`strref:<n> --uses`), honouring
 /// `--biff` and an optional `--type` filter. Each hit shows where it resolved from
 /// and which of its fields carry the strref. The typed scan covers the decoded
-/// strref-bearing formats (EFF, ITM, SPL, CRE, PRO, STO, ARE, DLG). 2DA/IDS text
-/// tables and DLG action scripts (the engine's strref-bearing actions, e.g.
-/// DisplayString / journal entries) are scanned heuristically and reported
-/// separately as candidates. BCS/BAF scripts are not scanned.
+/// strref-bearing formats (EFF, ITM, SPL, CRE, PRO, STO, ARE, DLG), and BCS
+/// scripts, whose strref-bearing calls (`DisplayString`, journal entries, …)
+/// name the string exactly. 2DA/IDS text tables and DLG action scripts are
+/// scanned heuristically and reported separately as candidates.
 fn print_strref_uses(
     out: &mut impl Write,
     manager: &mut ResourceManager,
@@ -597,6 +654,7 @@ Usage:
   iediff strref:<n>        resolve a dialog.tlk string by index
   iediff strref:<n> --uses list the resources that reference the string
   iediff --file <path>     print a discrete file by path, bypassing the index
+                           (a .baf is compiled to a .bcs next to it)
   iediff --stats           summarise the KEY index and override directory
   iediff [--help|-h]       show this help
 
@@ -607,16 +665,19 @@ Options:
   --uses                find where a resource or string is referenced; the query
                         must name a type (sw1h01.itm, strref:8000)
   --type <ext>          with --uses, scan only one resource type (e.g. itm)
+  --out <dir>           with --file on a .baf, write the .bcs into <dir>
 
-Decoded formats: 2da ids eff itm spl cre pro sto are dlg
+Decoded formats: 2da ids eff itm spl cre pro sto are dlg bcs
 Other resource types are located and summarised (type, size) but not parsed.
 
---uses searches the decoded binary formats (eff itm spl cre pro sto are dlg) for
-typed references, so it can find these as targets:
+--uses searches the decoded binary formats (eff itm spl cre pro sto are dlg bcs)
+for typed references, so it can find these as targets:
   itm spl cre dlg are pro eff bcs 2da bam vvc wav wed bmp mve
 Effect opcodes are covered in full: every resource an effect names is resolved to
-its type. 2DA/IDS tables and DLG trigger/action scripts are also scanned, as
-text, and reported separately as candidates. BCS/BAF scripts are not scanned.
+its type. BCS scripts and a DLG's trigger/action scripts are compiled and their
+calls' arguments typed, so a script naming an item, spell (by number too),
+creature or strref is a hard hit. 2DA/IDS tables are scanned as text and reported
+separately as candidates.
 
 Reads ./chitin.key if present (run from a game root), else game/chitin.key.
 ";
@@ -630,6 +691,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut help = false;
     let mut uses = false;
     let mut type_ext: Option<String> = None;
+    let mut out_dir: Option<String> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -651,6 +713,10 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
                         .ok_or("--type needs a resource extension (e.g. itm)")?,
                 );
             }
+            // Directory to write a compiled `.baf`'s `.bcs` into.
+            "--out" => {
+                out_dir = Some(args.next().ok_or("--out needs a directory")?);
+            }
             "--help" | "-h" => help = true,
             _ if query.is_none() => query = Some(arg),
             _ => return Err(format!("unexpected argument: {arg}").into()),
@@ -669,7 +735,10 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     // referenced names still resolve against the game directory.
     if file {
         let path = query.ok_or("--file needs a path to a resource file")?;
-        return print_file(out, &mut manager, &path, raw);
+        return print_file(out, &mut manager, &path, raw, out_dir.as_deref());
+    }
+    if out_dir.is_some() {
+        return Err("--out applies only when compiling a --file .baf".into());
     }
 
     if stats {

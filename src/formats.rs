@@ -5,6 +5,8 @@
 //! error, and small parsing helpers) live in the crate root.
 
 pub mod are;
+pub mod baf;
+pub mod bcs;
 pub mod bif;
 pub mod cre;
 pub mod dlg;
@@ -21,15 +23,14 @@ pub mod tlk;
 pub mod twoda;
 
 // Resource types this crate does not decode but whose resrefs the decoded
-// formats reference (portraits, icons, sounds, scripts, tilemaps, palettes).
-// The parsed formats tag their `resref_uses` with these so a reverse search
-// knows what each reference names. Values match `key::extension_type`.
+// formats reference (portraits, icons, sounds, tilemaps, palettes). The parsed
+// formats tag their `resref_uses` with these so a reverse search knows what
+// each reference names. Values match `key::extension_type`.
 pub const WAV_TYPE: u16 = 0x0004;
 pub const BMP_TYPE: u16 = 0x0001;
 pub const MVE_TYPE: u16 = 0x0002;
 pub const BAM_TYPE: u16 = 0x03e8;
 pub const WED_TYPE: u16 = 0x03e9;
-pub const BCS_TYPE: u16 = 0x03ef;
 pub const VVC_TYPE: u16 = 0x03fb;
 
 /// Name an item category code, as used in the `item type` field of an

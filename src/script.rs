@@ -1,29 +1,35 @@
-//! What the engine's script calls name, so a quoted resref in a DLG script can
-//! be typed by the call that takes it.
+//! What the engine's script calls name: the vocabulary that types a compiled
+//! script's calls and the quoted resrefs in a DLG's script blocks.
 //!
-//! [`SIGNATURES`] copies `ACTION.IDS` / `TRIGGER.IDS` verbatim rather than
-//! reading them: the calls are implemented in the closed-source executable, so
-//! a mod cannot add one without patching it, and a static table keeps the
-//! search working without the game present.
+//! The signatures are read from the install's own `ACTION.IDS` / `TRIGGER.IDS`
+//! ([`from_signatures`]) rather than transcribed. The calls are implemented in
+//! the closed-source executable, so a mod cannot add one — but decompiling
+//! needs their numeric ids and full parameter lists, and the *value* tables
+//! they point at (`SPELL.IDS`, `OBJECT.IDS`) are mod-extended, so the game must
+//! be read in any case.
 //!
 //! What the IDS cannot supply is what a parameter *name* means. It says
 //! `HasItem(S:ResRef*,…)` and `Global(S:Name*,S:Area*,…)`; only convention says
 //! the first is an item and the second pair a variable and its scope. Some
-//! names lie outright — `GiveItem(S:Object*,…)` takes an item.
-//!
-//! So the tables stay conservative: uncertainty resolves to
-//! [`ArgKind::Unknown`], which admits rather than rejects.
+//! names lie outright — `GiveItem(S:Object*,…)` takes an item. That curated
+//! layer ([`ArgKind`], [`param_kind`], [`call_override`]) is the one thing kept
+//! in code; uncertainty resolves to [`ArgKind::Unknown`], which admits rather
+//! than rejects.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+
+use crate::formats::bcs;
+use crate::formats::ids::IdsFile;
 
 use crate::formats::are::ARE_TYPE;
+use crate::formats::bcs::BCS_TYPE;
 use crate::formats::cre::CRE_TYPE;
 use crate::formats::dlg::DLG_TYPE;
 use crate::formats::eff::EFF_TYPE;
 use crate::formats::itm::ITM_TYPE;
 use crate::formats::spl::SPL_TYPE;
-use crate::formats::{BCS_TYPE, BMP_TYPE, WAV_TYPE};
+use crate::formats::{BMP_TYPE, WAV_TYPE};
 
 /// What a script call's string argument names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,107 +43,595 @@ pub enum ArgKind {
     Unknown,
 }
 
-/// For each call, what each argument names.
-#[derive(Default)]
-pub struct Vocabulary {
-    /// Lowercased call name -> argument kinds, by position.
-    calls: HashMap<String, Vec<ArgKind>>,
+/// Which record slot class a parameter occupies. A call's arguments are not
+/// stored in declaration order: each class fills its own slots in order, so
+/// `CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)` puts its integer in
+/// the first integer slot even though it is declared last.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Class {
+    String,
+    Int,
+    Object,
+    Point,
+    /// Only `ActionOverride(O:Actor*,A:Action*)`, which the engine never
+    /// stores: the actor goes in the call's own object slot 0.
+    Action,
 }
 
-/// The engine's vocabulary, parsed once and shared.
-pub fn engine() -> &'static Vocabulary {
-    static VOCABULARY: OnceLock<Vocabulary> = OnceLock::new();
-    VOCABULARY.get_or_init(|| {
-        let mut calls = HashMap::new();
-        for signature in SIGNATURES {
-            if let Some((name, kinds)) = parse_signature(signature) {
-                // First definition wins, as when a name appears in both tables.
-                calls.entry(name).or_insert(kinds);
+/// One declared parameter of a call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Param {
+    pub class: Class,
+    pub name: String,
+    /// The IDS table an integer argument draws its symbols from, when the
+    /// signature names one (`I:Spell*Spell` -> `SPELL.IDS`).
+    pub ids: Option<String>,
+}
+
+/// One `ACTION.IDS` / `TRIGGER.IDS` call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature {
+    pub id: i32,
+    pub name: String,
+    pub params: Vec<Param>,
+}
+
+/// How many slots of each class a signature occupies. Slots fill from zero, so
+/// a count is enough to say which are in use.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Slots {
+    pub ints: usize,
+    pub strings: usize,
+    /// Object slots the call itself uses, ignoring the `ActionOverride` slot.
+    pub objects: usize,
+    pub point: bool,
+}
+
+impl Slots {
+    /// Whether a signature covering `self` can account for a record occupying
+    /// `used` — every slot the record fills must be one the call reads.
+    fn covers(&self, used: &Slots) -> bool {
+        self.ints >= used.ints
+            && self.strings >= used.strings
+            && self.objects >= used.objects
+            && (self.point || !used.point)
+    }
+}
+
+impl Signature {
+    /// The slots this call occupies. A scope parameter shares its predecessor's
+    /// string slot: `Global(S:Name*,S:Area*,…)` stores one string, the scope
+    /// prefixed to the name.
+    pub fn slots(&self) -> Slots {
+        let mut slots = Slots::default();
+        for param in &self.params {
+            match param.class {
+                Class::Int => slots.ints += 1,
+                Class::Object => slots.objects += 1,
+                Class::Point => slots.point = true,
+                Class::Action => {}
+                Class::String => {
+                    if !(slots.strings > 0 && is_scope_param(&self.name, &param.name)) {
+                        slots.strings += 1;
+                    }
+                }
             }
         }
-        Vocabulary { calls }
-    })
+        slots
+    }
 }
 
-impl Vocabulary {
-    /// What argument `arg` of `call` names. [`ArgKind::Unknown`] when the call
-    /// is unlisted or the position is past its declared arguments.
-    pub fn arg_kind(&self, call: &str, arg: usize) -> ArgKind {
-        self.calls
-            .get(&call.to_ascii_lowercase())
-            .and_then(|kinds| kinds.get(arg))
-            .copied()
-            .unwrap_or(ArgKind::Unknown)
-    }
+/// The `IDS` tables behind an object's seven enumerated attributes, in the
+/// order the fields are stored.
+pub const OBJECT_TABLES: [&str; 7] = [
+    "EA", "GENERAL", "RACE", "CLASS", "SPECIFIC", "GENDER", "ALIGNMEN",
+];
 
-    /// Whether argument `arg` of `call` could name a resource of type `kind`.
-    /// Only a confident contradiction rejects, so an unlisted call still
-    /// reports.
-    pub fn could_name(&self, call: &str, arg: usize, kind: u16) -> bool {
-        match self.arg_kind(call, arg) {
-            ArgKind::Resource(named) => named == kind,
-            ArgKind::Variable => false,
-            ArgKind::Unknown => true,
+/// The table behind an object's five identifier fields, which chain into
+/// `LastAttackerOf(LastHeardBy(Myself))`.
+pub const IDENTIFIER_TABLE: &str = "OBJECT";
+
+/// For each call, what each argument names.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Vocabulary {
+    /// Action id -> the signatures sharing it, in file order.
+    actions: HashMap<i32, Vec<Signature>>,
+    /// Trigger id -> the signatures sharing it, in file order.
+    triggers: HashMap<i32, Vec<Signature>>,
+    /// Lowercased name -> signature, for parsing a call by name back into a
+    /// record. Names are unique within each table, so one entry each.
+    action_by_name: HashMap<String, Signature>,
+    trigger_by_name: HashMap<String, Signature>,
+    /// UPPERCASE table name -> value -> symbol, for the tables the signatures
+    /// name. These are the ones a mod really can extend, so they are read from
+    /// the install rather than assumed.
+    symbols: HashMap<String, HashMap<i64, String>>,
+    /// The reverse: UPPERCASE table -> UPPERCASE symbol -> value, for parsing a
+    /// symbol back to its number. Names are unique, so this is unambiguous even
+    /// where a value carries several.
+    values: HashMap<String, HashMap<String, i64>>,
+}
+
+/// Read one table's calls from the install's own `ACTION.IDS` / `TRIGGER.IDS`.
+///
+/// Separate from [`from_signatures`] because a caller holding the manager can
+/// only borrow one IDS table at a time.
+pub fn signatures(table: &IdsFile) -> Vec<Signature> {
+    table
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let id = i32::try_from(entry.value).ok()?;
+            parse_call(id, &entry.name)
+        })
+        .collect()
+}
+
+/// Build a vocabulary from `IDS` lines, for tests in this module and in
+/// [`bcs`](crate::formats::bcs).
+#[cfg(test)]
+pub fn from_lines(actions: &[&str], triggers: &[&str]) -> Vocabulary {
+    fn read(lines: &[&str]) -> Vec<Signature> {
+        lines
+            .iter()
+            .filter_map(|line| {
+                let (id, text) = line.trim().split_once(char::is_whitespace)?;
+                parse_call(id.parse().ok()?, text.trim())
+            })
+            .collect()
+    }
+    from_signatures(read(actions), read(triggers))
+}
+
+/// Assemble both tables into the vocabulary, indexing calls by id for
+/// decompiling and by name for the DLG scan.
+pub fn from_signatures(actions: Vec<Signature>, triggers: Vec<Signature>) -> Vocabulary {
+    let mut vocabulary = Vocabulary::default();
+    for (by_id, by_name, table) in [
+        (
+            &mut vocabulary.actions,
+            &mut vocabulary.action_by_name,
+            actions,
+        ),
+        (
+            &mut vocabulary.triggers,
+            &mut vocabulary.trigger_by_name,
+            triggers,
+        ),
+    ] {
+        for signature in table {
+            let name = signature.name.to_ascii_lowercase();
+            // First definition wins, as when a name appears in both tables.
+            by_name.entry(name).or_insert_with(|| signature.clone());
+            by_id.entry(signature.id).or_default().push(signature);
         }
     }
-
-    /// How many calls are typed; confirms the table parsed in full.
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.calls.len()
-    }
+    vocabulary
 }
 
-/// Split `SetGlobal(S:Name*,S:Area*,I:Value*)` into a lowercased name and the
-/// kind of each argument. Positions count *every* parameter, since the scanner
-/// that consumes this counts commas.
-fn parse_signature(signature: &str) -> Option<(String, Vec<ArgKind>)> {
-    let (name, rest) = signature.split_once('(')?;
+/// Split `12 CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)`'s call text
+/// into its name and typed parameters. `None` when the text is not a call.
+fn parse_call(id: i32, text: &str) -> Option<Signature> {
+    let (name, rest) = text.split_once('(')?;
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
     let args = rest.strip_suffix(')').unwrap_or(rest);
 
-    // `T:Name*Suffix`; only the `S` (string) class can hold a resref.
-    let params: Vec<(char, &str)> = args
+    let params = args
         .split(',')
         .filter(|p| !p.trim().is_empty())
-        .map(|p| {
+        .filter_map(|p| {
             let p = p.trim();
-            let (class, tail) = p.split_once(':').unwrap_or(("?", p));
-            let param = tail.split('*').next().unwrap_or(tail);
-            (class.chars().next().unwrap_or('?'), param)
+            let (class, tail) = p.split_once(':')?;
+            let class = match class.trim() {
+                "S" => Class::String,
+                "I" => Class::Int,
+                "O" => Class::Object,
+                "P" => Class::Point,
+                "A" => Class::Action,
+                _ => return None,
+            };
+            // `Name*Table`: the text after the asterisk names an IDS table, and
+            // only integer parameters have one.
+            let (name, ids) = tail.split_once('*').unwrap_or((tail, ""));
+            let ids = (!ids.is_empty() && class == Class::Int).then(|| ids.to_string());
+            Some(Param {
+                class,
+                name: name.to_string(),
+                ids,
+            })
         })
         .collect();
 
+    Some(Signature {
+        id,
+        name: name.to_string(),
+        params,
+    })
+}
+
+/// Whether a call's scope parameter shares its variable's string slot, stored
+/// as a six-character prefix on the name.
+///
+/// IESDP says the only reliable way to know is to hardcode the calls that do
+/// it, and it is right: the signatures give no clue. `Global(S:Name*,S:Area*)`
+/// packs both into one slot while `GlobalTimerNotExpired(S:Name*,S:Area*)`
+/// keeps them apart, and the two readings of id 446 disagree with each other.
+/// This list was derived by compiling one probe per candidate call with WeiDU
+/// and reading back which slots it filled.
+pub fn is_scope_param(call: &str, param: &str) -> bool {
+    const CONCATENATING: [&str; 16] = [
+        "createcreatureatlocation",
+        "createitemglobal",
+        "global",
+        "globalgt",
+        "globallt",
+        "incrementglobal",
+        "incrementglobalonce",
+        "movetosavedlocation",
+        "movetosavedlocationn",
+        "realsetglobaltimer",
+        "setglobal",
+        "setglobalrandom",
+        "setglobalrandomplus",
+        "setglobaltimer",
+        "setglobaltimerrandom",
+        "settokenglobal",
+    ];
+    is_scope_name(param) && CONCATENATING.iter().any(|c| call.eq_ignore_ascii_case(c))
+}
+
+/// Parameter names that hold a variable's scope rather than a resource.
+fn is_scope_name(param: &str) -> bool {
+    matches!(
+        param.to_ascii_lowercase().as_str(),
+        "area" | "area1" | "area2" | "scope"
+    )
+}
+
+/// The signature chosen to name a record, and whether it accounts for every
+/// slot the record fills. A false [`covered`](Naming::covered) means the record
+/// carries data the call has no parameter for — junk the compiler left behind —
+/// which the caller preserves rather than dropping.
+#[derive(Clone, Copy, Debug)]
+pub struct Naming<'a> {
+    pub signature: &'a Signature,
+    pub covered: bool,
+}
+
+/// The slots a compiled action fills. Slot 0 of the objects is the
+/// `ActionOverride` actor, never an argument.
+fn action_slots(action: &bcs::Action) -> Slots {
+    Slots {
+        ints: highest(&action.ints, |&v| v != 0),
+        strings: highest(&action.strings, |s| !s.is_empty()),
+        objects: highest(&action.objects[1..], |o| !o.is_empty()),
+        point: action.point != (0, 0),
+    }
+}
+
+/// The slots a compiled trigger fills.
+fn trigger_slots(trigger: &bcs::Trigger) -> Slots {
+    Slots {
+        ints: highest(&trigger.ints, |&v| v != 0),
+        strings: highest(&trigger.strings, |s| !s.is_empty()),
+        objects: usize::from(!trigger.object.is_empty()),
+        point: false,
+    }
+}
+
+/// Pick the signature to print for a record, by its string-slot count.
+///
+/// Only strings discriminate: an unread integer slot holds a zero either way
+/// (`StartCutSceneEx("cut212a",FALSE)` takes the spare when offered), but a call
+/// declaring a string the record never filled would name nothing. When none
+/// matches, the record is padding (`ForceRandomEncounterEntry("","")`) and the
+/// last reading wins — as on any tie, since `8 Dialogue`/`8 Dialog` are one call
+/// under two names and WeiDU prints the later.
+///
+/// Chooses even when no reading fully fits; [`Naming::covered`] reports the
+/// shortfall. Fitted to the colliding ids, checked against the whole install.
+fn select<'a>(candidates: &'a [Signature], used: &Slots) -> Option<&'a Signature> {
+    candidates
+        .iter()
+        .rev()
+        .find(|signature| signature.slots().strings == used.strings)
+        .or_else(|| candidates.iter().next_back())
+}
+
+impl Vocabulary {
+    /// The call a compiled action names, with whether the reading is complete.
+    /// `None` only when the id is unlisted.
+    pub fn name_action(&self, action: &bcs::Action) -> Option<Naming<'_>> {
+        let used = action_slots(action);
+        let signature = select(self.actions.get(&action.id)?, &used)?;
+        Some(Naming {
+            signature,
+            covered: signature.slots().covers(&used),
+        })
+    }
+
+    /// The call a compiled trigger names, with whether the reading is complete.
+    /// `None` only when the id is unlisted.
+    pub fn name_trigger(&self, trigger: &bcs::Trigger) -> Option<Naming<'_>> {
+        let used = trigger_slots(trigger);
+        let signature = select(self.triggers.get(&trigger.id)?, &used)?;
+        Some(Naming {
+            signature,
+            covered: signature.slots().covers(&used),
+        })
+    }
+
+    /// The call an action names only when a signature fully accounts for it.
+    pub fn action(&self, action: &bcs::Action) -> Option<&Signature> {
+        self.name_action(action)
+            .filter(|naming| naming.covered)
+            .map(|naming| naming.signature)
+    }
+
+    /// The call a trigger names only when a signature fully accounts for it.
+    pub fn trigger(&self, trigger: &bcs::Trigger) -> Option<&Signature> {
+        self.name_trigger(trigger)
+            .filter(|naming| naming.covered)
+            .map(|naming| naming.signature)
+    }
+
+    /// What a compiled action's arguments name — resources and dialog strings —
+    /// for a reverse search.
+    pub fn action_args<'a>(&self, action: &'a bcs::Action) -> Vec<Arg<'a>> {
+        self.name_action(action)
+            .map(|naming| call_args(naming.signature, &action.ints, &action.strings))
+            .unwrap_or_default()
+    }
+
+    /// What a compiled trigger's arguments name, for a reverse search.
+    pub fn trigger_args<'a>(&self, trigger: &'a bcs::Trigger) -> Vec<Arg<'a>> {
+        self.name_trigger(trigger)
+            .map(|naming| call_args(naming.signature, &trigger.ints, &trigger.strings))
+            .unwrap_or_default()
+    }
+
+    /// Every `IDS` table needed to print arguments symbolically: those the
+    /// signatures name for their integers, plus the object tables. Returned
+    /// owned so the caller can load each without holding a borrow.
+    pub fn symbol_tables(&self) -> Vec<String> {
+        let declared = self
+            .actions
+            .values()
+            .chain(self.triggers.values())
+            .flatten()
+            .flat_map(|signature| signature.params.iter())
+            .filter_map(|param| param.ids.as_deref());
+
+        let mut tables: Vec<String> = declared
+            .chain(OBJECT_TABLES)
+            .chain([IDENTIFIER_TABLE])
+            .map(|table| table.to_ascii_uppercase())
+            .collect();
+        tables.sort();
+        tables.dedup();
+        tables
+    }
+
+    /// Record a table's value -> symbol mapping, and its reverse for parsing.
+    pub fn set_symbols(&mut self, table: &str, entries: HashMap<i64, String>) {
+        let table = table.to_ascii_uppercase();
+        let reverse = entries
+            .iter()
+            .map(|(&value, name)| (name.to_ascii_uppercase(), value))
+            .collect();
+        self.values.insert(table.clone(), reverse);
+        self.symbols.insert(table, entries);
+    }
+
+    /// The symbol a table gives a value, if the table was loaded and lists it.
+    pub fn symbol(&self, table: &str, value: i64) -> Option<&str> {
+        let symbols = self.symbols.get(&table.to_ascii_uppercase())?;
+        symbols
+            .get(&value)
+            .or_else(|| {
+                // A table may write a 32-bit flag unsigned where the record
+                // stores it signed: `STATE.IDS` has `0x80000000 STATE_CONFUSED`
+                // for what a script holds as i32::MIN.
+                let unsigned =
+                    i64::from(u32::from_ne_bytes(i32::try_from(value).ok()?.to_ne_bytes()));
+                symbols.get(&unsigned)
+            })
+            .map(String::as_str)
+    }
+
+    /// The value a table gives a symbol, for parsing BAF back to a record. The
+    /// unsigned-flag case is folded to `i32` so it matches what the record
+    /// stores (`STATE_CONFUSED` -> i32::MIN, not 0x80000000).
+    pub fn value(&self, table: &str, symbol: &str) -> Option<i32> {
+        let value = *self
+            .values
+            .get(&table.to_ascii_uppercase())?
+            .get(&symbol.to_ascii_uppercase())?;
+        i32::try_from(value)
+            .ok()
+            .or_else(|| u32::try_from(value).ok().map(|u| u as i32))
+    }
+
+    /// The action a name resolves to, for parsing a response line.
+    pub fn action_named(&self, name: &str) -> Option<&Signature> {
+        self.action_by_name.get(&name.to_ascii_lowercase())
+    }
+
+    /// The trigger a name resolves to, for parsing a condition line.
+    pub fn trigger_named(&self, name: &str) -> Option<&Signature> {
+        self.trigger_by_name.get(&name.to_ascii_lowercase())
+    }
+
+    /// How many distinct call ids are known; confirms the tables were read.
+    #[cfg(test)]
+    pub fn call_ids(&self) -> (usize, usize) {
+        (self.actions.len(), self.triggers.len())
+    }
+
+    /// What argument `arg` of `call` names, for the tests that fix the curated
+    /// typing. [`ArgKind::Unknown`] when the call is unlisted or the position is
+    /// past its declared arguments.
+    #[cfg(test)]
+    fn arg_kind(&self, call: &str, arg: usize) -> ArgKind {
+        let name = call.to_ascii_lowercase();
+        self.action_by_name
+            .get(&name)
+            .or_else(|| self.trigger_by_name.get(&name))
+            .map(arg_kinds)
+            .and_then(|kinds| kinds.get(arg).copied())
+            .unwrap_or(ArgKind::Unknown)
+    }
+}
+
+/// What each argument of a call names. Positions count *every* parameter, since
+/// the curated typing is indexed by declaration order.
+fn arg_kinds(signature: &Signature) -> Vec<ArgKind> {
     // An `Area` alongside a variable name is that variable's *scope*, not an
     // area reference — the `Global`/`SetGlobal` shape. `MoveGlobal` has no name
     // parameter and really does name an area.
-    let scoped = params
+    let scoped = signature
+        .params
         .iter()
-        .any(|(class, param)| *class == 'S' && is_variable_name(param));
+        .any(|p| p.class == Class::String && is_variable_name(&p.name));
 
-    let kinds = params
+    signature
+        .params
         .iter()
-        .map(|(class, param)| {
-            if *class != 'S' {
+        .map(|param| {
+            // Only a string argument can hold a resref.
+            if param.class != Class::String {
                 return ArgKind::Unknown;
             }
-            if let Some(kind) = call_override(name, param) {
+            if let Some(kind) = call_override(&signature.name, &param.name) {
                 return kind;
             }
-            if is_variable_name(param) {
+            if is_variable_name(&param.name) {
                 return ArgKind::Variable;
             }
-            if param.eq_ignore_ascii_case("area") && scoped {
+            if param.name.eq_ignore_ascii_case("area") && scoped {
                 return ArgKind::Variable;
             }
-            param_kind(param)
+            param_kind(&param.name)
         })
-        .collect();
+        .collect()
+}
 
-    Some((name.to_ascii_lowercase(), kinds))
+/// Something a compiled call's argument names, tagged with the parameter it
+/// came from (for the search path).
+pub enum Arg<'a> {
+    /// A resource of a given type. The resref usually borrows from the record,
+    /// but a spell named by number is computed and so owns.
+    Resource {
+        kind: u16,
+        resref: Cow<'a, str>,
+        param: String,
+    },
+    /// A dialog string, by its `dialog.tlk` index.
+    Strref { value: u32, param: String },
+}
+
+/// What a call's arguments name. Walks the signature the way the renderer does
+/// — each class fills its own slots, and a scope parameter shares its
+/// variable's string slot — but classifies the arguments rather than formatting
+/// them. Only curated, concretely-typed arguments are returned; one whose type
+/// is uncertain is left out rather than guessed.
+fn call_args<'a>(signature: &Signature, ints: &[i32], strings: &'a [String]) -> Vec<Arg<'a>> {
+    let kinds = arg_kinds(signature);
+    let mut out = Vec::new();
+    let (mut next_int, mut next_string) = (0, 0);
+    let mut params = signature.params.iter().enumerate().peekable();
+    let param_path = |param: &Param| format!("{}.{}", signature.name, param.name);
+
+    while let Some((position, param)) = params.next() {
+        match param.class {
+            Class::Int => {
+                let value = ints.get(next_int).copied().unwrap_or(0);
+                next_int += 1;
+                // A `SPELL.IDS` integer names a spell by number, which the
+                // filename convention turns into a resref (`2001` -> `SPWI001`).
+                if param
+                    .ids
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("spell"))
+                {
+                    if let Some(resref) = spell_resref(value) {
+                        out.push(Arg::Resource {
+                            kind: SPL_TYPE,
+                            resref: Cow::Owned(resref),
+                            param: param_path(param),
+                        });
+                    }
+                } else if is_strref_param(&param.name) {
+                    // The "no string" sentinel is stored as -1, which fails the
+                    // conversion and so is skipped.
+                    if let Ok(value) = u32::try_from(value) {
+                        out.push(Arg::Strref {
+                            value,
+                            param: param_path(param),
+                        });
+                    }
+                }
+            }
+            Class::String => {
+                let stored = strings.get(next_string).map(String::as_str).unwrap_or("");
+                next_string += 1;
+                if let Some(ArgKind::Resource(kind)) = kinds.get(position)
+                    && !stored.is_empty()
+                {
+                    out.push(Arg::Resource {
+                        kind: *kind,
+                        resref: Cow::Borrowed(stored),
+                        param: param_path(param),
+                    });
+                }
+                // A scope parameter shares this string slot, so skip it: the
+                // next string parameter reads the next slot, not this one.
+                if params.peek().is_some_and(|(_, next)| {
+                    next.class == Class::String && is_scope_param(&signature.name, &next.name)
+                }) {
+                    params.next();
+                }
+            }
+            // Objects hold death-variable names, not resrefs; points and the
+            // `ActionOverride` slot name nothing.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether an integer parameter holds a `dialog.tlk` strref. Nearly all are
+/// named `StrRef`; `AddJournalEntry(I:Entry*,…)` is the one that labels its
+/// journal strref differently.
+fn is_strref_param(name: &str) -> bool {
+    name.eq_ignore_ascii_case("strref") || name.eq_ignore_ascii_case("entry")
+}
+
+/// The `.spl` resref a `SPELL.IDS` number names, by the filename convention: a
+/// four-digit `T·NNN` where `T` selects the prefix — priest, wizard, innate,
+/// class — and `NNN` is the file's numeric suffix (`2001` -> `SPWI001`). `None`
+/// for a number outside the scheme.
+pub fn spell_resref(number: i32) -> Option<String> {
+    let prefix = match number / 1000 {
+        1 => "SPPR",
+        2 => "SPWI",
+        3 => "SPIN",
+        4 => "SPCL",
+        _ => return None,
+    };
+    Some(format!("{prefix}{:03}", number % 1000))
+}
+
+/// One past the last slot holding something other than its default. Slots fill
+/// from zero, so this is how many the record occupies.
+fn highest<T>(slots: &[T], occupied: impl Fn(&T) -> bool) -> usize {
+    slots
+        .iter()
+        .rposition(occupied)
+        .map_or(0, |index| index + 1)
 }
 
 /// Parameter names holding a variable or scope rather than a resource.
@@ -257,215 +751,13 @@ fn call_override(call: &str, param: &str) -> Option<ArgKind> {
     }
 }
 
-/// Every `ACTION.IDS` / `TRIGGER.IDS` call taking a string parameter, verbatim
-/// from a BG2:EE install so it can be diffed against the game files. Calls
-/// without one are omitted — no quoted resref can appear in them.
-static SIGNATURES: [&str; 191] = [
-    "Acquired(S:ResRef*)",
-    "AddexperiencePartyGlobal(S:Name*,S:Area*)",
-    "AddGlobals(S:Name*,S:Name2*)",
-    "AddSpecialAbility(S:ResRef*)",
-    "AddStoreItem(S:Store*,S:Item*,I:Count*,I:Flags*)",
-    "AddWorldmapAreaFlag(S:Area*,I:Type*WMPFLAG)",
-    "AddXP2DA(S:Column*)",
-    "ApplySpellRES(S:RES*,O:Target)",
-    "AreaCheck(S:ResRef*)",
-    "AreaCheckObject(S:ResRef*,O:Object*)",
-    "AttachTransitionToDoor(S:GLOBAL*,O:Object*)",
-    "BeenInParty(S:Name*)",
-    "BitCheck(S:Name*,S:Area*,I:Bit*Bits)",
-    "BitClear(S:Name*,S:Scope*,I:Bit*Bits)",
-    "BitSet(S:Name*,S:Scope*,I:Bit*Bits)",
-    "ChangeAIScript(S:ScriptFile*,I:Level*Scrlev)",
-    "ChangeAnimation(S:ResRef*)",
-    "ChangeAnimationNoEffect(S:ResRef*)",
-    "ChangeStoreMarkup(S:Store*,I:BuyMarkup*,I:SellMarkup*)",
-    "CharName(S:Name*,O:Object*)",
-    "CheckItemSlot(O:Object*,S:Item*,I:Slot*SLOTS)",
-    "Contains(S:ResRef*,O:Object*)",
-    "CopyGroundPilesTo(S:ResRef*,P:Location*)",
-    "CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)",
-    "CreateCreatureAtLocation(S:GLOBAL*,S:Area*,S:ResRef*)",
-    "CreateCreatureCopyPoint(S:ResRef*,O:Object*,P:Dest*)",
-    "CreateCreatureDoor(S:NewObject*,P:Location*,I:Face*DIR)",
-    "CreateCreatureEffect(S:NewObject*,S:Effect*,P:Location*,I:Face*DIR)",
-    "CreateCreatureImpassable(S:NewObject*,P:Location*,I:Face*DIR)",
-    "CreateCreatureImpassableAllowOverlap(S:NewObject*,P:Location*,I:Face*DIR)",
-    "CreateCreatureImpassableAllowOverlapEffect(S:NewObject*,S:Effect*,P:Location*,I:Face*DIR)",
-    "CreateCreatureImpassableEffect(S:NewObject*,S:Effect*,P:Location*,I:Face*DIR)",
-    "CreateCreatureObject(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)",
-    "CreateCreatureObjectCopy(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)",
-    "CreateCreatureObjectCopyEffect(S:ResRef*,S:Effect*,O:Object*)",
-    "CreateCreatureObjectDoor(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)",
-    "CreateCreatureObjectEffect(S:ResRef*,S:Effect*,O:Object*)",
-    "CreateCreatureObjectOffScreen(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)",
-    "CreateCreatureObjectOffset(S:ResRef*,O:Object*,P:Offset*)",
-    "CreateCreatureOffScreen(S:ResRef*,I:Face*DIR)",
-    "CreateItem(S:ResRef*,I:Usage1*,I:Usage2*,I:Usage3*)",
-    "CreateItemGlobal(S:Global*,S:Area*,S:ResRef*)",
-    "CreateVisualEffect(S:Object*,P:Location*)",
-    "CreateVisualEffectObject(S:Effect*,O:Target*)",
-    "CurrentAmmo(S:ResRef*,O:Object*)",
-    "Dead(S:Name*)",
-    "DeathMatchPositionArea(S:Areaname*,P:Dest*,I:Player*)",
-    "DeathMatchPositionGlobal(S:Areaname*,P:Dest*,I:Player*)",
-    "DeathMatchPositionLocal(S:Areaname*,P:Dest*,I:Player*)",
-    "DestroyItem(S:ResRef*)",
-    "DisplayStringHeadOwner(S:Item*,I:STRREF*)",
-    "DropItem(S:Object*,P:Location*)",
-    "EquipItem(S:Object*)",
-    "EquipItemEx(S:Object*,I:EquipUnEquip*)",
-    "EscapeAreaMove(S:Area*,I:X*,I:Y*,I:Face*DIR)",
-    "EscapeAreaObjectMove(S:ResRef*,O:Object*,I:X*,I:Y*,I:Face*DIR)",
-    "ExportParty(S:Name*)",
-    "ForceRandomEncounter(S:Area*)",
-    "ForceRandomEncounterEntry(S:Area*,S:Entry*)",
-    "ForceSpellPointRangeRES(S:RES*,P:Target)",
-    "ForceSpellPointRES(S:RES*,P:Target)",
-    "ForceSpellRangeRES(S:RES*,O:Target)",
-    "ForceSpellRES(S:RES*,O:Target)",
-    "G(S:ResRef*,I:Num*)",
-    "GetItem(S:Object*,O:Target*)",
-    "GGT(S:ResRef*,I:Num*)",
-    "GiveItem(S:Object*,O:Target*)",
-    "GiveItemCreate(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)",
-    "GiveObjectGoldGlobal(S:Name*,S:Area*,O:Object*)",
-    "GivePartyGoldGlobal(S:Name*,S:Area*)",
-    "Global(S:Name*,S:Area*,I:Value*)",
-    "GlobalGT(S:Name*,S:Area*,I:Value*)",
-    "GlobalLT(S:Name*,S:Area*,I:Value*)",
-    "GlobalsEqual(S:Name1*,S:Name2*)",
-    "GlobalsGT(S:Name1*,S:Name2*)",
-    "GlobalsLT(S:Name1*,S:Name2*)",
-    "GlobalTimerExact(S:Name*,S:Area*)",
-    "GlobalTimerExpired(S:Name*,S:Area*)",
-    "GlobalTimerNotExpired(S:Name*,S:Area*)",
-    "GLT(S:ResRef*,I:Num*)",
-    "HasDLC(S:DLCName*)",
-    "HasItem(S:ResRef*,O:Object*)",
-    "HasItemEquiped(S:ResRef*,O:Object*)",
-    "HasItemEquipedReal(S:ResRef*,O:Object*)",
-    "HaveKnownSpellRES(S:Spell*)",
-    "HaveSpellRES(S:Spell*)",
-    "HideAreaOnMap(S:ResRef*)",
-    "IncrementChapter(S:RESREF*)",
-    "IncrementGlobal(S:Name*,S:Area*,I:Value*)",
-    "IncrementGlobalOnce(S:Name1*,S:Area1*,S:Name2*,S:Area2*,I:Val*)",
-    "IncrementGlobalOnceEx(S:Var1*,S:Var2*,I:Val*)",
-    "INI(S:Name*,I:Number*)",
-    "InLine(S:Target*,O:Object*)",
-    "IsForcedRandomEncounterActive(S:Area*)",
-    "LeaveArea(S:Area*,P:Point*,I:Face*DIR)",
-    "LeaveAreaLUA(S:Area*,S:Parchment*,P:Point*,I:Face*DIR)",
-    "LeaveAreaLUAEntry(S:Area*,S:Entry*,P:Point*,I:Face*DIR)",
-    "LeaveAreaLUAPanic(S:Area*,S:Parchment*,P:Point*,I:Face*DIR)",
-    "LeaveAreaLUAPanicEntry(S:Area*,S:Entry*,P:Point*,I:Face*DIR)",
-    "LocalsEqual(S:Name1*,S:Name2*)",
-    "LocalsGT(S:Name1*,S:Name2*)",
-    "LocalsLT(S:Name1*,S:Name2*)",
-    "MoveBetweenAreas(S:Area*,P:Location*,I:Face*DIR)",
-    "MoveBetweenAreasEffect(S:Area*,S:Effect*,P:Location*,I:Face*DIR)",
-    "MoveContainerContents(S:Container1*,S:Container2*)",
-    "MoveGlobal(S:Area*,O:Object*,P:Point*)",
-    "MoveGlobalsTo(S:FromArea*,S:ToArea*,P:Location*)",
-    "MoveToCampaign(S:Campaign*)",
-    "MoveToSavedLocation(S:GLOBAL*,S:Area*)",
-    "MoveToSavedLocationn(S:GLOBAL*,S:Area*)",
-    "Name(S:Name*,O:Object*)",
-    "NearSavedLocation(O:Object*,S:Global*,I:Range*)",
-    "NumDead(S:Name*,I:Num*)",
-    "NumDeadGT(S:Name*,I:Num*)",
-    "NumDeadLT(S:Name*,I:Num*)",
-    "NumItems(S:ResRef*,O:Object*,I:Num*)",
-    "NumItemsGT(S:ResRef*,O:Object*,I:Num*)",
-    "NumItemsLT(S:ResRef*,O:Object*,I:Num*)",
-    "NumItemsParty(S:ResRef*,I:Num*)",
-    "NumItemsPartyGT(S:ResRef*,I:Num*)",
-    "NumItemsPartyLT(S:ResRef*,I:Num*)",
-    "PartyHasItem(S:Item*)",
-    "PartyHasItemIdentified(S:ResRef*)",
-    "PickUpItem(S:ResRef*)",
-    "PlaySound(S:Sound*)",
-    "PlaySoundNotRanged(S:Sound*)",
-    "PlaySoundThroughVoice(S:Sound*)",
-    "RealGlobalTimerExact(S:Name*,S:Area*)",
-    "RealGlobalTimerExpired(S:Name*,S:Area*)",
-    "RealGlobalTimerNotExpired(S:Name*,S:Area*)",
-    "ReallyForceSpellDeadRES(S:RES*,O:Target)",
-    "ReallyForceSpellPointRES(S:RES*,P:Target*)",
-    "ReallyForceSpellRES(S:RES*,O:Target)",
-    "RealSetGlobalTimer(S:Name*,S:Area*,I:Time*GTimes)",
-    "RemoveSpellRES(S:RES*)",
-    "RemoveStoreItem(S:Store*,S:Item*,I:Count*)",
-    "RemoveWorldmapAreaFlag(S:Area*,I:Type*WMPFLAG)",
-    "RevealAreaOnMap(S:ResRef*)",
-    "SaveLocation(S:Area*,S:Global*,P:Point*)",
-    "SaveObjectLocation(S:Area*,S:Global*,O:Object*)",
-    "SetAreaScript(S:Script*,I:ScriptSlot*ASCRLEV)",
-    "SetDialog(S:DialogFile*)",
-    "SetDialogue(S:DialogFile*)",
-    "SetEncounterProbability(S:FromArea*,S:ToArea*,I:Probability*)",
-    "SetGlobal(S:Name*,S:Area*,I:Value*)",
-    "SetGlobalRandom(S:Name*,S:Area*,I:Count*,I:Size*)",
-    "SetGlobalRandomPlus(S:Name*,S:Area*,I:Count*,I:Size*,I:Plus*)",
-    "SetGlobalTimer(S:Name*,S:Area*,I:Time*GTimes)",
-    "SetGlobalTimerRandom(S:Name*,S:Area*,I:Min*GTimes,I:Max*GTimes)",
-    "SetItemFlags(S:ItemName*,I:Flags*INVITEM,I:SetReset*BOOLEAN)",
-    "SetMasterArea(S:Name*)",
-    "SetToken(S:Token*,I:STRREF*)",
-    "SetTokenGlobal(S:GLOBAL*,S:Area*,S:Token*)",
-    "SetTokenObject(S:Token*,O:Object)",
-    "SetWorldmap(S:Worldmap*)",
-    "SG(S:Name*,I:Num*)",
-    "SpellCastInnateRES(S:Spell*,O:Object*)",
-    "SpellCastOnMeRES(S:Spell*,O:Caster*)",
-    "SpellCastPriestRES(S:Spell*,O:Object*)",
-    "SpellCastRES(S:Spell*,O:Object*)",
-    "SpellNoDecRES(S:RES*,O:Target*)",
-    "SpellPointNoDecRES(S:RES*,P:Target*)",
-    "SpellPointRES(S:RES*,P:Target*)",
-    "SpellRES(S:RES*,O:Target*)",
-    "StartCutScene(S:CutScene*)",
-    "StartCutSceneEx(S:CutScene*,I:evaluateConditions*BOOLEAN)",
-    "StartDialog(S:DialogFile*,O:Target*)",
-    "StartDialogInterrupt(S:DialogFile*,O:Target*)",
-    "StartDialogNoName(S:DialogFile*,O:Target*)",
-    "StartDialogOverride(S:DialogFile*,O:Target*)",
-    "StartDialogOverrideInterrupt(S:DialogFile*,O:Target*)",
-    "StartDialogue(S:DialogFile*,O:Target*)",
-    "StartDialogueInterrupt(S:DialogFile*,O:Target*)",
-    "StartMovie(S:ResRef*)",
-    "StartStore(S:Store*,O:Target*)",
-    "StaticPalette(S:Palette*,O:Object*)",
-    "Switch(S:Global*,S:Area*)",
-    "TakeItemListParty(S:ResRef*)",
-    "TakeItemListPartyNum(S:ResRef*,I:Num*)",
-    "TakeItemReplace(S:Give*,S:Take*,O:Object*)",
-    "TakeObjectGoldGlobal(S:Name*,S:Area*,O:Object*)",
-    "TakePartyItem(S:Item*)",
-    "TakePartyItemAll(S:Item*)",
-    "TakePartyItemNum(S:ResRef*,I:Num*)",
-    "TakePartyItemRange(S:Item*)",
-    "TextScreen(S:TextList*)",
-    "TransformItem(S:OldItem*,S:NewItem*)",
-    "Unusable(S:ResRef*)",
-    "UseItem(S:Object*,O:Target*)",
-    "UseItemPoint(S:Item,P:Point*,I:Ability*)",
-    "XEquipItem(S:Item*,O:Object*,I:Slot*Slots,I:EquipUnEquip*XEQUIP)",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn vocab(signatures: &[&str]) -> Vocabulary {
-        let mut calls = HashMap::new();
-        for sig in signatures {
-            if let Some((name, kinds)) = parse_signature(sig) {
-                calls.insert(name, kinds);
-            }
-        }
-        Vocabulary { calls }
+        let sigs: Vec<Signature> = signatures.iter().filter_map(|s| parse_call(0, s)).collect();
+        from_signatures(sigs, Vec::new())
     }
 
     #[test]
@@ -509,30 +801,23 @@ mod tests {
     }
 
     #[test]
-    fn could_name_rejects_only_confident_contradictions() {
+    fn the_vocabulary_types_the_calls_the_reverse_search_leans_on() {
+        // The same curated calls the DLG scan relies on, now typed from IDS
+        // lines rather than a transcribed table.
         let v = vocab(&[
+            "PartyHasItem(S:Item*)",
+            "GiveItemCreate(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)",
+            "GiveItem(S:Object*,O:Target*)",
             "AreaCheck(S:ResRef*)",
+            "CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)",
+            "ApplySpellRES(S:RES*,O:Target)",
+            "StartDialogue(S:DialogFile*,O:Target*)",
             "SetGlobal(S:Name*,S:Area*,I:Value*)",
-            "MysteryAction(S:ResRef*)",
+            "G(S:ResRef*,I:Num*)",
+            "Dead(S:Name*)",
+            "MoveGlobal(S:Area*,O:Object*,P:Point*)",
         ]);
-        // Typed and matching, typed and contradicting.
-        assert!(v.could_name("AreaCheck", 0, ARE_TYPE));
-        assert!(!v.could_name("AreaCheck", 0, BCS_TYPE));
-        // Known not to be a resource at all.
-        assert!(!v.could_name("SetGlobal", 1, ARE_TYPE));
-        // Unknown always admits, whatever the query.
-        assert!(v.could_name("MysteryAction", 0, ARE_TYPE));
-        assert!(v.could_name("MysteryAction", 0, BCS_TYPE));
-        assert!(v.could_name("NotInTheTable", 0, ITM_TYPE));
-    }
 
-    #[test]
-    fn the_engine_vocabulary_types_the_calls_that_matter() {
-        let v = engine();
-        // Every signature in the table parsed.
-        assert_eq!(v.len(), SIGNATURES.len());
-
-        // The families the reverse search leans on, spot-checked end to end.
         assert_eq!(v.arg_kind("PartyHasItem", 0), ArgKind::Resource(ITM_TYPE));
         assert_eq!(v.arg_kind("GiveItemCreate", 0), ArgKind::Resource(ITM_TYPE));
         // `S:Object*` on the item verbs is an item, whatever the name says.
@@ -552,13 +837,164 @@ mod tests {
         assert_eq!(v.arg_kind("MoveGlobal", 0), ArgKind::Resource(ARE_TYPE));
     }
 
+    /// The ids whose overloads actually collide in the install, with the
+    /// reading WeiDU gives them.
+    fn overloaded() -> Vocabulary {
+        from_lines(
+            &[
+                "7 CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)",
+                "7 CreateCreatureEffect(S:NewObject*,S:Effect*,P:Location*,I:Face*DIR)",
+                "8 Dialogue(O:Object*)",
+                "8 Dialog(O:Object*)",
+                "120 StartCutScene(S:CutScene*)",
+                "120 StartCutSceneEx(S:CutScene*,I:evaluateConditions*BOOLEAN)",
+                "227 CreateCreatureObject(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)",
+                "227 CreateCreatureObjectEffect(S:ResRef*,S:Effect*,O:Object*)",
+                "357 ForceRandomEncounter(S:Area*)",
+                "357 ForceRandomEncounterEntry(S:Area*,S:Entry*)",
+            ],
+            &[],
+        )
+    }
+
+    fn action(id: i32, strings: [&str; 2], ints: [i32; 3], objects: usize) -> bcs::Action {
+        let mut action = bcs::Action {
+            id,
+            ints,
+            strings: [strings[0].to_string(), strings[1].to_string()],
+            ..bcs::Action::default()
+        };
+        // Object slot 0 is the ActionOverride actor, so arguments start at 1.
+        for slot in 1..=objects {
+            if let Some(object) = action.objects.get_mut(slot) {
+                object.fields[7] = 1;
+            }
+        }
+        action
+    }
+
+    #[test]
+    fn an_overload_must_account_for_every_string_the_record_holds() {
+        let v = overloaded();
+        // One string stored: the one-string reading, not the two-string one.
+        let one = action(227, ["bdoffscr", ""], [0, 0, 0], 1);
+        assert_eq!(
+            v.action(&one).map(|s| &*s.name),
+            Some("CreateCreatureObject")
+        );
+        // Both stored: only the two-string reading can hold them.
+        let two = action(227, ["bdoffscr", "eff"], [0, 0, 0], 1);
+        assert_eq!(
+            v.action(&two).map(|s| &*s.name),
+            Some("CreateCreatureObjectEffect")
+        );
+    }
+
+    #[test]
+    fn a_spare_integer_parameter_is_taken_but_a_spare_string_is_not() {
+        let v = overloaded();
+        // Same string count, so the extra integer decides nothing and the later
+        // reading wins — as WeiDU prints `StartCutSceneEx("cut212a",FALSE)`.
+        let cut = action(120, ["cut212a", ""], [0, 0, 0], 0);
+        assert_eq!(v.action(&cut).map(|s| &*s.name), Some("StartCutSceneEx"));
+
+        // A stored integer rules out the reading that has nowhere to put it.
+        let created = action(7, ["MINOTAUR", ""], [4, 0, 0], 0);
+        assert_eq!(v.action(&created).map(|s| &*s.name), Some("CreateCreature"));
+    }
+
+    #[test]
+    fn an_empty_record_falls_back_to_the_last_reading() {
+        let v = overloaded();
+        // Nothing is stored, so no reading matches exactly and the record is
+        // padding; WeiDU prints `ForceRandomEncounterEntry("","")`.
+        let empty = action(357, ["", ""], [0, 0, 0], 0);
+        assert_eq!(
+            v.action(&empty).map(|s| &*s.name),
+            Some("ForceRandomEncounterEntry")
+        );
+        // Two names for one call: the later one.
+        let talk = action(8, ["", ""], [0, 0, 0], 1);
+        assert_eq!(v.action(&talk).map(|s| &*s.name), Some("Dialog"));
+    }
+
+    #[test]
+    fn an_unaccountable_slot_leaves_the_call_unnamed() {
+        // BioWare left junk in integer slots no reading declares. Naming the
+        // call would mean dropping it, so nothing is named.
+        let v = from_lines(&["107 RandomFly()"], &[]);
+        assert!(v.action(&action(107, ["", ""], [0, 0, 0], 0)).is_some());
+        assert!(
+            v.action(&action(107, ["", ""], [0, 1598211621, 0], 0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_the_curated_calls_pack_a_scope_into_the_variable_slot() {
+        let v = from_lines(
+            &[],
+            &[
+                "16399 Global(S:Name*,S:Area*,I:Value*)",
+                "16449 GlobalTimerNotExpired(S:Name*,S:Area*)",
+            ],
+        );
+        // Identical signatures, opposite storage: `Global` concatenates into
+        // one slot, the timer keeps two.
+        let packed = bcs::Trigger {
+            id: 16399,
+            strings: ["LOCALSPrep".to_string(), String::new()],
+            ..bcs::Trigger::default()
+        };
+        assert_eq!(v.trigger(&packed).map(|s| &*s.name), Some("Global"));
+
+        let split = bcs::Trigger {
+            id: 16449,
+            strings: ["Iaspell".to_string(), "LOCALS".to_string()],
+            ..bcs::Trigger::default()
+        };
+        assert_eq!(
+            v.trigger(&split).map(|s| &*s.name),
+            Some("GlobalTimerNotExpired")
+        );
+    }
+
+    #[test]
+    fn each_parameter_class_fills_its_own_slots() {
+        // The integer is declared last but occupies the first integer slot.
+        let signature =
+            parse_call(7, "CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)").expect("parses");
+        let slots = signature.slots();
+        assert_eq!(slots.strings, 1);
+        assert_eq!(slots.ints, 1);
+        assert!(slots.point);
+        assert_eq!(slots.objects, 0);
+        assert_eq!(signature.params[2].ids.as_deref(), Some("DIR"));
+    }
+
+    #[test]
+    fn the_runtime_tables_type_the_same_calls_as_the_static_one() {
+        // Reading the IDS must not lose what the transcribed table knew.
+        let v = from_lines(
+            &[
+                "15 GiveItem(S:Object*,O:Target*)",
+                "30 SetGlobal(S:Name*,S:Area*,I:Value*)",
+            ],
+            &[],
+        );
+        assert_eq!(v.arg_kind("GiveItem", 0), ArgKind::Resource(ITM_TYPE));
+        assert_eq!(v.arg_kind("SetGlobal", 0), ArgKind::Variable);
+        assert_eq!(v.arg_kind("SetGlobal", 1), ArgKind::Variable);
+        assert_eq!(v.call_ids(), (2, 0));
+    }
+
     #[test]
     fn malformed_signatures_are_skipped_not_fatal() {
-        assert!(parse_signature("NoParens").is_none());
-        assert!(parse_signature("(S:Foo*)").is_none());
+        assert!(parse_call(0, "NoParens").is_none());
+        assert!(parse_call(0, "(S:Foo*)").is_none());
         // A signature with no parameters is valid and simply types nothing.
         let v = vocab(&["Continue()"]);
         assert_eq!(v.arg_kind("Continue", 0), ArgKind::Unknown);
-        assert_eq!(v.len(), 1);
+        assert_eq!(v.call_ids(), (1, 0));
     }
 }

@@ -1023,7 +1023,7 @@ mod tests {
         let uses = pro.resref_uses();
         let got: Vec<(u16, &str, &str, bool)> = uses
             .iter()
-            .map(|u| (u.kind, u.value, u.path.as_str(), u.soft))
+            .map(|u| (u.kind, u.value.as_ref(), u.path.as_str(), u.soft))
             .collect();
         assert_eq!(
             got,
@@ -1043,7 +1043,7 @@ mod tests {
         let uses = pro.resref_uses();
         let got: Vec<(u16, &str, &str, bool)> = uses
             .iter()
-            .map(|u| (u.kind, u.value, u.path.as_str(), u.soft))
+            .map(|u| (u.kind, u.value.as_ref(), u.path.as_str(), u.soft))
             .collect();
         assert_eq!(
             got,

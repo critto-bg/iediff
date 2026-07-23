@@ -80,9 +80,11 @@ impl From<std::io::Error> for TlkError {
     }
 }
 
-/// One string slot: where its bytes sit within the string section.
-#[derive(Clone, Copy)]
+/// One string slot: where its bytes sit within the string section, and the
+/// sound that plays with it (empty when there is none).
+#[derive(Clone)]
 struct StringEntry {
+    sound: String,
     /// Offset of the string relative to the start of the string section.
     offset: u32,
     length: u32,
@@ -145,11 +147,16 @@ impl TlkFile {
         let mut entries = Vec::with_capacity(count);
         for i in 0..count {
             let base = i * ENTRY_LEN;
-            // Bytes 0-17 (flags, sound resref, volume/pitch variance) are unused
-            // for now; only the string's location matters.
+            // Bytes 0-1 (flags) and 10-17 (volume/pitch variance) are unused;
+            // the sound resref (2-9) and the string's location matter.
+            let sound = reader.resref_at(base + 0x02, "entry sound resref")?;
             let offset = reader.u32_at(base + 0x12, "entry string offset")?;
             let length = reader.u32_at(base + 0x16, "entry string length")?;
-            entries.push(StringEntry { offset, length });
+            entries.push(StringEntry {
+                sound,
+                offset,
+                length,
+            });
         }
 
         Ok(entries)
@@ -161,7 +168,7 @@ impl TlkFile {
         let entry = self
             .entries
             .get(strref as usize)
-            .copied()
+            .cloned()
             .ok_or(TlkError::StrrefOutOfRange(strref))?;
 
         if entry.length == 0 {
@@ -176,5 +183,14 @@ impl TlkFile {
         // Some strings are NUL-terminated within their recorded length, others
         // not; trim at the first NUL. EE stores UTF-8, so decode lossily.
         Ok(parse_asciiz(&buf))
+    }
+
+    /// The sound resref that plays with a strref, if any. Empty for a string
+    /// with no attached sound, or a strref past the table.
+    pub fn sound(&self, strref: u32) -> Option<&str> {
+        self.entries
+            .get(strref as usize)
+            .map(|entry| entry.sound.as_str())
+            .filter(|sound| !sound.is_empty())
     }
 }

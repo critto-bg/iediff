@@ -15,9 +15,11 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::Reader;
 use crate::formats::are::{ARE_TYPE, Are, AreError};
+use crate::formats::bcs::{BCS_TYPE, BcsError, Comments, Script};
 use crate::formats::bif::{BifArchive, BifError};
 use crate::formats::cre::{CRE_TYPE, Cre, CreError, CreNames};
 use crate::formats::dlg::{DLG_TYPE, Dlg, DlgError};
@@ -30,6 +32,7 @@ use crate::formats::spl::{SPL_TYPE, Spl, SplError};
 use crate::formats::sto::{STO_TYPE, Sto, StoError};
 use crate::formats::tlk::{TlkError, TlkFile};
 use crate::formats::twoda::{TWODA_TYPE, TwoDA, TwoDAError};
+use crate::script::{self, Vocabulary};
 
 /// Locale whose `dialog.tlk` strings are resolved against. BG2:EE ships several
 /// under `lang/`; English is the default. (Selectable later.)
@@ -51,6 +54,7 @@ pub enum ResourceError {
     Sto(StoError),
     Are(AreError),
     Dlg(DlgError),
+    Bcs(BcsError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
         name: String,
@@ -76,6 +80,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Sto(e) => write!(f, "{e}"),
             ResourceError::Are(e) => write!(f, "{e}"),
             ResourceError::Dlg(e) => write!(f, "{e}"),
+            ResourceError::Bcs(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
             }
@@ -182,6 +187,12 @@ impl From<AreError> for ResourceError {
 impl From<DlgError> for ResourceError {
     fn from(e: DlgError) -> Self {
         ResourceError::Dlg(e)
+    }
+}
+
+impl From<BcsError> for ResourceError {
+    fn from(e: BcsError) -> Self {
+        ResourceError::Bcs(e)
     }
 }
 
@@ -298,6 +309,7 @@ pub enum Resource {
     Sto(Sto),
     Are(Are),
     Dlg(Dlg),
+    Bcs(Script),
     Other(ResourceInfo),
 }
 
@@ -314,6 +326,7 @@ impl fmt::Display for Resource {
             Resource::Sto(sto) => write!(f, "{sto}"),
             Resource::Are(are) => write!(f, "{are}"),
             Resource::Dlg(dlg) => write!(f, "{dlg}"),
+            Resource::Bcs(script) => write!(f, "{script}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
     }
@@ -333,6 +346,7 @@ impl Resource {
             Resource::Sto(sto) => sto.write_raw(out),
             Resource::Are(are) => are.write_raw(out),
             Resource::Dlg(dlg) => dlg.write_raw(out),
+            Resource::Bcs(script) => script.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => table.write_raw(out),
             Resource::Other(info) => write!(out, "{info}"),
@@ -387,6 +401,9 @@ pub struct ResourceManager {
     twoda_cache: HashMap<String, Option<TwoDA>>,
     /// Cache of parsed IDS tables, keyed by UPPERCASE name.
     ids_cache: HashMap<String, Option<IdsFile>>,
+    /// The script vocabulary, built from ACTION.IDS/TRIGGER.IDS on first use.
+    /// Shared rather than copied: every decoded script points at the same one.
+    vocabulary: Option<Rc<Vocabulary>>,
 }
 
 /// The display names a resource (ITM/SPL) carries, resolved from its header
@@ -427,6 +444,7 @@ impl ResourceManager {
             name_cache: HashMap::new(),
             twoda_cache: HashMap::new(),
             ids_cache: HashMap::new(),
+            vocabulary: None,
         })
     }
 
@@ -556,6 +574,17 @@ impl ResourceManager {
         let resource = match res_type {
             IDS_TYPE => Resource::Ids(IdsFile::parse(data)),
             TWODA_TYPE => Resource::TwoDA(TwoDA::parse(data)?),
+            BCS_TYPE => {
+                let mut script = Script::parse_verified(data)?;
+                if let Some(vocabulary) = self.vocabulary() {
+                    // Resolve the strref texts and resource names the view shows
+                    // after each call, which the writer cannot reach itself.
+                    let comments = self.script_comments(&script, &vocabulary);
+                    script.set_vocabulary(vocabulary);
+                    script.set_comments(comments);
+                }
+                Resource::Bcs(script)
+            }
             EFF_TYPE => {
                 let mut eff = Eff::parse(data)?;
                 // The primary/secondary types index dictionary tables; resolve
@@ -907,6 +936,126 @@ impl ResourceManager {
         self.load_ids(table)?
             .lookup_by_value(value)
             .map(str::to_string)
+    }
+
+    /// The script call vocabulary for this install. Built once from its own
+    /// `ACTION.IDS` / `TRIGGER.IDS`; `None` when either is missing, which
+    /// leaves compiled scripts readable but unnamed.
+    pub(crate) fn vocabulary(&mut self) -> Option<Rc<Vocabulary>> {
+        if self.vocabulary.is_none() {
+            // Each table is parsed into an owned value before the next borrow.
+            let actions = self.load_ids("ACTION").map(script::signatures);
+            let triggers = self.load_ids("TRIGGER").map(script::signatures);
+            if let (Some(actions), Some(triggers)) = (actions, triggers) {
+                let mut vocabulary = script::from_signatures(actions, triggers);
+                // Load only the tables the signatures actually name. A table
+                // the install lacks simply leaves those arguments numeric.
+                for table in vocabulary.symbol_tables() {
+                    if let Some(entries) = self.ids_symbols(&table) {
+                        vocabulary.set_symbols(&table, entries);
+                    }
+                }
+                self.vocabulary = Some(Rc::new(vocabulary));
+            }
+        }
+        self.vocabulary.clone()
+    }
+
+    /// Resolve the end-of-line comments a decompiled script shows: a strref's
+    /// text (and sound) and a named resource's display name. References are
+    /// collected first, then resolved, so the script borrow is released before
+    /// the manager is used.
+    fn script_comments(&mut self, script: &Script, vocabulary: &Vocabulary) -> Comments {
+        let mut strrefs = Vec::new();
+        let mut resources = Vec::new();
+        let mut objects = Vec::new();
+        script.for_each_reference(
+            vocabulary,
+            |value| strrefs.push(value),
+            |kind, resref| resources.push((kind, resref.to_string())),
+            |name| objects.push(name.to_string()),
+        );
+
+        let mut comments = Comments::default();
+        for value in strrefs {
+            comments
+                .strrefs
+                .entry(value)
+                .or_insert_with(|| self.strref_comment(value));
+        }
+        for (kind, resref) in resources {
+            let key = (kind, resref.to_ascii_uppercase());
+            if !comments.resources.contains_key(&key)
+                && let Some(name) = self.resource_name_comment(kind, &resref)
+            {
+                comments.resources.insert(key, name);
+            }
+        }
+        // A death variable doubles as the creature's resref, so its name is the
+        // creature's display name — nothing shown when it names no creature.
+        for death_var in objects {
+            let key = death_var.to_ascii_uppercase();
+            if !comments.objects.contains_key(&key)
+                && let Some(name) = self.resource_names(&death_var, CRE_TYPE).display()
+            {
+                let name = format!("~{name}~");
+                comments.objects.insert(key, name);
+            }
+        }
+        comments
+    }
+
+    /// The comment a strref earns: its `~text~`, with the sound that plays with
+    /// it in brackets. The "no string" sentinel and an out-of-range index both
+    /// read as WeiDU's `<Invalid Strref -1>`.
+    fn strref_comment(&mut self, strref: u32) -> String {
+        const INVALID: &str = "<Invalid Strref -1>";
+        if strref == u32::MAX {
+            return INVALID.to_string();
+        }
+        let Ok(text) = self.string(strref) else {
+            return INVALID.to_string();
+        };
+        let sound = self
+            .dialog()
+            .ok()
+            .and_then(|tlk| tlk.sound(strref).map(str::to_string));
+        match sound {
+            Some(sound) => format!("~{text}~ [{sound}]"),
+            None => format!("~{text}~"),
+        }
+    }
+
+    /// The comment a named resource earns: its `~display name~`. Only items,
+    /// spells and creatures carry a name. A resource that exists but whose name
+    /// strref is invalid reads as `<Invalid Strref -1>`, as in WeiDU; a resref
+    /// that resolves to no file gets no comment at all.
+    fn resource_name_comment(&mut self, kind: u16, resref: &str) -> Option<String> {
+        if !matches!(kind, ITM_TYPE | SPL_TYPE | CRE_TYPE) {
+            return None;
+        }
+        match self.resource_names(resref, kind).display() {
+            Some(name) => Some(format!("~{name}~")),
+            None => self
+                .locate(resref, kind, Source::Auto)
+                .map(|_| "<Invalid Strref -1>".to_string()),
+        }
+    }
+
+    /// A table's value -> symbol mapping, for naming script arguments.
+    ///
+    /// The *last* alias wins where a value repeats, which is the opposite of
+    /// [`IdsFile::lookup_by_value`]. `CLASS.IDS` lists `202 LONG_BOW` before
+    /// `202 MAGE_ALL`, and a script asking about class 202 means the kit, not
+    /// the weapon — the reading the engine's own decompiler gives.
+    fn ids_symbols(&mut self, table: &str) -> Option<HashMap<i64, String>> {
+        let ids = self.load_ids(table)?;
+        let symbols = ids
+            .entries()
+            .iter()
+            .map(|entry| (entry.value, entry.name.clone()))
+            .collect();
+        Some(symbols)
     }
 
     /// Borrow a parsed IDS table by name. Parsed once and cached.

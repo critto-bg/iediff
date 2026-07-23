@@ -847,7 +847,7 @@ mod tests {
 
     fn refs<'a>(uses: &'a [ResrefUse<'a>]) -> Vec<(u16, &'a str, &'a str, bool)> {
         uses.iter()
-            .map(|u| (u.kind, u.value, u.path.as_str(), u.soft))
+            .map(|u| (u.kind, u.value.as_ref(), u.path.as_str(), u.soft))
             .collect()
     }
 

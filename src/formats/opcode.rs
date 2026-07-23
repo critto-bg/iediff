@@ -9,12 +9,13 @@
 //! engine this tool targets.
 
 use crate::formats::are::ARE_TYPE;
+use crate::formats::bcs::BCS_TYPE;
 use crate::formats::cre::CRE_TYPE;
 use crate::formats::eff::EFF_TYPE;
 use crate::formats::itm::ITM_TYPE;
 use crate::formats::spl::SPL_TYPE;
 use crate::formats::twoda::TWODA_TYPE;
-use crate::formats::{BAM_TYPE, BCS_TYPE, BMP_TYPE, MVE_TYPE, VVC_TYPE, WAV_TYPE};
+use crate::formats::{BAM_TYPE, BMP_TYPE, MVE_TYPE, VVC_TYPE, WAV_TYPE};
 
 /// Human name for an effect `opcode`, or `None` if it is outside the range
 /// this engine defines (0–367). Used only to annotate readable output.

@@ -14,6 +14,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::formats::are::ARE_TYPE;
+use crate::formats::bcs::BCS_TYPE;
 use crate::formats::cre::CRE_TYPE;
 use crate::formats::dlg::DLG_TYPE;
 use crate::formats::eff::{EFF_TYPE, FEATURE_SIZE};
@@ -21,6 +22,13 @@ use crate::formats::itm::ITM_TYPE;
 use crate::formats::pro::PRO_TYPE;
 use crate::formats::spl::SPL_TYPE;
 use crate::formats::twoda::TWODA_TYPE;
+
+/// A spell named by the number the fixture script passes to `ForceSpell`, via
+/// the `SPELL.IDS` filename convention (`2001` -> `SPWI001`).
+pub const SPELL_BY_NUMBER: &str = "SPWI001";
+
+/// The strref the fixture script passes to `DisplayString`.
+pub const SCRIPT_STRREF: u32 = 12345;
 
 /// A fixture game tree that deletes itself when dropped.
 pub struct FixtureGame {
@@ -143,6 +151,11 @@ pub fn build() -> FixtureGame {
             res_type: TWODA_TYPE,
             data: twoda(),
         },
+        Entry {
+            name: "AISCRIPT",
+            res_type: BCS_TYPE,
+            data: bcs(),
+        },
     ];
 
     fs::write(data_dir.join("test.bif"), bif(&archived)).expect("write bif");
@@ -156,6 +169,14 @@ pub fn build() -> FixtureGame {
     )
     .expect("write override cre");
     fs::write(override_dir.join("LOOSE.STO"), sto()).expect("write override sto");
+
+    // The script vocabulary: the calls the fixture's DLG and BCS scripts use,
+    // and the one object identifier the DLG names (`Player1`), which the
+    // compiler needs to read that script's `ActionOverride`.
+    fs::write(override_dir.join("ACTION.IDS"), action_ids()).expect("write action.ids");
+    fs::write(override_dir.join("TRIGGER.IDS"), trigger_ids()).expect("write trigger.ids");
+    fs::write(override_dir.join("OBJECT.IDS"), b"21 Player1\n".as_slice())
+        .expect("write object.ids");
 
     FixtureGame { root }
 }
@@ -365,7 +386,7 @@ fn dlg() -> Vec<u8> {
     const STRING_ENTRY_SIZE: usize = 0x08;
 
     let trigger = format!("PartyHasItem(\"{ITM_TARGET}\")");
-    let action = format!("ActionOverride(Player1,GiveItemCreate(\"{ITM_TARGET}\",0,0,0))");
+    let action = format!("ActionOverride(Player1,GiveItemCreate(\"{ITM_TARGET}\",Player1,0,0,0))");
 
     let state_off = 0x34usize;
     let trans_off = state_off + STATE_SIZE;
@@ -406,6 +427,46 @@ fn dlg() -> Vec<u8> {
 fn twoda() -> Vec<u8> {
     format!("2DA V1.0\n*\nCOL1 COL2\n{ITM_TARGET} 1 2\nROW2 {ITM_TARGET} 0\nROW3 {ITM_TARGET}A 0\n")
         .into_bytes()
+}
+
+/// The `ACTION.IDS` the fixture scripts draw on: the item verb the DLG's
+/// `ActionOverride` wraps, plus the calls the BCS witness uses to name a
+/// creature, a script, a spell by number, and a display string.
+fn action_ids() -> Vec<u8> {
+    "200 GiveItemCreate(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)\n\
+     201 CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)\n\
+     202 ChangeAIScript(S:ScriptFile*,I:Level*Scrlev)\n\
+     203 ForceSpell(O:Target*,I:Spell*Spell)\n\
+     204 DisplayString(O:Object*,I:StrRef*)\n"
+        .as_bytes()
+        .to_vec()
+}
+
+/// The `TRIGGER.IDS`: the DLG's state trigger and the BCS witness's item check.
+fn trigger_ids() -> Vec<u8> {
+    "100 PartyHasItem(S:Item*)\n\
+     101 HasItem(S:ResRef*,O:Object*)\n"
+        .as_bytes()
+        .to_vec()
+}
+
+/// A compiled AI script whose calls name resources through every channel the
+/// reverse search reads: an item by a trigger's string, a creature and a script
+/// by an action's string, a spell by number, and a dialog string by strref.
+fn bcs() -> Vec<u8> {
+    // A default (all-zero, unnamed) object, both markers included.
+    let obj = "OB\n0 0 0 0 0 0 0 0 0 0 0 0 \"\"OB";
+    format!(
+        "SC\nCR\nCO\n\
+         TR\n101 0 0 0 0 \"{ITM_TARGET}\" \"\" {obj}\nTR\n\
+         CO\nRS\nRE\n\
+         100AC\n201{obj}\n{obj}\n{obj}\n0 0 0 0 0\"{CRE_TARGET}\" \"\" AC\n\
+         AC\n202{obj}\n{obj}\n{obj}\n0 0 0 0 0\"{BCS_TARGET}\" \"\" AC\n\
+         AC\n203{obj}\n{obj}\n{obj}\n2001 0 0 0 0\"\" \"\" AC\n\
+         AC\n204{obj}\n{obj}\n{obj}\n{SCRIPT_STRREF} 0 0 0 0\"\" \"\" AC\n\
+         RE\nRS\nCR\nSC\n"
+    )
+    .into_bytes()
 }
 
 /// A standalone V2 effect that creates an item.
@@ -514,10 +575,11 @@ mod tests {
     fn fixture_game_opens_and_indexes() {
         let game = build();
         let manager = ResourceManager::open(&game.key_path()).expect("open fixture");
-        assert_eq!(manager.key().resources().len(), 10);
+        assert_eq!(manager.key().resources().len(), 11);
         let stats = manager.override_stats();
         assert!(stats.present);
-        assert_eq!(stats.resources, 2);
+        // SHADOWED.cre, LOOSE.sto, ACTION.ids, TRIGGER.ids, OBJECT.ids.
+        assert_eq!(stats.resources, 5);
         assert_eq!(stats.shadowing, 1, "SHADOWED.CRE shadows the archived copy");
     }
 

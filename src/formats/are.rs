@@ -16,12 +16,13 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::formats::bcs::BCS_TYPE;
 use crate::formats::cre::CRE_TYPE;
 use crate::formats::dlg::DLG_TYPE;
 use crate::formats::fields::{set_bits, set_flags, write_bitfield};
 use crate::formats::itm::ITM_TYPE;
 use crate::formats::pro::PRO_TYPE;
-use crate::formats::{BAM_TYPE, BCS_TYPE, WAV_TYPE, WED_TYPE};
+use crate::formats::{BAM_TYPE, WAV_TYPE, WED_TYPE};
 use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for ARE files.
@@ -1928,7 +1929,7 @@ mod tests {
         let uses = are.resref_uses();
         let got: Vec<(u16, &str, &str)> = uses
             .iter()
-            .map(|u| (u.kind, u.value, u.path.as_str()))
+            .map(|u| (u.kind, u.value.as_ref(), u.path.as_str()))
             .collect();
         assert_eq!(
             got,
