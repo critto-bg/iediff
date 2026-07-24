@@ -19,7 +19,7 @@ use std::io::{self, Write};
 use crate::formats::fields::{set_flags, write_bitfield};
 use crate::formats::spl::SPL_TYPE;
 use crate::formats::{BAM_TYPE, BMP_TYPE, WAV_TYPE};
-use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, join_bytes};
+use crate::{ProjectileUse, Reader, ResrefUse, StrrefUse, Truncated, describe_tag, join_bytes};
 
 /// Resource type code for PRO files.
 pub const PRO_TYPE: u16 = 0x03fd;
@@ -152,6 +152,20 @@ impl Pro {
         }
         uses.retain(|u| !u.value.is_empty());
         uses
+    }
+
+    /// The projectiles this one fires, named by number ([`ProjectileUse`]).
+    ///
+    /// The explosion projectile only. Its *secondary* neighbour is documented
+    /// as `PROJECTL.IDS - 1`, but of the three values that resolve at all in
+    /// the install, `ICEGLYP` fits at no offset and `LIGHTB` at plus one — too
+    /// little to choose a reading, and a wrong one invents references.
+    pub fn projectile_uses(&self) -> Vec<ProjectileUse> {
+        self.area_codes()
+            .and_then(|codes| codes.explosion_projectile_ids())
+            .map(|number| ProjectileUse::new(number, "area.explosion_projectile"))
+            .into_iter()
+            .collect()
     }
 
     /// Resref of the spell cast when the projectile misses (`Default spell`).
@@ -587,6 +601,14 @@ pub struct AreaCodes {
     pub secondary_projectile: u16,
     pub explosion_projectile: u16,
     pub explosion_effect: u8,
+}
+
+impl AreaCodes {
+    /// The `projectl.ids` number the explosion fires at each target: a plain
+    /// table number, unlike an ability's `missile.ids` one. `0` is unset.
+    pub fn explosion_projectile_ids(&self) -> Option<i64> {
+        (self.explosion_projectile > 0).then(|| i64::from(self.explosion_projectile))
+    }
 }
 
 /// The 256-byte area struct: the explosion's extent, sound, secondary/explosion

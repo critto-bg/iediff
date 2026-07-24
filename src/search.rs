@@ -31,7 +31,7 @@ use crate::formats::{
 };
 use crate::resource::{Origin, ResourceManager, Source};
 use crate::script::Vocabulary;
-use crate::{ResrefUse, StrrefUse};
+use crate::{ProjectileUse, ResrefUse, StrrefUse};
 
 /// The decoded binary formats, and so the resources a reverse search reads.
 /// BCS scripts name resources through their calls, so they are scanned too —
@@ -203,6 +203,12 @@ pub fn find_resref(
     // Built once so compiled scripts and DLG script blocks can be typed.
     let vocabulary = manager.vocabulary();
 
+    // A projectile is named by number, so the query becomes table numbers.
+    let projectiles = match kind {
+        PRO_TYPE => manager.projectile_numbers(name),
+        _ => Vec::new(),
+    };
+
     // Snapshot the universe first: these names borrow the index, which the
     // read loop below needs `&mut manager` for.
     let (over, key) = manager.index_entries();
@@ -215,7 +221,14 @@ pub fn find_resref(
             continue;
         };
 
-        let (hard, soft) = match_resrefs(res_type, &bytes, name, kind, vocabulary.as_deref());
+        let (hard, soft) = match_resrefs(
+            res_type,
+            &bytes,
+            name,
+            kind,
+            vocabulary.as_deref(),
+            &projectiles,
+        );
         if !hard.is_empty() {
             hits.push(RefHit {
                 name: res_name.clone(),
@@ -358,6 +371,9 @@ fn soft_text_matches(data: &[u8], target: u32) -> Vec<String> {
 /// Where `data` names `name` as a resource of type `kind`, as matching field
 /// paths split into typed ("hard") and judge-me ("soft").
 ///
+/// `projectiles` holds the `projectl.ids` numbers of the queried `.pro`, empty
+/// for any other kind.
+///
 /// The [`ResrefUse`]s borrow from the parsed resource and die inside each `map`
 /// closure; only the matching paths escape. That is what stops a full-install
 /// scan cloning every resref in the game.
@@ -367,22 +383,47 @@ fn match_resrefs(
     name: &str,
     kind: u16,
     vocabulary: Option<&Vocabulary>,
+    projectiles: &[i64],
 ) -> (Vec<String>, Vec<String>) {
     match res_type {
         EFF_TYPE => Eff::parse(data)
             .map(|r| split_matches(r.resref_uses(), name, kind))
             .unwrap_or_default(),
         ITM_TYPE => Itm::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .map(|r| {
+                split_all(
+                    r.resref_uses(),
+                    r.projectile_uses(),
+                    name,
+                    kind,
+                    projectiles,
+                )
+            })
             .unwrap_or_default(),
         SPL_TYPE => Spl::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .map(|r| {
+                split_all(
+                    r.resref_uses(),
+                    r.projectile_uses(),
+                    name,
+                    kind,
+                    projectiles,
+                )
+            })
             .unwrap_or_default(),
         CRE_TYPE => Cre::parse(data)
             .map(|r| split_matches(r.resref_uses(), name, kind))
             .unwrap_or_default(),
         PRO_TYPE => Pro::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .map(|r| {
+                split_all(
+                    r.resref_uses(),
+                    r.projectile_uses(),
+                    name,
+                    kind,
+                    projectiles,
+                )
+            })
             .unwrap_or_default(),
         STO_TYPE => Sto::parse(data)
             .map(|r| split_matches(r.resref_uses(), name, kind))
@@ -432,6 +473,26 @@ fn split_matches(uses: Vec<ResrefUse<'_>>, name: &str, kind: u16) -> (Vec<String
         }
         if u.soft { &mut soft } else { &mut hard }.push(u.path);
     }
+    (hard, soft)
+}
+
+/// [`split_matches`] for a format that also names projectiles by number. Those
+/// are hard matches too: a `projectl.ids` number identifies a `.pro` as exactly
+/// as a resref would.
+fn split_all(
+    uses: Vec<ResrefUse<'_>>,
+    projectiles: Vec<ProjectileUse>,
+    name: &str,
+    kind: u16,
+    numbers: &[i64],
+) -> (Vec<String>, Vec<String>) {
+    let (mut hard, soft) = split_matches(uses, name, kind);
+    hard.extend(
+        projectiles
+            .into_iter()
+            .filter(|u| numbers.contains(&u.number))
+            .map(|u| u.path),
+    );
     (hard, soft)
 }
 
@@ -619,6 +680,32 @@ mod tests {
 
     fn fixture_manager(game: &fixture::FixtureGame) -> ResourceManager {
         ResourceManager::open(&game.key_path()).expect("open fixture game")
+    }
+
+    #[test]
+    fn a_projectile_is_found_through_the_number_that_names_it() {
+        // The table ties the two together, and gives PRO_TARGET two numbers.
+        let game = fixture::build();
+        let mut m = fixture_manager(&game);
+        assert_eq!(
+            m.projectile_numbers(fixture::PRO_TARGET),
+            vec![
+                i64::from(fixture::PROJECTILE_NUMBER),
+                i64::from(fixture::PROJECTILE_NUMBER) + 40
+            ]
+        );
+
+        let found = find_resref(&mut m, fixture::PRO_TARGET, PRO_TYPE, Source::Auto, None);
+        let hit = found
+            .iter()
+            .find(|h| h.name == "MAGIC")
+            .expect("the spell fires this projectile");
+        assert!(!hit.soft, "a table number identifies the file exactly");
+        assert_eq!(hit.fields, vec!["ability[0].projectile"]);
+
+        // A projectile the table does not name is not reachable at all.
+        let none = find_resref(&mut m, "NOSUCHPR", PRO_TYPE, Source::Auto, None);
+        assert!(none.iter().all(|h| h.name != "MAGIC"));
     }
 
     #[test]
@@ -916,6 +1003,13 @@ mod tests {
             ARE_TYPE,
             fixture::ARE_TARGET,
             "casting[10].op186.resource",
+        ),
+        // Named by projectl.ids number, not by resref.
+        (
+            "MAGIC",
+            PRO_TYPE,
+            fixture::PRO_TARGET,
+            "ability[0].projectile",
         ),
         // ARE header and sections.
         ("MAP", WED_TYPE, fixture::WED_TARGET, "wed"),

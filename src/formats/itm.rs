@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use crate::formats::eff::Feature;
 use crate::formats::fields::{set_bits, set_flags, write_bitfield, write_school};
 use crate::formats::{BAM_TYPE, item_category_name};
-use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::{ProjectileUse, Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for ITM files.
 pub const ITM_TYPE: u16 = 0x03ed;
@@ -151,6 +151,20 @@ impl Itm {
             }
         }
         uses
+    }
+
+    /// The projectiles the abilities fire, named by number ([`ProjectileUse`]).
+    pub fn projectile_uses(&self) -> Vec<ProjectileUse> {
+        self.ext_headers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ext)| {
+                Some(ProjectileUse::new(
+                    ext.projectile_ids()?,
+                    format!("ability[{i}].projectile"),
+                ))
+            })
+            .collect()
     }
 
     /// Attach the display names resolved from the header strrefs.
@@ -461,6 +475,12 @@ impl ExtHeader {
     /// The secondary type, an index into MSECTYPE.2DA.
     pub fn secondary_type(&self) -> u32 {
         self.secondary_type as u32
+    }
+
+    /// The `projectl.ids` number this ability fires. The field holds a
+    /// `missile.ids` number, one more than that; `1` is its `None`.
+    pub fn projectile_ids(&self) -> Option<i64> {
+        (self.projectile_animation > 1).then(|| i64::from(self.projectile_animation) - 1)
     }
 
     /// Attach the symbolic names resolved for the primary/secondary types.

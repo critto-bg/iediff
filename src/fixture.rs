@@ -30,6 +30,10 @@ pub const SPELL_BY_NUMBER: &str = "SPWI001";
 /// The strref the fixture script passes to `DisplayString`.
 pub const SCRIPT_STRREF: u32 = 12345;
 
+/// The `projectl.ids` number the fixture gives [`PRO_TARGET`], which is the
+/// only way a spell or item can name it.
+pub const PROJECTILE_NUMBER: u16 = 7;
+
 // What every reference in the fixture points at. Distinct per type, so an
 // assertion can never be satisfied by the wrong kind.
 pub const ITM_TARGET: &str = "SW1H01";
@@ -105,7 +109,7 @@ struct Entry {
 /// | `DECOY.itm`    | bif            | names nothing — the negative control   |
 /// | `SHADOWED.cre` | bif + override | 1 item archived, 2 in the override     |
 /// | `ARCHIVED.cre` | bif only       | portraits, scripts, dialog, spell, item |
-/// | `MAGIC.spl`    | bif            | one effect per resource-bearing opcode |
+/// | `MAGIC.spl`    | bif            | one effect per opcode, plus a projectile |
 /// | `MAP.are`      | bif            | tilemap, neighbour, actors, doors, …   |
 /// | `BOLT.pro`     | bif            | sounds, animations, palette, spell     |
 /// | `TALK.dlg`     | bif            | a DLG handoff, plus a trigger and action |
@@ -197,6 +201,18 @@ pub fn build() -> FixtureGame {
     fs::write(override_dir.join("OBJECT.IDS"), b"21 Player1\n".as_slice())
         .expect("write object.ids");
 
+    // The only thing naming the .pro a spell fires. Two numbers for the one
+    // file, as the real table has.
+    fs::write(
+        override_dir.join("PROJECTL.IDS"),
+        format!(
+            "{PROJECTILE_NUMBER} {PRO_TARGET}\n{} {PRO_TARGET}\n",
+            PROJECTILE_NUMBER + 40
+        )
+        .into_bytes(),
+    )
+    .expect("write projectl.ids");
+
     FixtureGame { root }
 }
 
@@ -263,8 +279,10 @@ fn cre(items: &[&str]) -> Vec<u8> {
     d
 }
 
-/// An SPL with a completion sound and the casting-effect pool ([`SPELL_EFFECTS`]).
+/// An SPL with a completion sound, the casting-effect pool ([`SPELL_EFFECTS`]),
+/// and one ability firing the projectile by number.
 fn spl() -> Vec<u8> {
+    const EXT_HEADER_SIZE: usize = 40;
     let mut d = vec![0u8; 0x9a];
     d[0x00..0x04].copy_from_slice(b"SPL ");
     d[0x04..0x08].copy_from_slice(b"V1  ");
@@ -278,9 +296,13 @@ fn spl() -> Vec<u8> {
         put_resref(&mut d, base + 0x14, resource);
     }
 
-    let end = d.len() as u32;
-    put_u32(&mut d, 0x64, end); // ext header offset (none follow)
-    put_u16(&mut d, 0x68, 0); // ext header count
+    // One ability, its projectile stored one past the projectl.ids number.
+    let ext_off = d.len();
+    d.resize(ext_off + EXT_HEADER_SIZE, 0);
+    put_u16(&mut d, ext_off + 0x26, PROJECTILE_NUMBER + 1);
+
+    put_u32(&mut d, 0x64, ext_off as u32); // ext header offset
+    put_u16(&mut d, 0x68, 1); // ext header count
     put_u32(&mut d, 0x6a, pool_off as u32); // feature pool
     put_u16(&mut d, 0x6e, 0); // casting index
     put_u16(&mut d, 0x70, SPELL_EFFECTS.len() as u16);
@@ -590,8 +612,8 @@ mod tests {
         assert_eq!(manager.key().resources().len(), 11);
         let stats = manager.override_stats();
         assert!(stats.present);
-        // SHADOWED.cre, LOOSE.sto, ACTION.ids, TRIGGER.ids, OBJECT.ids.
-        assert_eq!(stats.resources, 5);
+        // SHADOWED.cre, LOOSE.sto, and the four IDS tables.
+        assert_eq!(stats.resources, 6);
         assert_eq!(stats.shadowing, 1, "SHADOWED.CRE shadows the archived copy");
     }
 

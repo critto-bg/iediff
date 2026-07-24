@@ -214,6 +214,21 @@ impl ResourceManager {
         self.vocabulary.clone()
     }
 
+    /// The `projectl.ids` numbers naming this projectile, for a reverse search:
+    /// items and spells fire one by number, never by resref. Often several, as
+    /// the table gives one file more than one number.
+    pub(crate) fn projectile_numbers(&mut self, resref: &str) -> Vec<i64> {
+        self.load_ids("PROJECTL")
+            .map(|ids| {
+                ids.entries()
+                    .iter()
+                    .filter(|e| e.name.eq_ignore_ascii_case(resref))
+                    .map(|e| e.value)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Resolve a resource to a concrete location: an override file when one
     /// exists (and `source` permits it), otherwise the BIF the KEY points at.
     fn locate(&self, name: &str, res_type: u16, source: Source) -> Option<Located> {
@@ -310,16 +325,14 @@ impl ResourceManager {
                 let id = self.string_label(id);
                 spl.set_descriptions(unid, id);
 
-                // Each header's projectile indexes projectl.ids, off by one
-                // (binary N → ids N-1) in BG2.
-                let projectiles: Vec<u16> = spl
+                let projectiles: Vec<Option<i64>> = spl
                     .ext_headers()
                     .iter()
-                    .map(|ext| ext.projectile())
+                    .map(|ext| ext.projectile_ids())
                     .collect();
                 let names: Vec<Option<String>> = projectiles
                     .into_iter()
-                    .map(|projectile| self.ids_label("PROJECTL", projectile as i64 - 1))
+                    .map(|projectile| self.ids_label("PROJECTL", projectile?))
                     .collect();
                 for (ext, name) in spl.ext_headers_mut().iter_mut().zip(names) {
                     ext.set_projectile_name(name);
@@ -407,7 +420,9 @@ impl ResourceManager {
                     let fragment = self.ids_label("ANIMATE", codes.fragment_animation as i64);
                     let secondary =
                         self.ids_label("PROJECTL", codes.secondary_projectile as i64 - 1);
-                    let explosion = self.ids_label("PROJECTL", codes.explosion_projectile as i64);
+                    let explosion = codes
+                        .explosion_projectile_ids()
+                        .and_then(|n| self.ids_label("PROJECTL", n));
                     let effect = self.ids_label("FIREBALL", codes.explosion_effect as i64);
                     pro.set_area_names(fragment, secondary, explosion, effect);
                 }

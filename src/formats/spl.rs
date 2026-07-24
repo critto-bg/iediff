@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use crate::formats::eff::Feature;
 use crate::formats::fields::{set_flags, write_bitfield};
 use crate::formats::{BAM_TYPE, WAV_TYPE};
-use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::{ProjectileUse, Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for SPL files.
 pub const SPL_TYPE: u16 = 0x03ee;
@@ -163,6 +163,20 @@ impl Spl {
             }
         }
         uses
+    }
+
+    /// The projectiles the abilities fire, named by number ([`ProjectileUse`]).
+    pub fn projectile_uses(&self) -> Vec<ProjectileUse> {
+        self.ext_headers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ext)| {
+                Some(ProjectileUse::new(
+                    ext.projectile_ids()?,
+                    format!("ability[{i}].projectile"),
+                ))
+            })
+            .collect()
     }
 
     /// The primary type (school), an index into MSCHOOL.2DA.
@@ -456,9 +470,10 @@ impl SplExtHeader {
         })
     }
 
-    /// The projectile number, for the manager to resolve against `projectl.ids`.
-    pub fn projectile(&self) -> u16 {
-        self.projectile
+    /// The `projectl.ids` number this ability fires. The field holds a
+    /// `missile.ids` number, one more than that; `1` is its `None`.
+    pub fn projectile_ids(&self) -> Option<i64> {
+        (self.projectile > 1).then(|| i64::from(self.projectile) - 1)
     }
 
     /// Attach the projectile name resolved from `projectl.ids`.

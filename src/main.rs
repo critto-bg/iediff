@@ -78,8 +78,9 @@ for typed references, so it can find these as targets:
 Effect opcodes are covered in full: every resource an effect names is resolved to
 its type. BCS scripts and a DLG's trigger/action scripts are compiled and their
 calls' arguments typed, so a script naming an item, spell (by number too),
-creature, store or strref is a hard hit. 2DA/IDS tables are scanned as text and reported
-separately as candidates.
+creature, store or strref is a hard hit. A .pro is named by projectl.ids number
+rather than by resref, and resolved through that table. 2DA/IDS tables are
+scanned as text and reported separately as candidates.
 
 Reads ./chitin.key if present (run from a game root), else game/chitin.key.
 ";
@@ -246,6 +247,23 @@ impl<'a> ResrefUse<'a> {
         ResrefUse {
             path: format!("{prefix}.{}", self.path),
             ..self
+        }
+    }
+}
+
+/// One place a resource names a projectile by *number* rather than by resref:
+/// a `projectl.ids` entry and the field it came from. Resolving it needs the
+/// install's own table, so that is left to the caller that has one.
+pub struct ProjectileUse {
+    pub number: i64,
+    pub path: String,
+}
+
+impl ProjectileUse {
+    pub fn new(number: i64, path: impl Into<String>) -> ProjectileUse {
+        ProjectileUse {
+            number,
+            path: path.into(),
         }
     }
 }
