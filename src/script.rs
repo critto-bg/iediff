@@ -645,7 +645,7 @@ fn is_variable_name(param: &str) -> bool {
 /// What a parameter name conventionally holds. Only searchable types are
 /// listed; the rest stay [`Unknown`](ArgKind::Unknown).
 fn param_kind(param: &str) -> ArgKind {
-    const TABLE: [(&str, u16); 15] = [
+    const TABLE: [(&str, u16); 16] = [
         ("item", ITM_TYPE),
         ("itemname", ITM_TYPE),
         ("olditem", ITM_TYPE),
@@ -659,6 +659,7 @@ fn param_kind(param: &str) -> ArgKind {
         ("sound", WAV_TYPE),
         ("script", BCS_TYPE),
         ("scriptfile", BCS_TYPE),
+        ("cutscene", BCS_TYPE), // StartCutScene(Ex) — a cutscene is a script
         ("palette", BMP_TYPE),
         ("area", ARE_TYPE),
     ];
@@ -816,6 +817,9 @@ mod tests {
             "G(S:ResRef*,I:Num*)",
             "Dead(S:Name*)",
             "MoveGlobal(S:Area*,O:Object*,P:Point*)",
+            "ChangeAIScript(S:ScriptFile*,I:Type*SCRPLEV)",
+            "StartCutScene(S:CutScene*)",
+            "StartCutSceneEx(S:CutScene*,I:evaluateConditions*BOOLEAN)",
         ]);
 
         assert_eq!(v.arg_kind("PartyHasItem", 0), ArgKind::Resource(ITM_TYPE));
@@ -827,6 +831,13 @@ mod tests {
         assert_eq!(v.arg_kind("ApplySpellRES", 0), ArgKind::Resource(SPL_TYPE));
         // A parameter name that is honest for once.
         assert_eq!(v.arg_kind("StartDialogue", 0), ArgKind::Resource(DLG_TYPE));
+        // A cutscene is a script, whichever name the parameter goes by.
+        assert_eq!(v.arg_kind("ChangeAIScript", 0), ArgKind::Resource(BCS_TYPE));
+        assert_eq!(v.arg_kind("StartCutScene", 0), ArgKind::Resource(BCS_TYPE));
+        assert_eq!(
+            v.arg_kind("StartCutSceneEx", 0),
+            ArgKind::Resource(BCS_TYPE)
+        );
 
         // The variable families, which must never answer a resource search.
         assert_eq!(v.arg_kind("SetGlobal", 0), ArgKind::Variable);
