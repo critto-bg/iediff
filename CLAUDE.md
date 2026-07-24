@@ -135,14 +135,20 @@ first three are needed to find and name anything.
 
 BCS is a compiled script (an ASCII token stream); BAF is its textual form. The
 codec was verified against the install's own scripts and WeiDU (the community
-compiler used as an oracle), by three round-trip metrics:
+compiler used as an oracle), by three round-trip metrics.
 
-- **M1** — `encode(parse(bcs)) == bcs`, byte for byte. Holds for all ~5,200
-  scripts in the install.
+Counts are per *stored copy*, not per name: a script the override layer shadows
+is two different byte sequences, and both must round-trip. The local install
+holds 5535 — a total mods change, so it is the last sweep's denominator, not a
+constant.
+
+- **M1** — `encode(parse(bcs)) == bcs`, byte for byte. Holds for all 5535.
 - **M2** — our decompiled BAF matches WeiDU's, call for call (~99.4%); the rest
   is WeiDU sugar we render equivalently.
 - **M3** — `compile(decompile(bcs)) == bcs` through the full BAF compiler. Holds
-  for 5219/5232.
+  for 5522/5535, both from the comment-free BAF and from the commented text the
+  CLI prints — the two must agree, since a comment that escapes its line turns
+  into code (see [`one_line`](src/formats/bcs.rs)).
 
 Exceptions that are **normal, not bugs**:
 
