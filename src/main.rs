@@ -74,11 +74,11 @@ Other resource types are located and summarised (type, size) but not parsed.
 
 --uses searches the decoded binary formats (eff itm spl cre pro sto are dlg bcs)
 for typed references, so it can find these as targets:
-  itm spl cre dlg are pro eff bcs 2da bam vvc wav wed bmp mve
+  itm spl cre dlg are pro eff bcs sto 2da bam vvc wav wed bmp mve mos wmp
 Effect opcodes are covered in full: every resource an effect names is resolved to
 its type. BCS scripts and a DLG's trigger/action scripts are compiled and their
 calls' arguments typed, so a script naming an item, spell (by number too),
-creature or strref is a hard hit. 2DA/IDS tables are scanned as text and reported
+creature, store or strref is a hard hit. 2DA/IDS tables are scanned as text and reported
 separately as candidates.
 
 Reads ./chitin.key if present (run from a game root), else game/chitin.key.

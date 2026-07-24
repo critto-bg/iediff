@@ -31,6 +31,8 @@ pub const BMP_TYPE: u16 = 0x0001;
 pub const MVE_TYPE: u16 = 0x0002;
 pub const BAM_TYPE: u16 = 0x03e8;
 pub const WED_TYPE: u16 = 0x03e9;
+pub const MOS_TYPE: u16 = 0x03ec;
+pub const WMP_TYPE: u16 = 0x03f7;
 pub const VVC_TYPE: u16 = 0x03fb;
 
 /// Name an item category code, as used in the `item type` field of an

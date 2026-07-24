@@ -29,7 +29,9 @@ use crate::formats::dlg::DLG_TYPE;
 use crate::formats::eff::EFF_TYPE;
 use crate::formats::itm::ITM_TYPE;
 use crate::formats::spl::SPL_TYPE;
-use crate::formats::{BMP_TYPE, WAV_TYPE};
+use crate::formats::sto::STO_TYPE;
+use crate::formats::twoda::TWODA_TYPE;
+use crate::formats::{BMP_TYPE, MOS_TYPE, WAV_TYPE, WMP_TYPE};
 
 /// The `IDS` tables behind an object's seven enumerated attributes, in the
 /// order the fields are stored.
@@ -540,7 +542,7 @@ fn arg_kinds(signature: &Signature) -> Vec<ArgKind> {
             if is_variable_name(&param.name) {
                 return ArgKind::Variable;
             }
-            if param.name.eq_ignore_ascii_case("area") && scoped {
+            if is_scope_name(&param.name) && scoped {
                 return ArgKind::Variable;
             }
             param_kind(&param.name)
@@ -643,9 +645,12 @@ fn is_variable_name(param: &str) -> bool {
 }
 
 /// What a parameter name conventionally holds. Only searchable types are
-/// listed; the rest stay [`Unknown`](ArgKind::Unknown).
+/// listed; the rest stay [`Unknown`](ArgKind::Unknown). Two string parameters
+/// that look like resrefs are deliberately absent: `MoveToCampaign`'s takes a
+/// row label from `campaign.2da`, and `HasDLC`'s a store product, neither of
+/// which is a resource.
 fn param_kind(param: &str) -> ArgKind {
-    const TABLE: [(&str, u16); 16] = [
+    const TABLE: [(&str, u16); 23] = [
         ("item", ITM_TYPE),
         ("itemname", ITM_TYPE),
         ("olditem", ITM_TYPE),
@@ -662,6 +667,15 @@ fn param_kind(param: &str) -> ArgKind {
         ("cutscene", BCS_TYPE), // StartCutScene(Ex) — a cutscene is a script
         ("palette", BMP_TYPE),
         ("area", ARE_TYPE),
+        // The travel actions name an area at each end; `Areaname` is the
+        // deathmatch spelling of the same thing.
+        ("fromarea", ARE_TYPE),
+        ("toarea", ARE_TYPE),
+        ("areaname", ARE_TYPE),
+        ("store", STO_TYPE),
+        ("parchment", MOS_TYPE),  // the area-transition loading screen
+        ("textlist", TWODA_TYPE), // TextScreen's text-and-graphics table
+        ("worldmap", WMP_TYPE),
     ];
     TABLE
         .iter()

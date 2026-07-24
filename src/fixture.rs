@@ -47,6 +47,9 @@ pub const WAV_TARGET: &str = "SOUND1";
 pub const WED_TARGET: &str = "TILEMAP1";
 pub const BMP_TARGET: &str = "PORTRAIT";
 pub const MVE_TARGET: &str = "MOVIE1";
+pub const STO_TARGET: &str = "SHOP1";
+pub const MOS_TARGET: &str = "LOADSCR1";
+pub const WMP_TARGET: &str = "WORLD1";
 
 /// One casting effect per resource-bearing opcode family, so a single spell
 /// witnesses most of the opcode table.
@@ -431,13 +434,17 @@ fn twoda() -> Vec<u8> {
 
 /// The `ACTION.IDS` the fixture scripts draw on: the item verb the DLG's
 /// `ActionOverride` wraps, plus the calls the BCS witness uses to name a
-/// creature, a script, a spell by number, and a display string.
+/// creature, a script, a spell by number, a display string, and the three types
+/// only a script ever names — a store, a loading screen, a worldmap.
 fn action_ids() -> Vec<u8> {
     "200 GiveItemCreate(S:ResRef*,O:Object*,I:Usage1*,I:Usage2*,I:Usage3*)\n\
      201 CreateCreature(S:NewObject*,P:Location*,I:Face*DIR)\n\
      202 ChangeAIScript(S:ScriptFile*,I:Level*Scrlev)\n\
      203 ForceSpell(O:Target*,I:Spell*Spell)\n\
-     204 DisplayString(O:Object*,I:StrRef*)\n"
+     204 DisplayString(O:Object*,I:StrRef*)\n\
+     205 StartStore(S:Store*,O:Target*)\n\
+     206 LeaveAreaLUA(S:Area*,S:Parchment*,P:Point*,I:Face*DIR)\n\
+     207 SetWorldmap(S:Worldmap*)\n"
         .as_bytes()
         .to_vec()
 }
@@ -453,6 +460,8 @@ fn trigger_ids() -> Vec<u8> {
 /// A compiled AI script whose calls name resources through every channel the
 /// reverse search reads: an item by a trigger's string, a creature and a script
 /// by an action's string, a spell by number, and a dialog string by strref.
+/// `LeaveAreaLUA` fills both its string slots, so a parchment misread as an area
+/// (or the reverse) fails rather than passing on a lucky alignment.
 fn bcs() -> Vec<u8> {
     // A default (all-zero, unnamed) object, both markers included.
     let obj = "OB\n0 0 0 0 0 0 0 0 0 0 0 0 \"\"OB";
@@ -464,6 +473,9 @@ fn bcs() -> Vec<u8> {
          AC\n202{obj}\n{obj}\n{obj}\n0 0 0 0 0\"{BCS_TARGET}\" \"\" AC\n\
          AC\n203{obj}\n{obj}\n{obj}\n2001 0 0 0 0\"\" \"\" AC\n\
          AC\n204{obj}\n{obj}\n{obj}\n{SCRIPT_STRREF} 0 0 0 0\"\" \"\" AC\n\
+         AC\n205{obj}\n{obj}\n{obj}\n0 0 0 0 0\"{STO_TARGET}\" \"\" AC\n\
+         AC\n206{obj}\n{obj}\n{obj}\n0 0 0 0 0\"{ARE_TARGET}\" \"{MOS_TARGET}\" AC\n\
+         AC\n207{obj}\n{obj}\n{obj}\n0 0 0 0 0\"{WMP_TARGET}\" \"\" AC\n\
          RE\nRS\nCR\nSC\n"
     )
     .into_bytes()

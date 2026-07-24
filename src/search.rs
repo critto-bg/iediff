@@ -26,7 +26,9 @@ use crate::formats::pro::{PRO_TYPE, Pro};
 use crate::formats::spl::{SPL_TYPE, Spl};
 use crate::formats::sto::{STO_TYPE, Sto};
 use crate::formats::twoda::TWODA_TYPE;
-use crate::formats::{BAM_TYPE, BMP_TYPE, MVE_TYPE, VVC_TYPE, WAV_TYPE, WED_TYPE};
+use crate::formats::{
+    BAM_TYPE, BMP_TYPE, MOS_TYPE, MVE_TYPE, VVC_TYPE, WAV_TYPE, WED_TYPE, WMP_TYPE,
+};
 use crate::resource::{Origin, ResourceManager, Source};
 use crate::script::Vocabulary;
 use crate::{ResrefUse, StrrefUse};
@@ -43,14 +45,14 @@ const SCANNED_TYPES: [u16; 9] = [
 ///
 /// This is the *target* axis, independent of which formats are scanned as
 /// referrers ([`SCANNED_TYPES`]): BCS is here because CRE and ARE name scripts,
-/// though we never parse one; STO is the mirror image. Absent are the types
-/// nothing we decode names — TIS, IDS, STO, MOS, CHU.
+/// though we never parse one, and MOS and WMP only because scripts name them.
+/// Absent are the types nothing we decode names — TIS, IDS, CHU.
 ///
 /// The formats' `resref_uses` are the source of truth; the tests keep this list
 /// and the usage guide in step with them.
-pub const REFERENCEABLE_KINDS: [u16; 15] = [
-    ITM_TYPE, SPL_TYPE, CRE_TYPE, DLG_TYPE, ARE_TYPE, PRO_TYPE, EFF_TYPE, BCS_TYPE, TWODA_TYPE,
-    BAM_TYPE, VVC_TYPE, WAV_TYPE, WED_TYPE, BMP_TYPE, MVE_TYPE,
+pub const REFERENCEABLE_KINDS: [u16; 18] = [
+    ITM_TYPE, SPL_TYPE, CRE_TYPE, DLG_TYPE, ARE_TYPE, PRO_TYPE, EFF_TYPE, BCS_TYPE, STO_TYPE,
+    TWODA_TYPE, BAM_TYPE, VVC_TYPE, WAV_TYPE, WED_TYPE, BMP_TYPE, MVE_TYPE, MOS_TYPE, WMP_TYPE,
 ];
 
 /// Text formats with no typed fields, scanned only heuristically. DLG is soft-
@@ -981,6 +983,31 @@ mod tests {
             SPL_TYPE,
             fixture::SPELL_BY_NUMBER,
             "block[0].ForceSpell.Spell",
+        ),
+        // The three types nothing but a script names.
+        (
+            "AISCRIPT",
+            STO_TYPE,
+            fixture::STO_TARGET,
+            "block[0].StartStore.Store",
+        ),
+        (
+            "AISCRIPT",
+            ARE_TYPE,
+            fixture::ARE_TARGET,
+            "block[0].LeaveAreaLUA.Area",
+        ),
+        (
+            "AISCRIPT",
+            MOS_TYPE,
+            fixture::MOS_TARGET,
+            "block[0].LeaveAreaLUA.Parchment",
+        ),
+        (
+            "AISCRIPT",
+            WMP_TYPE,
+            fixture::WMP_TARGET,
+            "block[0].SetWorldmap.Worldmap",
         ),
     ];
 
