@@ -240,6 +240,34 @@ pub fn opcode_resource_slots(opcode: u32) -> &'static [ResourceRef] {
     }
 }
 
+/// The `projectl.ids` number an effect's parameters name, if its opcode names a
+/// projectile at all. Each of these reads the table differently, so the rule
+/// lives with the opcode rather than with the field.
+///
+/// Excluded is #141 (Lighting Effects), whose `Type` also selects a projectile:
+/// IESDP records that those "ignore their entry in `PROJECTL.IDS`" — the engine
+/// holds them internally and a `.pro` of that number is never read, so naming
+/// one would report a reference the game does not make.
+pub fn opcode_projectile(opcode: u32, param1: u32, param2: u32) -> Option<i64> {
+    match opcode {
+        // #83 Protection: From Projectile, #197 Spell: Bounce (by Impact
+        // Projectile): a plain table number, where 0 is the engine's `None`.
+        83 | 197 => (param2 > 0).then(|| i64::from(param2)),
+        // #140 Graphics: Casting Glow. `Type` 0 takes Parameter #1, counted as a
+        // spell header counts it; 9..=16 are the school glows at 110..=117;
+        // 1..=8 crash the engine.
+        140 => match param2 {
+            0 => (param1 > 1).then(|| i64::from(param1) - 1),
+            9..=16 => Some(101 + i64::from(param2)),
+            _ => None,
+        },
+        // #327 Graphics: Icewind Visual Spell Hit, biased by 4096 — which is
+        // why it cannot name the first 4096 projectiles at all.
+        327 => param2.checked_sub(4096).map(i64::from),
+        _ => None,
+    }
+}
+
 /// Opcode → name, indexed directly by opcode number. Bulk data appendix; the
 /// module's logic is above.
 static OPCODE_NAMES: [&str; 368] = [
@@ -635,6 +663,32 @@ mod tests {
         // ordinary numeric opcodes carry no strref.
         for op in [0, 1, 13, 68, 367, 999] {
             assert!(opcode_strref_slots(op).is_empty(), "opcode {op}");
+        }
+    }
+
+    #[test]
+    fn projectile_parameters_follow_each_opcode_s_own_rule() {
+        // #83/#197 read a plain table number out of Parameter #2; 0 is `None`.
+        assert_eq!(opcode_projectile(83, 0, 4), Some(4));
+        assert_eq!(opcode_projectile(197, 0, 205), Some(205));
+        assert_eq!(opcode_projectile(83, 9, 0), None);
+
+        // #140 takes Parameter #1 counted as a spell header counts it, but only
+        // when the type is 0; 9..=16 are the fixed school glows, 1..=8 crash.
+        assert_eq!(opcode_projectile(140, 322, 0), Some(321));
+        assert_eq!(opcode_projectile(140, 1, 0), None);
+        assert_eq!(opcode_projectile(140, 0, 11), Some(112));
+        assert_eq!(opcode_projectile(140, 0, 16), Some(117));
+        assert_eq!(opcode_projectile(140, 322, 5), None);
+
+        // #327 is biased by 4096, so it cannot name anything below that.
+        assert_eq!(opcode_projectile(327, 0, 4096 + 118), Some(118));
+        assert_eq!(opcode_projectile(327, 0, 4095), None);
+
+        // #141 selects a projectile the engine holds internally, and every
+        // other opcode names none at all.
+        for op in [0, 12, 141, 367] {
+            assert_eq!(opcode_projectile(op, 7, 7), None, "opcode {op}");
         }
     }
 

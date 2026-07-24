@@ -20,7 +20,7 @@ use crate::formats::eff::{EFF_V2_BODY_SIZE, Eff, FEATURE_SIZE, Feature};
 use crate::formats::fields::set_bits;
 use crate::formats::itm::ITM_TYPE;
 use crate::formats::spl::SPL_TYPE;
-use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::{ProjectileUse, Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for CRE files.
 pub const CRE_TYPE: u16 = 0x03f1;
@@ -320,6 +320,21 @@ impl Cre {
             let inner = match effect {
                 CreEffect::V1(feat) => feat.resref_uses(),
                 CreEffect::V2(eff) => eff.resref_uses(),
+            };
+            let at = format!("effect[{i}]");
+            uses.extend(inner.into_iter().map(|u| u.prefixed(&at)));
+        }
+        uses
+    }
+
+    /// The projectiles this creature's effects name by number
+    /// ([`ProjectileUse`]) — a permanent protection from one, typically.
+    pub fn projectile_uses(&self) -> Vec<ProjectileUse> {
+        let mut uses = Vec::new();
+        for (i, effect) in self.effects.iter().enumerate() {
+            let inner = match effect {
+                CreEffect::V1(feat) => feat.projectile_uses(),
+                CreEffect::V2(eff) => eff.projectile_uses(),
             };
             let at = format!("effect[{i}]");
             uses.extend(inner.into_iter().map(|u| u.prefixed(&at)));

@@ -296,6 +296,13 @@ fn spl() -> Vec<u8> {
         put_resref(&mut d, base + 0x14, resource);
     }
 
+    // One more effect, protecting from a projectile: opcode #83 names it by
+    // table number in Parameter #2, with no resref anywhere.
+    let guard_off = d.len();
+    d.resize(guard_off + FEATURE_SIZE, 0);
+    put_u16(&mut d, guard_off, 83);
+    put_u32(&mut d, guard_off + 0x08, u32::from(PROJECTILE_NUMBER));
+
     // One ability, its projectile stored one past the projectl.ids number.
     let ext_off = d.len();
     d.resize(ext_off + EXT_HEADER_SIZE, 0);
@@ -305,7 +312,7 @@ fn spl() -> Vec<u8> {
     put_u16(&mut d, 0x68, 1); // ext header count
     put_u32(&mut d, 0x6a, pool_off as u32); // feature pool
     put_u16(&mut d, 0x6e, 0); // casting index
-    put_u16(&mut d, 0x70, SPELL_EFFECTS.len() as u16);
+    put_u16(&mut d, 0x70, SPELL_EFFECTS.len() as u16 + 1);
     d
 }
 

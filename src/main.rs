@@ -266,6 +266,14 @@ impl ProjectileUse {
             path: path.into(),
         }
     }
+
+    /// Prepend a location to the path, as [`ResrefUse::prefixed`] does.
+    pub fn prefixed(self, prefix: &str) -> ProjectileUse {
+        ProjectileUse {
+            path: format!("{prefix}.{}", self.path),
+            ..self
+        }
+    }
 }
 
 /// The `chitin.key` to open: the one in the working directory if it exists (a

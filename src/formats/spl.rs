@@ -165,9 +165,11 @@ impl Spl {
         uses
     }
 
-    /// The projectiles the abilities fire, named by number ([`ProjectileUse`]).
+    /// The projectiles this spell names by number ([`ProjectileUse`]): the one
+    /// each ability fires, and any an effect protects from or reflects.
     pub fn projectile_uses(&self) -> Vec<ProjectileUse> {
-        self.ext_headers
+        let mut uses: Vec<ProjectileUse> = self
+            .ext_headers
             .iter()
             .enumerate()
             .filter_map(|(i, ext)| {
@@ -176,7 +178,18 @@ impl Spl {
                     format!("ability[{i}].projectile"),
                 ))
             })
-            .collect()
+            .collect();
+        for (i, feat) in self.casting.iter().enumerate() {
+            let at = format!("casting[{i}]");
+            uses.extend(feat.projectile_uses().into_iter().map(|u| u.prefixed(&at)));
+        }
+        for (j, ext) in self.ext_headers.iter().enumerate() {
+            for (k, feat) in ext.features.iter().enumerate() {
+                let at = format!("ability[{j}].effect[{k}]");
+                uses.extend(feat.projectile_uses().into_iter().map(|u| u.prefixed(&at)));
+            }
+        }
+        uses
     }
 
     /// The primary type (school), an index into MSCHOOL.2DA.

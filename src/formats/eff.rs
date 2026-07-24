@@ -14,9 +14,10 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::formats::opcode::{
-    ResourceSlot, StrrefSlot, opcode_name, opcode_resource_slots, opcode_strref_slots,
+    ResourceSlot, StrrefSlot, opcode_name, opcode_projectile, opcode_resource_slots,
+    opcode_strref_slots,
 };
-use crate::{Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
+use crate::{ProjectileUse, Reader, ResrefUse, StrrefUse, Truncated, describe_tag, parse_asciiz};
 
 /// Resource type code for EFF files.
 pub const EFF_TYPE: u16 = 0x03f8;
@@ -170,6 +171,14 @@ impl Eff {
             uses.push(if slot.soft { use_.soft() } else { use_ });
         }
         uses
+    }
+
+    /// The projectile this effect names by number, if its opcode names one.
+    pub fn projectile_uses(&self) -> Vec<ProjectileUse> {
+        opcode_projectile(self.opcode, self.param1, self.param2)
+            .map(|number| ProjectileUse::new(number, format!("op{}.projectile", self.opcode)))
+            .into_iter()
+            .collect()
     }
 
     /// Render the authored effect fields, each line prefixed with `indent`. The
@@ -516,6 +525,14 @@ impl Feature {
                 );
                 if slot.soft { use_.soft() } else { use_ }
             })
+            .collect()
+    }
+
+    /// The projectile this effect names by number, if its opcode names one.
+    pub fn projectile_uses(&self) -> Vec<ProjectileUse> {
+        opcode_projectile(self.opcode as u32, self.param1, self.param2)
+            .map(|number| ProjectileUse::new(number, format!("op{}.projectile", self.opcode)))
+            .into_iter()
             .collect()
     }
 

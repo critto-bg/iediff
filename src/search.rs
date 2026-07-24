@@ -387,7 +387,15 @@ fn match_resrefs(
 ) -> (Vec<String>, Vec<String>) {
     match res_type {
         EFF_TYPE => Eff::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .map(|r| {
+                split_all(
+                    r.resref_uses(),
+                    r.projectile_uses(),
+                    name,
+                    kind,
+                    projectiles,
+                )
+            })
             .unwrap_or_default(),
         ITM_TYPE => Itm::parse(data)
             .map(|r| {
@@ -412,7 +420,15 @@ fn match_resrefs(
             })
             .unwrap_or_default(),
         CRE_TYPE => Cre::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .map(|r| {
+                split_all(
+                    r.resref_uses(),
+                    r.projectile_uses(),
+                    name,
+                    kind,
+                    projectiles,
+                )
+            })
             .unwrap_or_default(),
         PRO_TYPE => Pro::parse(data)
             .map(|r| {
@@ -701,7 +717,10 @@ mod tests {
             .find(|h| h.name == "MAGIC")
             .expect("the spell fires this projectile");
         assert!(!hit.soft, "a table number identifies the file exactly");
-        assert_eq!(hit.fields, vec!["ability[0].projectile"]);
+        assert_eq!(
+            hit.fields,
+            vec!["ability[0].projectile", "casting[11].op83.projectile"]
+        );
 
         // A projectile the table does not name is not reachable at all.
         let none = find_resref(&mut m, "NOSUCHPR", PRO_TYPE, Source::Auto, None);
@@ -1004,12 +1023,19 @@ mod tests {
             fixture::ARE_TARGET,
             "casting[10].op186.resource",
         ),
-        // Named by projectl.ids number, not by resref.
+        // Named by projectl.ids number, not by resref: the ability fires it,
+        // and an effect protects from it.
         (
             "MAGIC",
             PRO_TYPE,
             fixture::PRO_TARGET,
             "ability[0].projectile",
+        ),
+        (
+            "MAGIC",
+            PRO_TYPE,
+            fixture::PRO_TARGET,
+            "casting[11].op83.projectile",
         ),
         // ARE header and sections.
         ("MAP", WED_TYPE, fixture::WED_TARGET, "wed"),
