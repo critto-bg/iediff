@@ -522,14 +522,22 @@ fn soft_text_resref_matches(data: &[u8], target: &str) -> Vec<String> {
     let text = String::from_utf8_lossy(&text);
     text.lines()
         .enumerate()
-        .filter(|(_, line)| {
-            line.split_whitespace().any(|token| {
-                let token = token.split_once('.').map_or(token, |(stem, _)| stem);
-                token.eq_ignore_ascii_case(target)
-            })
-        })
+        .filter(|(_, line)| line.split_whitespace().any(|token| token_names(token, target)))
         .map(|(i, _)| format!("line {}", i + 1))
         .collect()
+}
+
+/// Does a table token name `target`? Directly, or through a two-letter action
+/// prefix: the level-up and CLAB tables list a spell as `GA_<resref>` (gain
+/// ability) or `AP_<resref>` (apply), never the bare resref. A `.ext` suffix is
+/// ignored either way.
+fn token_names(token: &str, target: &str) -> bool {
+    let token = token.split_once('.').map_or(token, |(stem, _)| stem);
+    if token.eq_ignore_ascii_case(target) {
+        return true;
+    }
+    matches!(token.as_bytes(), [a, b, b'_', ..] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic())
+        && token.get(3..).is_some_and(|rest| rest.eq_ignore_ascii_case(target))
 }
 
 #[cfg(test)]
@@ -648,6 +656,19 @@ mod tests {
         assert!(soft_text_resref_matches(table, "SW1H0").is_empty());
         assert!(soft_text_resref_matches(table, "W1H01").is_empty());
         assert!(soft_text_resref_matches(table, "NOSUCH").is_empty());
+    }
+
+    #[test]
+    fn soft_text_resref_matches_through_a_two_letter_action_prefix() {
+        // A level-up table grants a spell as GA_<resref> / AP_<resref>.
+        let table = b"2DA V1.0\n*\nABILITY\nGA_SPWI920\nAP_SPWI920\nGA_SPWI920.SPL\n";
+        assert_eq!(
+            soft_text_resref_matches(table, "SPWI920"),
+            vec!["line 4", "line 5", "line 6"]
+        );
+        // Only a two-letter prefix, and the suffix must be the whole resref.
+        assert!(soft_text_resref_matches(b"ALL_EVIL\n", "EVIL").is_empty());
+        assert!(soft_text_resref_matches(b"GA_SPWI920\n", "SPWI92").is_empty());
     }
 
     #[test]
