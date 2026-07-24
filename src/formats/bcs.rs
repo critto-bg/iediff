@@ -25,6 +25,7 @@
 //!
 //! Spec: `md/iesdp/file_formats/ie_formats/bcs.md`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
@@ -579,9 +580,34 @@ fn raw_object(object: &Object) -> String {
 /// Write a call line at `indent`, appending its comment if any.
 fn write_call(f: &mut fmt::Formatter<'_>, indent: &str, call: Call) -> fmt::Result {
     match call.comment {
-        Some(comment) => writeln!(f, "{indent}{}  // {comment}", call.text),
+        Some(comment) => writeln!(f, "{indent}{}  // {}", call.text, one_line(&comment)),
         None => writeln!(f, "{indent}{}", call.text),
     }
+}
+
+/// Fold a comment onto one line. A `//` comment ends at the newline, so a
+/// resolved journal entry — the one TLK string that spans lines — would spill
+/// its tail into the text as code, and the BAF we print would not compile.
+fn one_line(text: &str) -> Cow<'_, str> {
+    if !text.contains(['\n', '\r']) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut break_pending = false;
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\r' {
+            // Runs of blank lines collapse to the single space that replaces
+            // them, and leading or trailing ones vanish.
+            break_pending = !out.is_empty();
+        } else {
+            if break_pending {
+                out.push(' ');
+                break_pending = false;
+            }
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// The comment a call earns: the first of its arguments the manager could
@@ -598,7 +624,7 @@ fn annotate(view: &View, args: Vec<Arg<'_>>, objects: &[&Object]) -> Option<Stri
             }
             // Borrowed only: a string resref, not a spell named by number.
             Arg::Resource { kind, resref, .. } => {
-                if let std::borrow::Cow::Borrowed(name) = resref
+                if let Cow::Borrowed(name) = resref
                     && let Some(text) = comments.resources.get(&(kind, name.to_ascii_uppercase()))
                 {
                     return Some(text.clone());
@@ -1251,6 +1277,33 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("TRAP_FIREBALL)  //"), "{shown}");
+    }
+
+    #[test]
+    fn a_multi_line_comment_stays_on_its_line() {
+        // Journal entries span lines in the TLK; a `//` comment does not, so the
+        // tail would come back as code. Compare `one_line` directly, then check
+        // the whole rendering has no line that is neither a comment nor a call.
+        assert_eq!(one_line("~one\r\n\r\ntwo~"), "~one two~");
+        assert_eq!(one_line("\n~lead and trail~\n"), "~lead and trail~");
+        assert!(matches!(one_line("~plain~"), Cow::Borrowed(_)));
+
+        let mut script = Script::parse(TRAP).expect("parses");
+        let vocabulary =
+            crate::script::from_lines(&["151 DisplayString(O:Object*,I:StrRef*)"], &[]);
+        script.set_vocabulary(Rc::new(vocabulary));
+        let mut comments = Comments::default();
+        comments
+            .strrefs
+            .insert(14381, "~first line\n\nsecond line~".to_string());
+        script.set_comments(comments);
+
+        let shown = format!("{script}");
+        assert!(
+            shown.contains("14381)  // ~first line second line~\n"),
+            "{shown}"
+        );
+        assert!(!shown.contains("second line~\n\n"), "{shown}");
     }
 
     #[test]
