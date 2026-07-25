@@ -17,19 +17,55 @@ use crate::script::{
     Class, IDENTIFIER_TABLE, OBJECT_TABLES, Signature, Vocabulary, is_scope_param,
 };
 
+/// Resolves a `@N` tra reference to the strref its text holds in `dialog.tlk`.
+/// Keeps the compiler pure: the caller supplies the tra tables and tlk lookup.
+pub trait StrrefSource {
+    fn resolve(&self, index: u32) -> Result<i32, StrrefError>;
+}
+
+/// Why a `@N` reference could not be resolved.
+pub enum StrrefError {
+    /// No loaded tra defines this reference.
+    UnknownRef,
+    /// Its text is not present in `dialog.tlk` (read-only: we never add one).
+    NotInTlk,
+}
+
+/// The default when no tra is loaded: every `@N` is an error. Callers that never
+/// meet tra references (DLG typing, the round-trip tests) use this.
+pub struct NoStrings;
+
+impl StrrefSource for NoStrings {
+    fn resolve(&self, _index: u32) -> Result<i32, StrrefError> {
+        Err(StrrefError::UnknownRef)
+    }
+}
+
+static NO_STRINGS: NoStrings = NoStrings;
+
 /// A cursor over the BAF text.
 struct Parser<'a> {
     data: &'a [u8],
     pos: usize,
     vocabulary: &'a Vocabulary,
+    strings: &'a dyn StrrefSource,
 }
 
 impl<'a> Parser<'a> {
     fn new(data: &'a [u8], vocabulary: &'a Vocabulary) -> Parser<'a> {
+        Parser::with_strings(data, vocabulary, &NO_STRINGS)
+    }
+
+    fn with_strings(
+        data: &'a [u8],
+        vocabulary: &'a Vocabulary,
+        strings: &'a dyn StrrefSource,
+    ) -> Parser<'a> {
         Parser {
             data,
             pos: 0,
             vocabulary,
+            strings,
         }
     }
 
@@ -201,9 +237,13 @@ impl<'a> Parser<'a> {
 
     // ---- arguments ---------------------------------------------------------
 
-    /// An integer argument: a bare number, or a symbol resolved through the
-    /// table the parameter names.
+    /// An integer argument: a bare number, a `@N` tra reference (in a strref
+    /// slot), or a symbol resolved through the table the parameter names.
     fn int_arg(&mut self, table: Option<&str>) -> Result<i32, BafError> {
+        self.skip_inline_ws();
+        if self.peek() == Some(b'@') {
+            return self.tra_strref();
+        }
         if self.peek_number() {
             return self.number();
         }
@@ -217,6 +257,18 @@ impl<'a> Parser<'a> {
                 symbol,
                 at,
             })
+    }
+
+    /// A `@N` tra reference: WeiDU substitutes its text and resolves the string
+    /// to a `dialog.tlk` strref. Read-only here — the string must already exist.
+    fn tra_strref(&mut self) -> Result<i32, BafError> {
+        let at = self.pos;
+        self.pos += 1; // the '@'
+        let index = self.number()? as u32;
+        self.strings.resolve(index).map_err(|why| match why {
+            StrrefError::UnknownRef => BafError::UnknownTraRef { index, at },
+            StrrefError::NotInTlk => BafError::TraStringNotInTlk { index, at },
+        })
     }
 
     /// An object argument: identifiers chaining outward around a base of an
@@ -504,6 +556,11 @@ pub enum BafError {
         symbol: String,
         at: usize,
     },
+    /// A `@N` reference no loaded tra defines (missing or wrong `--using`).
+    UnknownTraRef { index: u32, at: usize },
+    /// A `@N` whose tra text has no strref in `dialog.tlk`. Read-only: we resolve
+    /// against existing strings and never add one, as an install would.
+    TraStringNotInTlk { index: u32, at: usize },
     /// Text ran out mid-construct.
     UnexpectedEnd,
 }
@@ -523,6 +580,18 @@ impl std::fmt::Display for BafError {
                     "malformed BAF: {symbol:?} is not in {table}.IDS at byte {at}"
                 )
             }
+            BafError::UnknownTraRef { index, at } => {
+                write!(
+                    f,
+                    "malformed BAF: @{index} is in no loaded tra at byte {at}"
+                )
+            }
+            BafError::TraStringNotInTlk { index, at } => {
+                write!(
+                    f,
+                    "malformed BAF: @{index}'s text is not in dialog.tlk at byte {at}"
+                )
+            }
             BafError::UnexpectedEnd => write!(f, "malformed BAF: unexpected end of input"),
         }
     }
@@ -532,7 +601,17 @@ impl std::error::Error for BafError {}
 
 /// Compile a whole BAF script into the record form.
 pub fn compile(text: &[u8], vocabulary: &Vocabulary) -> Result<Script, BafError> {
-    let mut p = Parser::new(text, vocabulary);
+    compile_using(text, vocabulary, &NO_STRINGS)
+}
+
+/// As [`compile`], but with a [`StrrefSource`] to resolve `@N` tra references
+/// (the `USING` clause of a WeiDU `COMPILE`).
+pub fn compile_using(
+    text: &[u8],
+    vocabulary: &Vocabulary,
+    strings: &dyn StrrefSource,
+) -> Result<Script, BafError> {
+    let mut p = Parser::with_strings(text, vocabulary, strings);
     let mut blocks = Vec::new();
     p.skip_trivia();
     while !p.at_end() {
@@ -753,6 +832,41 @@ mod tests {
         let mut rendered = script.clone();
         rendered.set_vocabulary(std::rc::Rc::new(vocab()));
         assert_eq!(format!("{rendered}"), format!("{baf}\n"));
+    }
+
+    #[test]
+    fn a_tra_reference_resolves_to_its_strref() {
+        // A `@N` in a strref slot resolves through the source; the two failure
+        // modes stay distinct and never panic.
+        struct Fixed;
+        impl StrrefSource for Fixed {
+            fn resolve(&self, index: u32) -> Result<i32, StrrefError> {
+                match index {
+                    5521 => Ok(104360),
+                    9999 => Err(StrrefError::NotInTlk),
+                    _ => Err(StrrefError::UnknownRef),
+                }
+            }
+        }
+        let compile_arg = |src: &str| {
+            compile_using(
+                format!("IF\nTHEN\n  RESPONSE #100\n    DisplayString(Player1,{src})\nEND\n")
+                    .as_bytes(),
+                &vocab(),
+                &Fixed,
+            )
+        };
+
+        let script = compile_arg("@5521").expect("compiles");
+        assert_eq!(script.blocks[0].responses[0].actions[0].ints[0], 104360);
+        assert!(matches!(
+            compile_arg("@1"),
+            Err(BafError::UnknownTraRef { index: 1, .. })
+        ));
+        assert!(matches!(
+            compile_arg("@9999"),
+            Err(BafError::TraStringNotInTlk { index: 9999, .. })
+        ));
     }
 
     #[test]

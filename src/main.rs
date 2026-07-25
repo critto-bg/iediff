@@ -12,6 +12,7 @@ mod script;
 mod search;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::{self, Write};
@@ -68,6 +69,8 @@ Options:
                         must name a type (sw1h01.itm, strref:8000)
   --type <ext>          with --uses, scan only one resource type (e.g. itm)
   --out <dir>           with --file on a .baf, write the .bcs into <dir>
+  --using <tra>         with --file on a .baf, resolve @N strings from this tra
+                        (repeatable; later files win a shared @N)
 
 Decoded formats: 2da ids eff itm spl cre pro sto are dlg bcs
 Other resource types are located and summarised (type, size) but not parsed.
@@ -415,6 +418,7 @@ fn print_file(
     path: &str,
     raw: bool,
     out_dir: Option<&str>,
+    using: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = Path::new(path);
     let ext = file
@@ -425,10 +429,13 @@ fn print_file(
     // A `.baf` is textual script; compile it to a `.bcs` on disk rather than
     // echoing it back.
     if ext.eq_ignore_ascii_case("baf") {
-        return compile_baf(out, manager, file, out_dir);
+        return compile_baf(out, manager, file, out_dir, using);
     }
     if out_dir.is_some() {
         return Err("--out applies only when compiling a .baf".into());
+    }
+    if !using.is_empty() {
+        return Err("--using applies only when compiling a .baf".into());
     }
 
     let res_type = extension_type(&ext.to_ascii_lowercase())
@@ -447,18 +454,25 @@ fn print_file(
 
 /// Compile a BAF file to a `.bcs` beside it, or in `out_dir` when given. The
 /// vocabulary comes from the game, so a symbol the install does not know is an
-/// error rather than a silent pass.
+/// error rather than a silent pass. `using` tra files (WeiDU's `USING` clause)
+/// supply the `@N` strings; later files win a shared `@N`.
 fn compile_baf(
     out: &mut impl Write,
     manager: &mut ResourceManager,
     file: &Path,
     out_dir: Option<&str>,
+    using: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let text = std::fs::read(file)?;
     let vocabulary = manager
         .vocabulary()
         .ok_or("no ACTION.IDS / TRIGGER.IDS in the game to compile against")?;
-    let script = formats::baf::compile(&text, &vocabulary)?;
+    let script = if using.is_empty() {
+        formats::baf::compile(&text, &vocabulary)?
+    } else {
+        let strings = load_tra(manager, using)?;
+        formats::baf::compile_using(&text, &vocabulary, &strings)?
+    };
 
     let stem = file
         .file_stem()
@@ -483,6 +497,41 @@ fn compile_baf(
         .map_err(|e| format!("could not write {}: {e}", target.display()))?;
     writeln!(out, "compiled {} -> {}", file.display(), target.display())?;
     Ok(())
+}
+
+/// Load and merge `using` tra files, resolving each `@N`'s text to the strref it
+/// already holds in `dialog.tlk`. Later files override earlier on a shared `@N`.
+fn load_tra(
+    manager: &mut ResourceManager,
+    using: &[String],
+) -> Result<TraStrings, Box<dyn std::error::Error>> {
+    let mut tra: HashMap<u32, String> = HashMap::new();
+    for path in using {
+        let bytes = std::fs::read(path).map_err(|e| format!("could not read {path}: {e}"))?;
+        tra.extend(formats::tra::parse(&bytes).map_err(|e| format!("{path}: {e}"))?);
+    }
+    let mut resolved = HashMap::with_capacity(tra.len());
+    for (index, text) in tra {
+        resolved.insert(index, manager.strref_for(&text)?.map(|s| s as i32));
+    }
+    Ok(TraStrings { resolved })
+}
+
+/// The `@N` resolver for [`compile_baf`]: each loaded reference paired with the
+/// strref its text holds in `dialog.tlk`, or `None` when the tlk lacks it — so a
+/// present-but-untranslatable `@N` reads differently from an undefined one.
+struct TraStrings {
+    resolved: HashMap<u32, Option<i32>>,
+}
+
+impl formats::baf::StrrefSource for TraStrings {
+    fn resolve(&self, index: u32) -> Result<i32, formats::baf::StrrefError> {
+        match self.resolved.get(&index) {
+            Some(Some(strref)) => Ok(*strref),
+            Some(None) => Err(formats::baf::StrrefError::NotInTlk),
+            None => Err(formats::baf::StrrefError::UnknownRef),
+        }
+    }
 }
 
 /// Print prefix-search results, grouped by override vs biff.
@@ -739,6 +788,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut uses = false;
     let mut type_ext: Option<String> = None;
     let mut out_dir: Option<String> = None;
+    let mut using: Vec<String> = Vec::new();
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -764,6 +814,11 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
             "--out" => {
                 out_dir = Some(args.next().ok_or("--out needs a directory")?);
             }
+            // A tra file supplying `@N` strings for compilation; repeatable, and
+            // later files win on a shared `@N`. See [`compile_baf`].
+            "--using" => {
+                using.push(args.next().ok_or("--using needs a tra file")?);
+            }
             "--help" | "-h" => help = true,
             _ if query.is_none() => query = Some(arg),
             _ => return Err(format!("unexpected argument: {arg}").into()),
@@ -782,10 +837,13 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     // referenced names still resolve against the game directory.
     if file {
         let path = query.ok_or("--file needs a path to a resource file")?;
-        return print_file(out, &mut manager, &path, raw, out_dir.as_deref());
+        return print_file(out, &mut manager, &path, raw, out_dir.as_deref(), &using);
     }
     if out_dir.is_some() {
         return Err("--out applies only when compiling a --file .baf".into());
+    }
+    if !using.is_empty() {
+        return Err("--using applies only when compiling a --file .baf".into());
     }
 
     if stats {

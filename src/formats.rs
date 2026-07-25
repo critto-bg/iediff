@@ -20,6 +20,7 @@ pub mod pro;
 pub mod spl;
 pub mod sto;
 pub mod tlk;
+pub mod tra;
 pub mod twoda;
 
 // Resource types this crate does not decode but whose resrefs the decoded

@@ -47,6 +47,9 @@ pub struct ResourceManager {
     open_bifs: HashMap<usize, BifArchive>,
     /// The `dialog.tlk` string table, opened lazily on first string lookup.
     dialog: Option<TlkFile>,
+    /// Reverse `text -> strref` index over `dialog.tlk`, built lazily and only
+    /// when a BAF is compiled with `--using` tra files.
+    dialog_reverse: Option<HashMap<String, u32>>,
     /// Index of the override directory; its resources shadow the BIFs.
     over: Override,
     /// Cache of resolved names, keyed by (UPPERCASE resref, type). A creature
@@ -80,6 +83,7 @@ impl ResourceManager {
             game_dir,
             open_bifs: HashMap::new(),
             dialog: None,
+            dialog_reverse: None,
             over,
             name_cache: HashMap::new(),
             twoda_cache: HashMap::new(),
@@ -153,6 +157,19 @@ impl ResourceManager {
     /// opened lazily and kept open for subsequent lookups.
     pub fn string(&mut self, strref: u32) -> Result<String, ResourceError> {
         Ok(self.dialog()?.string(strref)?)
+    }
+
+    /// The strref whose `dialog.tlk` text is `text`, via the
+    /// [`dialog_reverse`](Self::dialog_reverse) index (built on first call).
+    pub(crate) fn strref_for(&mut self, text: &str) -> Result<Option<u32>, ResourceError> {
+        if self.dialog_reverse.is_none() {
+            let index = self.dialog()?.reverse_index()?;
+            self.dialog_reverse = Some(index);
+        }
+        Ok(self
+            .dialog_reverse
+            .as_ref()
+            .and_then(|m| m.get(text).copied()))
     }
 
     /// Every `(name, type)` the index knows, as `(override, KEY)`. Kept apart

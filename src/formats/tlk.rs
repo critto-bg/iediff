@@ -10,6 +10,7 @@
 //! fixed-size entry table in memory and `seek`/`read` each string on demand.
 //! Spec: `md/file_formats/ie_formats/tlk_v1.md`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -87,6 +88,29 @@ impl TlkFile {
         // Some strings are NUL-terminated within their recorded length, others
         // not; trim at the first NUL. EE stores UTF-8, so decode lossily.
         Ok(parse_asciiz(&buf))
+    }
+
+    /// The reverse map text -> strref. A string with several strrefs keeps the
+    /// highest, matching WeiDU: it loads the table in strref order into a hash
+    /// whose lookup returns the last binding added, so a duplicate resolves to
+    /// its largest strref (e.g. the placeholder `...`).
+    pub fn reverse_index(&mut self) -> Result<HashMap<String, u32>, TlkError> {
+        self.file
+            .seek(SeekFrom::Start(self.string_section as u64))?;
+        let mut section = Vec::new();
+        self.file.read_to_end(&mut section)?;
+
+        let mut index = HashMap::with_capacity(self.entries.len());
+        for (strref, entry) in self.entries.iter().enumerate() {
+            if entry.length == 0 {
+                continue;
+            }
+            let start = entry.offset as usize;
+            let end = start.saturating_add(entry.length as usize);
+            let text = parse_asciiz(section.get(start..end).unwrap_or_default());
+            index.insert(text, strref as u32);
+        }
+        Ok(index)
     }
 
     /// The sound resref that plays with a strref, if any. Empty for a string
