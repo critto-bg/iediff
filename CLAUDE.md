@@ -7,6 +7,18 @@ Guidance for working in this repo. See `README.md` for project intent.
 `iediff` parses, prints, and diffs Infinity Engine resource files, developed and
 tested against a real BG2:EE install. See `README.md` for goals.
 
+## Mod-specific features
+
+Some features serve a *specific mod*, not the engine or the wider toolchain: they
+implement one mod's own build convention rather than a game file format or a
+WeiDU feature. (Contrast the BAF compiler's `--using`, which is core WeiDU — a
+mod merely provided the tra files to test it against.) So far the only such
+feature is `--templates`: ImprovedAnvil's `@@name` preprocessor in
+`src/preprocess.rs`, mirroring `game/ImprovedAnvil/lib/tpa/baf_preprocessor.tpa`.
+Keep this code identifiable and loosely coupled to the engine core — as it grows
+it may be extracted into a separate binary. Verify it against its own oracle (the
+mod's own staged output), not just the engine.
+
 ## Hard constraints
 
 - **Rust, standard library only.** No external crates — this is educational.

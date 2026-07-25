@@ -7,6 +7,7 @@
 #[cfg(test)]
 mod fixture;
 mod formats;
+mod preprocess;
 mod resource;
 mod script;
 mod search;
@@ -71,6 +72,8 @@ Options:
   --out <dir>           with --file on a .baf, write the .bcs into <dir>
   --using <tra>         with --file on a .baf, resolve @N strings from this tra
                         (repeatable; later files win a shared @N)
+  --templates <dir>     with --file on a .baf, expand @@name marker lines from
+                        <dir>/name.baf (ImprovedAnvil mod convention)
 
 Decoded formats: 2da ids eff itm spl cre pro sto are dlg bcs
 Other resource types are located and summarised (type, size) but not parsed.
@@ -419,6 +422,7 @@ fn print_file(
     raw: bool,
     out_dir: Option<&str>,
     using: &[String],
+    templates: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = Path::new(path);
     let ext = file
@@ -429,13 +433,16 @@ fn print_file(
     // A `.baf` is textual script; compile it to a `.bcs` on disk rather than
     // echoing it back.
     if ext.eq_ignore_ascii_case("baf") {
-        return compile_baf(out, manager, file, out_dir, using);
+        return compile_baf(out, manager, file, out_dir, using, templates);
     }
     if out_dir.is_some() {
         return Err("--out applies only when compiling a .baf".into());
     }
     if !using.is_empty() {
         return Err("--using applies only when compiling a .baf".into());
+    }
+    if templates.is_some() {
+        return Err("--templates applies only when compiling a .baf".into());
     }
 
     let res_type = extension_type(&ext.to_ascii_lowercase())
@@ -455,15 +462,20 @@ fn print_file(
 /// Compile a BAF file to a `.bcs` beside it, or in `out_dir` when given. The
 /// vocabulary comes from the game, so a symbol the install does not know is an
 /// error rather than a silent pass. `using` tra files (WeiDU's `USING` clause)
-/// supply the `@N` strings; later files win a shared `@N`.
+/// supply the `@N` strings; later files win a shared `@N`. A `templates`
+/// directory expands `@@name` marker lines first (see [`preprocess`]).
 fn compile_baf(
     out: &mut impl Write,
     manager: &mut ResourceManager,
     file: &Path,
     out_dir: Option<&str>,
     using: &[String],
+    templates: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let text = std::fs::read(file)?;
+    let mut text = std::fs::read(file)?;
+    if let Some(dir) = templates {
+        text = preprocess::expand(&text, Path::new(dir))?;
+    }
     let vocabulary = manager
         .vocabulary()
         .ok_or("no ACTION.IDS / TRIGGER.IDS in the game to compile against")?;
@@ -789,6 +801,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut type_ext: Option<String> = None;
     let mut out_dir: Option<String> = None;
     let mut using: Vec<String> = Vec::new();
+    let mut templates: Option<String> = None;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -819,6 +832,10 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
             "--using" => {
                 using.push(args.next().ok_or("--using needs a tra file")?);
             }
+            // A directory of `@@name` template fragments for the preprocessor.
+            "--templates" => {
+                templates = Some(args.next().ok_or("--templates needs a directory")?);
+            }
             "--help" | "-h" => help = true,
             _ if query.is_none() => query = Some(arg),
             _ => return Err(format!("unexpected argument: {arg}").into()),
@@ -837,13 +854,24 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     // referenced names still resolve against the game directory.
     if file {
         let path = query.ok_or("--file needs a path to a resource file")?;
-        return print_file(out, &mut manager, &path, raw, out_dir.as_deref(), &using);
+        return print_file(
+            out,
+            &mut manager,
+            &path,
+            raw,
+            out_dir.as_deref(),
+            &using,
+            templates.as_deref(),
+        );
     }
     if out_dir.is_some() {
         return Err("--out applies only when compiling a --file .baf".into());
     }
     if !using.is_empty() {
         return Err("--using applies only when compiling a --file .baf".into());
+    }
+    if templates.is_some() {
+        return Err("--templates applies only when compiling a --file .baf".into());
     }
 
     if stats {
