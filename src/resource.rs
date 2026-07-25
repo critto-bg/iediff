@@ -703,13 +703,16 @@ impl ResourceManager {
         }
     }
 
-    /// A table's value -> symbol mapping, for naming script arguments.
+    /// A table's `(value, symbol)` pairs in file order, for naming script
+    /// arguments and parsing names back.
     ///
-    /// The *last* alias wins where a value repeats, which is the opposite of
-    /// [`IdsFile::lookup_by_value`]. `CLASS.IDS` lists `202 LONG_BOW` before
-    /// `202 MAGE_ALL`, and a script asking about class 202 means the kit, not
-    /// the weapon — the reading the engine's own decompiler gives.
-    fn ids_symbols(&mut self, table: &str) -> Option<HashMap<i64, String>> {
+    /// Order is load-bearing: where a value repeats, the *last* alias wins the
+    /// naming map (the opposite of [`IdsFile::lookup_by_value`]). `CLASS.IDS`
+    /// lists `202 LONG_BOW` before `202 MAGE_ALL`, and a script asking about
+    /// class 202 means the kit, not the weapon — the reading the engine's own
+    /// decompiler gives. Every pair is kept so the reverse map can too (see
+    /// [`Vocabulary::set_symbols`]).
+    fn ids_symbols(&mut self, table: &str) -> Option<Vec<(i64, String)>> {
         let ids = self.load_ids(table)?;
         let symbols = ids
             .entries()

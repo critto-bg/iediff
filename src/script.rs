@@ -139,14 +139,20 @@ impl Vocabulary {
     }
 
     /// Record a table's value -> symbol mapping, and its reverse for parsing.
-    pub fn set_symbols(&mut self, table: &str, entries: HashMap<i64, String>) {
+    ///
+    /// `entries` is in file order. A repeated value collapses to its last alias
+    /// in the naming map, but the reverse keeps *every* name: IDS tables
+    /// legitimately alias several names to one value (`spell.ids`: 2302 both
+    /// `WIZARD_DISPEL_MAGIC` and `WIZARD_REMOVE_MAGIC`), and each must still
+    /// compile even though only the survivor is ever decompiled back.
+    pub fn set_symbols(&mut self, table: &str, entries: Vec<(i64, String)>) {
         let table = table.to_ascii_uppercase();
         let reverse = entries
             .iter()
-            .map(|(&value, name)| (name.to_ascii_uppercase(), value))
+            .map(|(value, name)| (name.to_ascii_uppercase(), *value))
             .collect();
         self.values.insert(table.clone(), reverse);
-        self.symbols.insert(table, entries);
+        self.symbols.insert(table, entries.into_iter().collect());
     }
 
     /// The symbol a table gives a value, if the table was loaded and lists it.
@@ -1021,5 +1027,23 @@ mod tests {
         let v = vocab(&["Continue()"]);
         assert_eq!(v.arg_kind("Continue", 0), ArgKind::Unknown);
         assert_eq!(v.call_ids(), (1, 0));
+    }
+
+    #[test]
+    fn every_alias_of_a_shared_value_still_parses() {
+        // spell.ids aliases two names to 2302; decompiling names only the last,
+        // but a BAF the user wrote by hand may use either, and both must compile.
+        let mut v = vocab(&[]);
+        v.set_symbols(
+            "SPELL",
+            vec![
+                (2302, "WIZARD_DISPEL_MAGIC".to_string()),
+                (2302, "WIZARD_REMOVE_MAGIC".to_string()),
+            ],
+        );
+        assert_eq!(v.value("SPELL", "WIZARD_DISPEL_MAGIC"), Some(2302));
+        assert_eq!(v.value("SPELL", "WIZARD_REMOVE_MAGIC"), Some(2302));
+        // The naming map still collapses to the last alias.
+        assert_eq!(v.symbol("SPELL", 2302), Some("WIZARD_REMOVE_MAGIC"));
     }
 }
