@@ -328,7 +328,8 @@ impl<'a> Parser<'a> {
         self.data.get(self.pos).copied()
     }
 
-    /// Skip spaces, newlines and `//` comments.
+    /// Skip spaces, newlines and comments — both `//` to end of line and
+    /// `/* … */` blocks, which WeiDU accepts and mods use to disable code.
     fn skip_trivia(&mut self) {
         loop {
             match self.peek() {
@@ -337,6 +338,17 @@ impl<'a> Parser<'a> {
                     while self.peek().is_some_and(|b| b != b'\n') {
                         self.pos += 1;
                     }
+                }
+                Some(b'/') if self.data.get(self.pos + 1) == Some(&b'*') => {
+                    self.pos += 2;
+                    // Not nested, like C: skip to the first `*/`, or end of input.
+                    while self.peek().is_some()
+                        && !(self.peek() == Some(b'*')
+                            && self.data.get(self.pos + 1) == Some(&b'/'))
+                    {
+                        self.pos += 1;
+                    }
+                    self.pos = (self.pos + 2).min(self.data.len());
                 }
                 _ => break,
             }
@@ -741,6 +753,20 @@ mod tests {
         let mut rendered = script.clone();
         rendered.set_vocabulary(std::rc::Rc::new(vocab()));
         assert_eq!(format!("{rendered}"), format!("{baf}\n"));
+    }
+
+    #[test]
+    fn comments_are_skipped_including_multi_line_blocks() {
+        // Mods disable code with `/* … */` blocks and annotate with `//`; WeiDU
+        // skips both, so a `/* IF … END */` between blocks must vanish, not parse.
+        let baf = "/* druid quest */\n\
+                   IF\n  Entered([ANYONE]) // trigger\nTHEN\n  RESPONSE #100\nEND\n\
+                   /*IF\n  True()\nTHEN\n  RESPONSE #100\nEND*/\n\
+                   IF\nTHEN\n  RESPONSE #100\n    SetGlobal(\"x\",\"GLOBAL\",1)\nEND\n";
+        let script = compile(baf.as_bytes(), &vocab()).expect("compiles");
+        // Only the two live blocks survive; the commented-out one is gone.
+        assert_eq!(script.blocks.len(), 2);
+        assert_eq!(script.blocks[0].triggers.len(), 1);
     }
 
     #[test]

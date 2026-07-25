@@ -522,7 +522,10 @@ fn soft_text_resref_matches(data: &[u8], target: &str) -> Vec<String> {
     let text = String::from_utf8_lossy(&text);
     text.lines()
         .enumerate()
-        .filter(|(_, line)| line.split_whitespace().any(|token| token_names(token, target)))
+        .filter(|(_, line)| {
+            line.split_whitespace()
+                .any(|token| token_names(token, target))
+        })
         .map(|(i, _)| format!("line {}", i + 1))
         .collect()
 }
@@ -537,7 +540,9 @@ fn token_names(token: &str, target: &str) -> bool {
         return true;
     }
     matches!(token.as_bytes(), [a, b, b'_', ..] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic())
-        && token.get(3..).is_some_and(|rest| rest.eq_ignore_ascii_case(target))
+        && token
+            .get(3..)
+            .is_some_and(|rest| rest.eq_ignore_ascii_case(target))
 }
 
 #[cfg(test)]
