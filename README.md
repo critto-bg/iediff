@@ -52,6 +52,9 @@ Options:
 - `--type <ext>` — with `--uses`, scan only one referring type.
 - `--out <dir>` — with `--file` on a `.baf`, write the compiled `.bcs` into
   `<dir>` (which must exist) instead of beside the source.
+- `--using <tra>` — with `--file` on a `.baf`, resolve `@N` string references
+  from this translation file (WeiDU's `USING` clause). Repeatable; a later file
+  wins a shared `@N`.
 
 It runs against `./chitin.key` when present (so it works from a game root),
 otherwise `game/chitin.key`.
@@ -139,6 +142,18 @@ END
 A full BAF compiler goes the other way: `iediff --file x.baf` writes the compiled
 `x.bcs`, and the round trip `compile(decompile(bcs)) == bcs` holds byte for byte
 on every script in the install that round-trips at all.
+
+Mod scripts often carry `@N` string references in place of a strref, defined in
+a companion `.tra` translation file. Pass those with `--using` to compile such a
+script offline:
+
+```sh
+iediff --file S!0002.baf --using setup.tra --using druidq.tra --out build
+```
+
+Each `@N` is resolved to its text and matched against an existing `dialog.tlk`
+string (read-only — a string the game does not already hold is an error, not a
+new entry). Output is byte-identical to WeiDU's for the same tra set.
 
 ## Local setup
 
