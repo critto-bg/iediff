@@ -15,9 +15,11 @@ WeiDU feature. (Contrast the BAF compiler's `--using`, which is core WeiDU — a
 mod merely provided the tra files to test it against.) So far the only such
 feature is `--templates`: ImprovedAnvil's `@@name` preprocessor in
 `src/preprocess.rs`, mirroring `game/ImprovedAnvil/lib/tpa/baf_preprocessor.tpa`.
-Keep this code identifiable and loosely coupled to the engine core — as it grows
-it may be extracted into a separate binary. Verify it against its own oracle (the
-mod's own staged output), not just the engine.
+Both implementations follow one normative grammar, `baf-preprocessor-grammar.md`,
+so any divergence is a bug in one of them. Keep this code identifiable and
+loosely coupled to the engine core — as it grows it may be extracted into a
+separate binary. Verify it against its own oracle (the mod's own staged output
+under `game/ImprovedAnvil/workspace/baf`), not just the engine.
 
 ## Hard constraints
 

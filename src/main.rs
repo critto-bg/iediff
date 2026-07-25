@@ -474,7 +474,7 @@ fn compile_baf(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut text = std::fs::read(file)?;
     if let Some(dir) = templates {
-        text = preprocess::expand(&text, Path::new(dir))?;
+        text = preprocess::expand(&text, Path::new(dir), file)?;
     }
     let vocabulary = manager
         .vocabulary()

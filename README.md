@@ -55,8 +55,8 @@ Options:
 - `--using <tra>` — with `--file` on a `.baf`, resolve `@N` string references
   from this translation file (WeiDU's `USING` clause). Repeatable; a later file
   wins a shared `@N`.
-- `--templates <dir>` — with `--file` on a `.baf`, expand `@@name` marker lines
-  from `<dir>/name.baf` before compiling (an ImprovedAnvil mod convention).
+- `--templates <dir>` — with `--file` on a `.baf`, expand `@@name` directive
+  lines from `<dir>/name.baf` before compiling (an ImprovedAnvil mod convention).
 
 It runs against `./chitin.key` when present (so it works from a game root),
 otherwise `game/chitin.key`.
@@ -158,9 +158,11 @@ string (read-only — a string the game does not already hold is an error, not a
 new entry). Output is byte-identical to WeiDU's for the same tra set.
 
 Some mods also preprocess their BAF with their own directives. `--templates`
-supports one such convention (ImprovedAnvil's): a whole line `@@name` is a marker
-replaced inline by `<dir>/name.baf` before compiling, so a shared fragment lives
-in one place. An unknown marker is an error.
+supports one such convention (ImprovedAnvil's): a whole line `@@name` is replaced
+by `<dir>/name.baf` before compiling, so a shared fragment lives in one place. A
+directive may pass `@@name(key=value; …)` args (also written over several lines)
+that fill the template's `%key%` slot lines and inline placeholders. An unknown
+template, a malformed directive, or a leftover placeholder is an error.
 
 ```sh
 iediff --file S!hlkang.baf --templates ImprovedAnvil/scripts/_templates --out build
