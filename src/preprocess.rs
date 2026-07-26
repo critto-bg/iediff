@@ -2,8 +2,8 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v2);
-//! this mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v2.1); this
+//! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
 //! A directive is a whole line whose first non-blank characters are `@@`. It
@@ -13,12 +13,18 @@
 //! deleted when the key is absent) and its inline `%key%` placeholders. The
 //! spliced text is inserted verbatim and never rescanned; after every directive
 //! is expanded, a leftover `@@` line or `%token%` anywhere is a fatal error.
+//!
+//! `@@define key(v1; v2; …)` binds a key at file scope: any call whose template
+//! references `key` but whose args omit it draws the definition's values, as if
+//! the call had passed them. Definitions are collected in a first pass (they are
+//! position-independent), then their own lines are dropped from the output.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// Template names the grammar forbids in a call.
-const RESERVED: [&str; 2] = ["foreach", "end"];
+/// Template names the grammar forbids in a call. `define` heads its own
+/// directive; `foreach`/`end` are reserved for a future loop form.
+const RESERVED: [&str; 3] = ["foreach", "end", "define"];
 
 /// The `key=value` pairs of one directive, in call order. Duplicate keys
 /// accumulate their values (a key may fill a multi-value slot); `used` drives
@@ -58,6 +64,51 @@ impl Args {
 }
 
 struct Entry {
+    key: String,
+    values: Vec<Vec<u8>>,
+    used: bool,
+}
+
+/// The file's `@@define` bindings — a fallback value source for calls that omit
+/// a key. `used` is set when some call draws on the definition; one left unused
+/// by every call is a fatal error, so a stale define never passes silently.
+struct Definitions {
+    entries: Vec<Def>,
+}
+
+impl Definitions {
+    fn new() -> Definitions {
+        Definitions {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Record a definition, rejecting a second one for the same key.
+    fn insert(&mut self, key: String, values: Vec<Vec<u8>>) -> Result<(), ErrorKind> {
+        if self.entries.iter().any(|d| d.key == key) {
+            return Err(ErrorKind::DuplicateDefine { key });
+        }
+        self.entries.push(Def {
+            key,
+            values,
+            used: false,
+        });
+        Ok(())
+    }
+
+    fn index_of(&self, key: &str) -> Option<usize> {
+        self.entries.iter().position(|d| d.key == key)
+    }
+
+    fn first_unused(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|d| !d.used)
+            .map(|d| d.key.as_str())
+    }
+}
+
+struct Def {
     key: String,
     values: Vec<Vec<u8>>,
     used: bool,
@@ -114,6 +165,19 @@ enum ErrorKind {
         name: String,
         key: String,
     },
+    DuplicateDefine {
+        key: String,
+    },
+    UnterminatedDefine {
+        key: String,
+    },
+    DefineCollision {
+        name: String,
+        key: String,
+    },
+    DefineUnused {
+        key: String,
+    },
     ResidualDirective {
         line: String,
     },
@@ -149,6 +213,21 @@ impl fmt::Display for ErrorKind {
             ErrorKind::UnusedKey { name, key } => {
                 write!(f, "@@{name}: key '{key}' is not used by the template")
             }
+            ErrorKind::DuplicateDefine { key } => {
+                write!(f, "duplicate @@define for key '{key}'")
+            }
+            ErrorKind::UnterminatedDefine { key } => {
+                write!(f, "unterminated multi-line @@define {key}")
+            }
+            ErrorKind::DefineCollision { name, key } => {
+                write!(
+                    f,
+                    "@@{name}: key '{key}' is also set by @@define; provide it in one place only"
+                )
+            }
+            ErrorKind::DefineUnused { key } => {
+                write!(f, "@@define {key} is used by no call")
+            }
             ErrorKind::ResidualDirective { line } => {
                 write!(f, "unexpanded directive remains after expansion: {line}")
             }
@@ -175,10 +254,34 @@ pub fn expand(
 
 fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKind> {
     let lines = physical_lines(source);
+
+    // Pass 1: collect every `@@define` (position-independent, file-scoped) and
+    // mark its lines so pass 2 drops them from the output.
+    let mut defs = Definitions::new();
+    let mut consumed = vec![false; lines.len()];
+    let mut i = 0;
+    while let Some(&line) = lines.get(i) {
+        if is_define_directive(strip_leading_ws(split_newline(line).0)) {
+            let (key, values, end) = parse_define(&lines, i)?;
+            defs.insert(key, values)?;
+            for slot in consumed.get_mut(i..=end).unwrap_or_default() {
+                *slot = true;
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Pass 2: expand each call (drawing on the definitions), pass the rest through.
     let mut out = Vec::with_capacity(source.len());
     let mut i = 0;
-
     while let Some(&line) = lines.get(i) {
+        if *consumed.get(i).unwrap_or(&false) {
+            i += 1;
+            continue;
+        }
+
         let (content, newline) = split_newline(line);
         let stripped = strip_leading_ws(content);
         if !stripped.starts_with(b"@@") {
@@ -191,14 +294,14 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
         // but its trailing newline is kept, so neighbouring blocks stay apart.
         match classify(stripped)? {
             Directive::Bare(name) => {
-                out.extend_from_slice(&expand_call(name, Args::new(), templates_dir)?);
+                out.extend_from_slice(&expand_call(name, Args::new(), &mut defs, templates_dir)?);
                 out.extend_from_slice(newline);
                 i += 1;
             }
 
             Directive::OneLine(name, inner) => {
                 let args = parse_args(split_pairs(inner), name)?;
-                out.extend_from_slice(&expand_call(name, args, templates_dir)?);
+                out.extend_from_slice(&expand_call(name, args, &mut defs, templates_dir)?);
                 out.extend_from_slice(newline);
                 i += 1;
             }
@@ -206,13 +309,18 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
             Directive::MultiOpen(name) => {
                 let (segments, close) = gather_multiline(&lines, i + 1, name)?;
                 let args = parse_args(segments, name)?;
-                out.extend_from_slice(&expand_call(name, args, templates_dir)?);
+                out.extend_from_slice(&expand_call(name, args, &mut defs, templates_dir)?);
                 out.extend_from_slice(split_newline(lines[close]).1);
                 i = close + 1;
             }
         }
     }
 
+    if let Some(key) = defs.first_unused() {
+        return Err(ErrorKind::DefineUnused {
+            key: key.to_owned(),
+        });
+    }
     check_postconditions(&out)?;
     Ok(out)
 }
@@ -312,14 +420,122 @@ fn parse_args(segments: Vec<&[u8]>, name: &str) -> Result<Args, ErrorKind> {
     Ok(args)
 }
 
+/// Whether a stripped directive line heads an `@@define` (name exactly `define`,
+/// so `@@definers` and the like stay ordinary calls).
+fn is_define_directive(stripped: &[u8]) -> bool {
+    let after = match stripped.strip_prefix(b"@@") {
+        Some(after) => after,
+        None => return false,
+    };
+    let name_len = after.iter().take_while(|b| is_name(b)).count();
+    after.get(..name_len) == Some(b"define".as_slice())
+}
+
+/// Parse an `@@define key(…)` starting at line `i` (already known to head a
+/// define). Returns the key, its values, and the index of the last line the
+/// directive spans (its own line, or the closing `)` line for the multi-line
+/// form).
+fn parse_define(lines: &[&[u8]], i: usize) -> Result<(String, Vec<Vec<u8>>, usize), ErrorKind> {
+    let line = lines.get(i).copied().unwrap_or_default();
+    let stripped = strip_leading_ws(split_newline(line).0);
+    let rest = stripped.strip_prefix(b"@@define").unwrap_or_default();
+
+    // Exactly one space, then the key, then `(`.
+    let after_space = match rest.split_first() {
+        Some((&b' ', tail)) => tail,
+        _ => return Err(malformed(stripped)),
+    };
+    let key_len = after_space.iter().take_while(|b| is_name(b)).count();
+    let key = match std::str::from_utf8(after_space.get(..key_len).unwrap_or_default()) {
+        Ok(key) if key_len > 0 => key,
+        _ => return Err(malformed(stripped)),
+    };
+    let inside = match after_space.get(key_len..).and_then(<[u8]>::split_first) {
+        Some((&b'(', tail)) => tail,
+        _ => return Err(malformed(stripped)),
+    };
+
+    // `(` last on the line opens the multi-line form; otherwise `)` closes it here.
+    if inside.is_empty() {
+        let (values, end) = gather_define_values(lines, i + 1, key)?;
+        return Ok((key.to_owned(), values, end));
+    }
+
+    let content = match inside.split_last() {
+        Some((&b')', content)) if !content.is_empty() => content,
+        _ => return Err(malformed(stripped)),
+    };
+    let mut values = Vec::new();
+    for segment in content.split(|&b| b == b';') {
+        let value = trim_ws(segment);
+        if value.is_empty() {
+            return Err(malformed(stripped));
+        }
+        values.push(value.to_vec());
+    }
+    Ok((key.to_owned(), values, i))
+}
+
+/// Collect the `value;` lines of a multi-line `@@define`, from `start` to the
+/// lone `)` line whose index is returned. Every value line ends with `;` and
+/// there must be at least one — mirrors [`gather_multiline`].
+fn gather_define_values(
+    lines: &[&[u8]],
+    start: usize,
+    key: &str,
+) -> Result<(Vec<Vec<u8>>, usize), ErrorKind> {
+    let mut values = Vec::new();
+    let mut j = start;
+    loop {
+        let line = lines.get(j).ok_or_else(|| ErrorKind::UnterminatedDefine {
+            key: key.to_owned(),
+        })?;
+        let stripped = strip_leading_ws(split_newline(line).0);
+        if stripped == b")" {
+            if values.is_empty() {
+                return Err(malformed(stripped));
+            }
+            return Ok((values, j));
+        }
+
+        match stripped.split_last() {
+            Some((&b';', value)) => {
+                let value = trim_ws(value);
+                if value.is_empty() {
+                    return Err(malformed(stripped));
+                }
+                values.push(value.to_vec());
+            }
+            _ => return Err(malformed(stripped)),
+        }
+
+        j += 1;
+    }
+}
+
 /// Load the template for one directive and apply its args: slot lines, then
 /// inline placeholders, then the unused-key check. Returns the replacement text
 /// (no trailing newline — the directive line contributes its own).
-fn expand_call(name: &str, mut args: Args, templates_dir: &Path) -> Result<Vec<u8>, ErrorKind> {
+fn expand_call(
+    name: &str,
+    mut args: Args,
+    defs: &mut Definitions,
+    templates_dir: &Path,
+) -> Result<Vec<u8>, ErrorKind> {
     if RESERVED.contains(&name) {
         return Err(ErrorKind::Reserved {
             name: name.to_owned(),
         });
+    }
+
+    // A key comes from the call or a file definition, never both.
+    for entry in &args.entries {
+        if defs.index_of(&entry.key).is_some() {
+            return Err(ErrorKind::DefineCollision {
+                name: name.to_owned(),
+                key: entry.key.clone(),
+            });
+        }
     }
 
     let path = templates_dir.join(name).with_extension("baf");
@@ -332,8 +548,8 @@ fn expand_call(name: &str, mut args: Args, templates_dir: &Path) -> Result<Vec<u
     // A template ends with exactly one LF; the splice text drops it so the
     // directive line's own newline is the single separator that survives.
     let splice = template.strip_suffix(b"\n").unwrap_or(&template);
-    let after_slots = expand_slots(splice, &mut args);
-    let expanded = expand_inline(&after_slots, &mut args, name)?;
+    let after_slots = expand_slots(splice, &mut args, defs);
+    let expanded = expand_inline(&after_slots, &mut args, defs, name)?;
 
     match args.first_unused() {
         Some(key) => Err(ErrorKind::UnusedKey {
@@ -347,17 +563,16 @@ fn expand_call(name: &str, mut args: Args, templates_dir: &Path) -> Result<Vec<u
 /// Replace each slot line (`<ws>%key%` alone) with one line per value at the
 /// slot's indentation, or delete it when the key is absent. Non-slot lines pass
 /// through unchanged.
-fn expand_slots(splice: &[u8], args: &mut Args) -> Vec<u8> {
+fn expand_slots(splice: &[u8], args: &mut Args, defs: &mut Definitions) -> Vec<u8> {
     let mut out = Vec::with_capacity(splice.len());
     let mut first = true;
 
     for line in splice.split(|&b| b == b'\n') {
         match slot_key(line) {
             Some((indent_len, key)) => {
-                if let Some(idx) = args.index_of(key) {
-                    args.entries[idx].used = true;
+                if let Some(values) = resolve(args, defs, key) {
                     let indent = line.get(..indent_len).unwrap_or_default().to_vec();
-                    for value in &args.entries[idx].values {
+                    for value in values {
                         if !first {
                             out.push(b'\n');
                         }
@@ -385,22 +600,26 @@ fn expand_slots(splice: &[u8], args: &mut Args) -> Vec<u8> {
 /// Replace each remaining `%key%` with its single value. A provided key is
 /// marked used; an unprovided one is left for the postcondition to reject; a
 /// multi-value key used inline is a fatal error.
-fn expand_inline(buf: &[u8], args: &mut Args, name: &str) -> Result<Vec<u8>, ErrorKind> {
+fn expand_inline(
+    buf: &[u8],
+    args: &mut Args,
+    defs: &mut Definitions,
+    name: &str,
+) -> Result<Vec<u8>, ErrorKind> {
     let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
     while let Some(&b) = buf.get(i) {
         if let Some((key, end)) = placeholder_at(buf, i) {
-            match args.index_of(key) {
-                Some(idx) if args.entries[idx].values.len() > 1 => {
+            match resolve(args, defs, key) {
+                Some(values) if values.len() > 1 => {
                     return Err(ErrorKind::InlineMultiValue {
                         name: name.to_owned(),
                         key: key.to_owned(),
                     });
                 }
 
-                Some(idx) => {
-                    args.entries[idx].used = true;
-                    out.extend_from_slice(&args.entries[idx].values[0]);
+                Some(values) => {
+                    out.extend_from_slice(values.first().map(Vec::as_slice).unwrap_or_default());
                 }
 
                 None => out.extend_from_slice(buf.get(i..end).unwrap_or_default()),
@@ -413,6 +632,21 @@ fn expand_inline(buf: &[u8], args: &mut Args, name: &str) -> Result<Vec<u8>, Err
     }
 
     Ok(out)
+}
+
+/// Values bound to `key` — the call's args first, else a file definition —
+/// marking whichever source consumed. `None` if neither provides it (a slot then
+/// vanishes; an inline `%key%` is left for the postcondition to reject).
+fn resolve<'a>(args: &'a mut Args, defs: &'a mut Definitions, key: &str) -> Option<&'a [Vec<u8>]> {
+    if let Some(idx) = args.index_of(key) {
+        args.entries[idx].used = true;
+        return Some(&args.entries[idx].values);
+    }
+    if let Some(idx) = defs.index_of(key) {
+        defs.entries[idx].used = true;
+        return Some(&defs.entries[idx].values);
+    }
+    None
 }
 
 /// Reject the two whole-file leftovers the grammar forbids: a line that still
@@ -636,6 +870,55 @@ mod tests {
         // A required inline key left unprovided surfaces as a residual placeholder.
         assert!(kind(t.expand(b"@@inline\n")).contains("unresolved placeholder"));
         assert!(kind(t.expand(b"@@t(\n  a=1;\n")).contains("unterminated multi-line call @@t"));
+    }
+
+    #[test]
+    fn a_define_feeds_a_key_the_call_omits() {
+        // The call provides `verb`; `giveup` (a multi-value slot) comes from the
+        // file definition. The one-line and multi-line define forms agree, and
+        // the define's own lines leave no trace.
+        let t = Templates::with(&[("t", b"IF\n  %verb%\nTHEN\n  %giveup%\nEND\n")]);
+        let expect = b"IF\n  Detect\nTHEN\n  A\n  B\nEND\n";
+
+        let multi = b"@@define giveup(\n  A;\n  B;\n)\n@@t(verb=Detect)\n";
+        assert_eq!(t.expand(multi).expect("multi-line define"), expect);
+
+        let one = b"@@define giveup(A; B)\n@@t(verb=Detect)\n";
+        assert_eq!(t.expand(one).expect("one-line define"), expect);
+    }
+
+    #[test]
+    fn a_define_is_lazy_and_position_independent() {
+        // A template that never references the key is unaffected — no unused-key
+        // error — as long as some other call consumes the definition. The define
+        // may sit after the call that uses it.
+        let t = Templates::with(&[("uses", b"X(%k%)\n"), ("ignores", b"Y\n")]);
+        let src = b"@@ignores\n@@uses\n@@define k(v)\n";
+        assert_eq!(t.expand(src).expect("lazy define"), b"Y\nX(v)\n");
+    }
+
+    #[test]
+    fn define_misuse_is_rejected() {
+        let t = Templates::with(&[("t", b"%k%\n"), ("none", b"Z\n")]);
+        let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
+
+        // Two definitions for one key.
+        assert!(
+            kind(t.expand(b"@@define k(a)\n@@define k(b)\n@@t\n"))
+                .contains("duplicate @@define for key 'k'")
+        );
+        // Call passes a key that also has a definition.
+        assert!(kind(t.expand(b"@@define k(a)\n@@t(k=b)\n")).contains("also set by @@define"));
+        // A definition no call ever draws on.
+        assert!(kind(t.expand(b"@@define k(a)\n@@none\n")).contains("used by no call"));
+        // Multi-line define running off the end with no closing `)`.
+        assert!(
+            kind(t.expand(b"@@define k(\n  a;\n")).contains("unterminated multi-line @@define k")
+        );
+        // A span line that is neither `value;` nor the lone `)`.
+        assert!(kind(t.expand(b"@@define k(\n  a\n)\n@@t\n")).contains("malformed directive"));
+        // Zero-value define.
+        assert!(kind(t.expand(b"@@define k()\n@@t\n")).contains("malformed directive"));
     }
 
     #[test]
