@@ -56,7 +56,8 @@ Options:
   from this translation file (WeiDU's `USING` clause). Repeatable; a later file
   wins a shared `@N`.
 - `--templates <dir>` — with `--file` on a `.baf`, expand `@@name` directive
-  lines from `<dir>/name.baf` before compiling (an ImprovedAnvil mod convention).
+  lines from `<dir>/name.baf` (and `@@use(name)` definition imports from
+  `<dir>/defs/name.baf`) before compiling (an ImprovedAnvil mod convention).
 
 It runs against `./chitin.key` when present (so it works from a game root),
 otherwise `game/chitin.key`.
@@ -162,9 +163,10 @@ supports one such convention (ImprovedAnvil's): a whole line `@@name` is replace
 by `<dir>/name.baf` before compiling, so a shared fragment lives in one place. A
 directive may pass `@@name(key=value; …)` args (also written over several lines)
 that fill the template's `%key%` slot lines and inline placeholders. A file-scoped
-`@@define key(…)` supplies a key that calls omit, so a shared value lives in one
-place. An unknown template, a malformed directive, or a leftover placeholder is an
-error.
+`@@define key(…)` supplies a key that calls omit, and `@@use(name)` imports such
+definitions from a shared `<dir>/defs/name.baf`, so a value shared across scripts
+lives in one place. An unknown template, a malformed directive, or a leftover
+placeholder is an error.
 
 ```sh
 iediff --file S!hlkang.baf --templates ImprovedAnvil/scripts/_templates --out build

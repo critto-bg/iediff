@@ -2,7 +2,7 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v2.1); this
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v2.2); this
 //! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
@@ -16,15 +16,19 @@
 //!
 //! `@@define key(v1; v2; …)` binds a key at file scope: any call whose template
 //! references `key` but whose args omit it draws the definition's values, as if
-//! the call had passed them. Definitions are collected in a first pass (they are
-//! position-independent), then their own lines are dropped from the output.
+//! the call had passed them. `@@use(name)` imports the same kind of definitions
+//! from a shared defs file (`<templates-dir>/defs/name.baf`), which holds only
+//! definitions. Both are collected in a first pass (they are position-
+//! independent), then their own lines are dropped from the output; an imported
+//! definition is thereafter indistinguishable from an in-file one, bar the
+//! origin kept for error messages.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// Template names the grammar forbids in a call. `define` heads its own
-/// directive; `foreach`/`end` are reserved for a future loop form.
-const RESERVED: [&str; 3] = ["foreach", "end", "define"];
+/// Template names the grammar forbids in a call. `define`/`use` head their own
+/// directives; `foreach`/`end` are reserved for a future loop form.
+const RESERVED: [&str; 4] = ["foreach", "end", "define", "use"];
 
 /// The `key=value` pairs of one directive, in call order. Duplicate keys
 /// accumulate their values (a key may fill a multi-value slot); `used` drives
@@ -69,9 +73,10 @@ struct Entry {
     used: bool,
 }
 
-/// The file's `@@define` bindings — a fallback value source for calls that omit
-/// a key. `used` is set when some call draws on the definition; one left unused
-/// by every call is a fatal error, so a stale define never passes silently.
+/// The file's definition bindings — a fallback value source for calls that omit
+/// a key. Fed by in-file `@@define`s and `@@use`d imports alike; `used` is set
+/// when some call draws on a definition, and one left unused by every call is a
+/// fatal error, so a stale definition never passes silently.
 struct Definitions {
     entries: Vec<Def>,
 }
@@ -83,15 +88,31 @@ impl Definitions {
         }
     }
 
-    /// Record a definition, rejecting a second one for the same key.
-    fn insert(&mut self, key: String, values: Vec<Vec<u8>>) -> Result<(), ErrorKind> {
-        if self.entries.iter().any(|d| d.key == key) {
-            return Err(ErrorKind::DuplicateDefine { key });
+    /// Record a definition, rejecting a second one for the same key. `from` is
+    /// the defs file it was imported from, or `None` for an in-file `@@define`;
+    /// it origins the collision message (all in-file inserts precede imports, so
+    /// the older entry is never the more-remote one).
+    fn insert(
+        &mut self,
+        key: String,
+        values: Vec<Vec<u8>>,
+        from: Option<String>,
+    ) -> Result<(), ErrorKind> {
+        if let Some(prior) = self.entries.iter().find(|d| d.key == key) {
+            return Err(match (&prior.from, &from) {
+                (None, None) => ErrorKind::DuplicateDefine { key },
+                (first, second) => ErrorKind::DefineConflict {
+                    key,
+                    first: origin(first),
+                    second: origin(second),
+                },
+            });
         }
         self.entries.push(Def {
             key,
             values,
             used: false,
+            from,
         });
         Ok(())
     }
@@ -100,11 +121,8 @@ impl Definitions {
         self.entries.iter().position(|d| d.key == key)
     }
 
-    fn first_unused(&self) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|d| !d.used)
-            .map(|d| d.key.as_str())
+    fn first_unused(&self) -> Option<&Def> {
+        self.entries.iter().find(|d| !d.used)
     }
 }
 
@@ -112,6 +130,7 @@ struct Def {
     key: String,
     values: Vec<Vec<u8>>,
     used: bool,
+    from: Option<String>,
 }
 
 /// A preprocessing failure, naming the source `.baf` and the offending
@@ -131,7 +150,9 @@ impl fmt::Display for PreprocessError {
 impl std::error::Error for PreprocessError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
-            ErrorKind::UnknownTemplate { io, .. } => Some(io),
+            ErrorKind::UnknownTemplate { io, .. } | ErrorKind::MissingDefsFile { io, .. } => {
+                Some(io)
+            }
             _ => None,
         }
     }
@@ -140,6 +161,11 @@ impl std::error::Error for PreprocessError {
 #[derive(Debug)]
 enum ErrorKind {
     UnknownTemplate {
+        name: String,
+        path: PathBuf,
+        io: std::io::Error,
+    },
+    MissingDefsFile {
         name: String,
         path: PathBuf,
         io: std::io::Error,
@@ -168,15 +194,32 @@ enum ErrorKind {
     DuplicateDefine {
         key: String,
     },
+    DefineConflict {
+        key: String,
+        first: String,
+        second: String,
+    },
     UnterminatedDefine {
         key: String,
     },
     DefineCollision {
         name: String,
         key: String,
+        from: Option<String>,
     },
     DefineUnused {
         key: String,
+        from: Option<String>,
+    },
+    DuplicateUse {
+        name: String,
+    },
+    NonDefineContent {
+        name: String,
+        line: String,
+    },
+    EmptyDefsFile {
+        name: String,
     },
     ResidualDirective {
         line: String,
@@ -195,6 +238,9 @@ impl fmt::Display for ErrorKind {
                     "unknown template @@{name}: cannot read {}: {io}",
                     path.display()
                 )
+            }
+            ErrorKind::MissingDefsFile { name, path, io } => {
+                write!(f, "@@use({name}): cannot read {}: {io}", path.display())
             }
             ErrorKind::Reserved { name } => write!(f, "reserved directive name @@{name}"),
             ErrorKind::Malformed { line } => write!(f, "malformed directive: {line}"),
@@ -216,17 +262,30 @@ impl fmt::Display for ErrorKind {
             ErrorKind::DuplicateDefine { key } => {
                 write!(f, "duplicate @@define for key '{key}'")
             }
+            ErrorKind::DefineConflict { key, first, second } => {
+                write!(f, "key '{key}' is defined by both {first} and {second}")
+            }
             ErrorKind::UnterminatedDefine { key } => {
                 write!(f, "unterminated multi-line @@define {key}")
             }
-            ErrorKind::DefineCollision { name, key } => {
+            ErrorKind::DefineCollision { name, key, from } => {
                 write!(
                     f,
-                    "@@{name}: key '{key}' is also set by @@define; provide it in one place only"
+                    "@@{name}: key '{key}' is also set by {}; provide it in one place only",
+                    origin(from)
                 )
             }
-            ErrorKind::DefineUnused { key } => {
-                write!(f, "@@define {key} is used by no call")
+            ErrorKind::DefineUnused { key, from } => {
+                write!(f, "{} {key} is used by no call", origin(from))
+            }
+            ErrorKind::DuplicateUse { name } => {
+                write!(f, "duplicate @@use({name})")
+            }
+            ErrorKind::NonDefineContent { name, line } => {
+                write!(f, "defs file {name}: non-define content: {line}")
+            }
+            ErrorKind::EmptyDefsFile { name } => {
+                write!(f, "@@use({name}): defs file defines nothing")
             }
             ErrorKind::ResidualDirective { line } => {
                 write!(f, "unexpanded directive remains after expansion: {line}")
@@ -255,22 +314,38 @@ pub fn expand(
 fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKind> {
     let lines = physical_lines(source);
 
-    // Pass 1: collect every `@@define` (position-independent, file-scoped) and
-    // mark its lines so pass 2 drops them from the output.
+    // Pass 1: collect every `@@define` and `@@use` (both position-independent
+    // and file-scoped) and mark their lines so pass 2 drops them. Imports are
+    // read after all in-file definitions, so a key clash reports the import as
+    // the newcomer.
     let mut defs = Definitions::new();
+    let mut uses: Vec<String> = Vec::new();
     let mut consumed = vec![false; lines.len()];
     let mut i = 0;
     while let Some(&line) = lines.get(i) {
-        if is_define_directive(strip_leading_ws(split_newline(line).0)) {
+        let stripped = strip_leading_ws(split_newline(line).0);
+        if is_define_directive(stripped) {
             let (key, values, end) = parse_define(&lines, i)?;
-            defs.insert(key, values)?;
+            defs.insert(key, values, None)?;
             for slot in consumed.get_mut(i..=end).unwrap_or_default() {
                 *slot = true;
             }
             i = end + 1;
+        } else if let Some(name) = parse_use(stripped) {
+            if uses.contains(&name) {
+                return Err(ErrorKind::DuplicateUse { name });
+            }
+            uses.push(name);
+            if let Some(slot) = consumed.get_mut(i) {
+                *slot = true;
+            }
+            i += 1;
         } else {
             i += 1;
         }
+    }
+    for name in &uses {
+        import_defs(templates_dir, name, &mut defs)?;
     }
 
     // Pass 2: expand each call (drawing on the definitions), pass the rest through.
@@ -316,9 +391,10 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
         }
     }
 
-    if let Some(key) = defs.first_unused() {
+    if let Some(def) = defs.first_unused() {
         return Err(ErrorKind::DefineUnused {
-            key: key.to_owned(),
+            key: def.key.clone(),
+            from: def.from.clone(),
         });
     }
     check_postconditions(&out)?;
@@ -513,6 +589,58 @@ fn gather_define_values(
     }
 }
 
+/// The name of an `@@use(name)` directive line, or `None` if the stripped line
+/// is not a well-formed use. Grammar: `@@use(` ws* name ws* `)`.
+fn parse_use(stripped: &[u8]) -> Option<String> {
+    let after = strip_leading_ws(stripped.strip_prefix(b"@@use(")?);
+    let name_len = after.iter().take_while(|b| is_name(b)).count();
+    if name_len == 0 {
+        return None;
+    }
+    let name = std::str::from_utf8(after.get(..name_len)?).ok()?;
+    (strip_leading_ws(after.get(name_len..)?) == b")").then(|| name.to_owned())
+}
+
+/// Read `<templates-dir>/defs/<name>.baf` and fold its definitions into `defs`
+/// (origin `name`). A defs file holds only definitions, blank lines, and `//`
+/// comments; any other content — a template call, a nested `@@use` — is a fatal
+/// error, as is one contributing no definitions.
+fn import_defs(templates_dir: &Path, name: &str, defs: &mut Definitions) -> Result<(), ErrorKind> {
+    let path = templates_dir.join("defs").join(name).with_extension("baf");
+    let content = std::fs::read(&path).map_err(|io| ErrorKind::MissingDefsFile {
+        name: name.to_owned(),
+        path,
+        io,
+    })?;
+
+    let lines = physical_lines(&content);
+    let mut count = 0;
+    let mut i = 0;
+    while let Some(&line) = lines.get(i) {
+        let stripped = strip_leading_ws(split_newline(line).0);
+        if stripped.is_empty() || stripped.starts_with(b"//") {
+            i += 1;
+        } else if is_define_directive(stripped) {
+            let (key, values, end) = parse_define(&lines, i)?;
+            defs.insert(key, values, Some(name.to_owned()))?;
+            count += 1;
+            i = end + 1;
+        } else {
+            return Err(ErrorKind::NonDefineContent {
+                name: name.to_owned(),
+                line: lossy(stripped),
+            });
+        }
+    }
+
+    if count == 0 {
+        return Err(ErrorKind::EmptyDefsFile {
+            name: name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Load the template for one directive and apply its args: slot lines, then
 /// inline placeholders, then the unused-key check. Returns the replacement text
 /// (no trailing newline — the directive line contributes its own).
@@ -530,10 +658,11 @@ fn expand_call(
 
     // A key comes from the call or a file definition, never both.
     for entry in &args.entries {
-        if defs.index_of(&entry.key).is_some() {
+        if let Some(idx) = defs.index_of(&entry.key) {
             return Err(ErrorKind::DefineCollision {
                 name: name.to_owned(),
                 key: entry.key.clone(),
+                from: defs.entries.get(idx).and_then(|d| d.from.clone()),
             });
         }
     }
@@ -759,6 +888,15 @@ fn malformed(line: &[u8]) -> ErrorKind {
     ErrorKind::Malformed { line: lossy(line) }
 }
 
+/// Name a definition's origin for a collision message: the `@@use` that imported
+/// it, or the in-file `@@define`.
+fn origin(from: &Option<String>) -> String {
+    match from {
+        Some(name) => format!("@@use({name})"),
+        None => "@@define".to_owned(),
+    }
+}
+
 fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -785,7 +923,11 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("create templates dir");
             for (name, body) in fragments {
-                fs::write(dir.join(name).with_extension("baf"), body).expect("write fragment");
+                let path = dir.join(name).with_extension("baf");
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).expect("create fragment dir");
+                }
+                fs::write(path, body).expect("write fragment");
             }
             Templates { dir }
         }
@@ -919,6 +1061,59 @@ mod tests {
         assert!(kind(t.expand(b"@@define k(\n  a\n)\n@@t\n")).contains("malformed directive"));
         // Zero-value define.
         assert!(kind(t.expand(b"@@define k()\n@@t\n")).contains("malformed directive"));
+    }
+
+    #[test]
+    fn an_imported_define_feeds_a_key_the_call_omits() {
+        // `@@use` pulls the `giveup` definition from a shared defs file; it fills
+        // the template's slot exactly as an in-file define would, and both the
+        // use line and the defs file leave no trace in the output.
+        let t = Templates::with(&[
+            ("t", b"IF\n  %verb%\nTHEN\n  %giveup%\nEND\n"),
+            (
+                "defs/shared",
+                b"// shared across scripts\n@@define giveup(\n  A;\n  B;\n)\n",
+            ),
+        ]);
+        assert_eq!(
+            t.expand(b"@@use(shared)\n@@t(verb=Detect)\n")
+                .expect("import"),
+            b"IF\n  Detect\nTHEN\n  A\n  B\nEND\n"
+        );
+    }
+
+    #[test]
+    fn use_misuse_is_rejected() {
+        let t = Templates::with(&[
+            ("t", b"%k%\n"),
+            ("none", b"Z\n"),
+            ("defs/a", b"@@define k(x)\n"),
+            ("defs/b", b"@@define k(y)\n"),
+            ("defs/empty", b"// nothing here\n"),
+            ("defs/bad", b"@@define k(x)\nCallSomething()\n"),
+        ]);
+        let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
+
+        // Missing defs file.
+        assert!(kind(t.expand(b"@@use(nope)\n@@t\n")).contains("cannot read"));
+        // The same defs file imported twice.
+        assert!(kind(t.expand(b"@@use(a)\n@@use(a)\n@@t\n")).contains("duplicate @@use(a)"));
+        // A defs file line that is neither a definition, blank, nor a comment.
+        assert!(kind(t.expand(b"@@use(bad)\n@@t\n")).contains("non-define content"));
+        // A defs file that binds nothing.
+        assert!(kind(t.expand(b"@@use(empty)\n@@t\n")).contains("defines nothing"));
+        // A key bound both in-file and by an import.
+        assert!(
+            kind(t.expand(b"@@use(a)\n@@define k(z)\n@@t\n"))
+                .contains("defined by both @@define and @@use(a)")
+        );
+        // The same key from two different imports.
+        assert!(
+            kind(t.expand(b"@@use(a)\n@@use(b)\n@@t\n"))
+                .contains("defined by both @@use(a) and @@use(b)")
+        );
+        // An imported definition no call ever draws on.
+        assert!(kind(t.expand(b"@@use(a)\n@@none\n")).contains("used by no call"));
     }
 
     #[test]
