@@ -2,7 +2,7 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v2.2); this
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v3); this
 //! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
@@ -13,6 +13,11 @@
 //! deleted when the key is absent) and its inline `%key%` placeholders. The
 //! spliced text is inserted verbatim and never rescanned; after every directive
 //! is expanded, a leftover `@@` line or `%token%` anywhere is a fatal error.
+//!
+//! A template body may wrap a run of lines in `@@foreach(key)` … `@@end`: the
+//! block is emitted once per value of `key`, blank-line separated, with `%key%`
+//! bound to that one value. Regions are a template-only form — in a source
+//! `foreach` and `end` stay reserved names.
 //!
 //! `@@define key(v1; v2; …)` binds a key at file scope: any call whose template
 //! references `key` but whose args omit it draws the definition's values, as if
@@ -27,7 +32,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Template names the grammar forbids in a call. `define`/`use` head their own
-/// directives; `foreach`/`end` are reserved for a future loop form.
+/// directives; `foreach`/`end` delimit a template's iteration regions.
 const RESERVED: [&str; 4] = ["foreach", "end", "define", "use"];
 
 /// The `key=value` pairs of one directive, in call order. Duplicate keys
@@ -221,6 +226,33 @@ enum ErrorKind {
     EmptyDefsFile {
         name: String,
     },
+    MalformedForeach {
+        name: String,
+        line: String,
+    },
+    NestedRegion {
+        name: String,
+        key: String,
+    },
+    UnterminatedRegion {
+        name: String,
+        key: String,
+    },
+    UnopenedRegion {
+        name: String,
+    },
+    EmptyRegion {
+        name: String,
+        key: String,
+    },
+    RegionKeyAbsent {
+        name: String,
+        key: String,
+    },
+    IteratedOutsideRegion {
+        name: String,
+        key: String,
+    },
     ResidualDirective {
         line: String,
     },
@@ -287,6 +319,33 @@ impl fmt::Display for ErrorKind {
             ErrorKind::EmptyDefsFile { name } => {
                 write!(f, "@@use({name}): defs file defines nothing")
             }
+            ErrorKind::MalformedForeach { name, line } => {
+                write!(f, "@@{name}: malformed @@foreach line: {line}")
+            }
+            ErrorKind::NestedRegion { name, key } => {
+                write!(
+                    f,
+                    "@@{name}: nested @@foreach region inside @@foreach({key})"
+                )
+            }
+            ErrorKind::UnterminatedRegion { name, key } => {
+                write!(f, "@@{name}: unterminated @@foreach({key}) region")
+            }
+            ErrorKind::UnopenedRegion { name } => {
+                write!(f, "@@{name}: @@end without @@foreach")
+            }
+            ErrorKind::EmptyRegion { name, key } => {
+                write!(f, "@@{name}: empty @@foreach({key}) region")
+            }
+            ErrorKind::RegionKeyAbsent { name, key } => {
+                write!(f, "@@{name}: @@foreach key '{key}' is not provided")
+            }
+            ErrorKind::IteratedOutsideRegion { name, key } => {
+                write!(
+                    f,
+                    "@@{name}: iterated key '{key}' referenced outside its @@foreach region"
+                )
+            }
             ErrorKind::ResidualDirective { line } => {
                 write!(f, "unexpanded directive remains after expansion: {line}")
             }
@@ -324,14 +383,14 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
     let mut i = 0;
     while let Some(&line) = lines.get(i) {
         let stripped = strip_leading_ws(split_newline(line).0);
-        if is_define_directive(stripped) {
+        if is_directive(stripped, b"define") {
             let (key, values, end) = parse_define(&lines, i)?;
             defs.insert(key, values, None)?;
             for slot in consumed.get_mut(i..=end).unwrap_or_default() {
                 *slot = true;
             }
             i = end + 1;
-        } else if let Some(name) = parse_use(stripped) {
+        } else if let Some(name) = parse_paren_name(stripped, b"@@use(") {
             if uses.contains(&name) {
                 return Err(ErrorKind::DuplicateUse { name });
             }
@@ -496,15 +555,17 @@ fn parse_args(segments: Vec<&[u8]>, name: &str) -> Result<Args, ErrorKind> {
     Ok(args)
 }
 
-/// Whether a stripped directive line heads an `@@define` (name exactly `define`,
-/// so `@@definers` and the like stay ordinary calls).
-fn is_define_directive(stripped: &[u8]) -> bool {
+/// Whether a stripped directive line heads the directive `head` — its name is
+/// exactly that, so a template whose name merely starts with it (`@@definers`)
+/// stays an ordinary call. Matches a malformed head too, so the specific error
+/// can be reported over "malformed directive".
+fn is_directive(stripped: &[u8], head: &[u8]) -> bool {
     let after = match stripped.strip_prefix(b"@@") {
         Some(after) => after,
         None => return false,
     };
     let name_len = after.iter().take_while(|b| is_name(b)).count();
-    after.get(..name_len) == Some(b"define".as_slice())
+    after.get(..name_len) == Some(head)
 }
 
 /// Parse an `@@define key(…)` starting at line `i` (already known to head a
@@ -589,10 +650,11 @@ fn gather_define_values(
     }
 }
 
-/// The name of an `@@use(name)` directive line, or `None` if the stripped line
-/// is not a well-formed use. Grammar: `@@use(` ws* name ws* `)`.
-fn parse_use(stripped: &[u8]) -> Option<String> {
-    let after = strip_leading_ws(stripped.strip_prefix(b"@@use(")?);
+/// The lone name a directive line carries after `prefix` — the shape shared by
+/// `@@use(name)` and `@@foreach(key)`: `prefix` ws* name ws* `)`. `None` if the
+/// line does not match.
+fn parse_paren_name(stripped: &[u8], prefix: &[u8]) -> Option<String> {
+    let after = strip_leading_ws(stripped.strip_prefix(prefix)?);
     let name_len = after.iter().take_while(|b| is_name(b)).count();
     if name_len == 0 {
         return None;
@@ -620,7 +682,7 @@ fn import_defs(templates_dir: &Path, name: &str, defs: &mut Definitions) -> Resu
         let stripped = strip_leading_ws(split_newline(line).0);
         if stripped.is_empty() || stripped.starts_with(b"//") {
             i += 1;
-        } else if is_define_directive(stripped) {
+        } else if is_directive(stripped, b"define") {
             let (key, values, end) = parse_define(&lines, i)?;
             defs.insert(key, values, Some(name.to_owned()))?;
             count += 1;
@@ -641,9 +703,10 @@ fn import_defs(templates_dir: &Path, name: &str, defs: &mut Definitions) -> Resu
     Ok(())
 }
 
-/// Load the template for one directive and apply its args: slot lines, then
-/// inline placeholders, then the unused-key check. Returns the replacement text
-/// (no trailing newline — the directive line contributes its own).
+/// Load the template for one directive and apply its args: iteration regions,
+/// then slot lines, then inline placeholders, then the unused-key check. Returns
+/// the replacement text (no trailing newline — the directive line contributes
+/// its own).
 fn expand_call(
     name: &str,
     mut args: Args,
@@ -677,8 +740,9 @@ fn expand_call(
     // A template ends with exactly one LF; the splice text drops it so the
     // directive line's own newline is the single separator that survives.
     let splice = template.strip_suffix(b"\n").unwrap_or(&template);
-    let after_slots = expand_slots(splice, &mut args, defs);
-    let expanded = expand_inline(&after_slots, &mut args, defs, name)?;
+    let (after_regions, iterated) = expand_regions(splice, &mut args, defs, name)?;
+    let after_slots = expand_slots(&after_regions, &mut args, defs, &iterated, name)?;
+    let expanded = expand_inline(&after_slots, &mut args, defs, &iterated, name)?;
 
     match args.first_unused() {
         Some(key) => Err(ErrorKind::UnusedKey {
@@ -689,41 +753,173 @@ fn expand_call(
     }
 }
 
+/// Step 0: replace each `@@foreach(key)` … `@@end` region (the delimiters
+/// included) with one instance of its body per value of `key`, in value order
+/// and separated by a blank line, `%key%` bound to that one value. Returns the
+/// rewritten splice text and the keys the regions consumed.
+fn expand_regions(
+    splice: &[u8],
+    args: &mut Args,
+    defs: &mut Definitions,
+    name: &str,
+) -> Result<(Vec<u8>, Vec<String>), ErrorKind> {
+    let lines: Vec<&[u8]> = splice.split(|&b| b == b'\n').collect();
+    let mut out = Vec::with_capacity(splice.len());
+    let mut iterated: Vec<String> = Vec::new();
+    let mut first = true;
+    let mut i = 0;
+
+    while let Some(&line) = lines.get(i) {
+        let stripped = strip_leading_ws(line);
+        if !is_directive(stripped, b"foreach") {
+            if stripped == b"@@end" {
+                return Err(ErrorKind::UnopenedRegion {
+                    name: name.to_owned(),
+                });
+            }
+            push_line(&mut out, &mut first, line);
+            i += 1;
+            continue;
+        }
+
+        let key = parse_paren_name(stripped, b"@@foreach(").ok_or_else(|| {
+            ErrorKind::MalformedForeach {
+                name: name.to_owned(),
+                line: lossy(stripped),
+            }
+        })?;
+
+        // Regions do not nest, so the first `@@end` closes this one and an
+        // opener before it is an error rather than an inner region.
+        let mut close = i + 1;
+        loop {
+            let inner = lines
+                .get(close)
+                .copied()
+                .ok_or_else(|| ErrorKind::UnterminatedRegion {
+                    name: name.to_owned(),
+                    key: key.clone(),
+                })?;
+            let inner = strip_leading_ws(inner);
+            if inner == b"@@end" {
+                break;
+            }
+            if is_directive(inner, b"foreach") {
+                return Err(ErrorKind::NestedRegion {
+                    name: name.to_owned(),
+                    key,
+                });
+            }
+            close += 1;
+        }
+        if close == i + 1 {
+            return Err(ErrorKind::EmptyRegion {
+                name: name.to_owned(),
+                key,
+            });
+        }
+
+        // Unlike a slot, an iterated key has no absent form: there is no
+        // sensible number of instances to emit.
+        let values = match resolve(args, defs, &key) {
+            Some(values) => values.to_vec(),
+            None => {
+                return Err(ErrorKind::RegionKeyAbsent {
+                    name: name.to_owned(),
+                    key,
+                });
+            }
+        };
+        for (n, value) in values.iter().enumerate() {
+            if n > 0 {
+                push_line(&mut out, &mut first, b"");
+            }
+            // A slot line of the iterated key is `<ws>%key%`, so substituting a
+            // single value in place leaves exactly the slot's indentation.
+            for &body in lines.get(i + 1..close).unwrap_or_default() {
+                push_line(&mut out, &mut first, &substitute(body, &key, value));
+            }
+        }
+
+        if !iterated.contains(&key) {
+            iterated.push(key);
+        }
+        i = close + 1;
+    }
+
+    Ok((out, iterated))
+}
+
+/// Replace every `%key%` in one line with `value`, leaving other keys'
+/// placeholders for the later passes.
+fn substitute(line: &[u8], key: &str, value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(line.len());
+    let mut i = 0;
+    while let Some(&b) = line.get(i) {
+        match placeholder_at(line, i) {
+            Some((found, end)) => {
+                match found == key {
+                    true => out.extend_from_slice(value),
+                    false => out.extend_from_slice(line.get(i..end).unwrap_or_default()),
+                }
+                i = end;
+            }
+            None => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
+
+/// Reject a reference to a key some region already consumed: its values belong
+/// to the instances, so a slot or `%key%` outside every region of that key has
+/// no value left to take.
+fn reject_iterated(iterated: &[String], key: &str, name: &str) -> Result<(), ErrorKind> {
+    match iterated.iter().any(|k| k == key) {
+        true => Err(ErrorKind::IteratedOutsideRegion {
+            name: name.to_owned(),
+            key: key.to_owned(),
+        }),
+        false => Ok(()),
+    }
+}
+
 /// Replace each slot line (`<ws>%key%` alone) with one line per value at the
 /// slot's indentation, or delete it when the key is absent. Non-slot lines pass
 /// through unchanged.
-fn expand_slots(splice: &[u8], args: &mut Args, defs: &mut Definitions) -> Vec<u8> {
+fn expand_slots(
+    splice: &[u8],
+    args: &mut Args,
+    defs: &mut Definitions,
+    iterated: &[String],
+    name: &str,
+) -> Result<Vec<u8>, ErrorKind> {
     let mut out = Vec::with_capacity(splice.len());
     let mut first = true;
 
     for line in splice.split(|&b| b == b'\n') {
         match slot_key(line) {
             Some((indent_len, key)) => {
+                reject_iterated(iterated, key, name)?;
                 if let Some(values) = resolve(args, defs, key) {
                     let indent = line.get(..indent_len).unwrap_or_default().to_vec();
                     for value in values {
-                        if !first {
-                            out.push(b'\n');
-                        }
-                        first = false;
-                        out.extend_from_slice(&indent);
-                        out.extend_from_slice(value);
+                        let mut expanded = indent.clone();
+                        expanded.extend_from_slice(value);
+                        push_line(&mut out, &mut first, &expanded);
                     }
                 }
                 // Absent key: emit nothing, so the line and its separator vanish.
             }
 
-            None => {
-                if !first {
-                    out.push(b'\n');
-                }
-                first = false;
-                out.extend_from_slice(line);
-            }
+            None => push_line(&mut out, &mut first, line),
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Replace each remaining `%key%` with its single value. A provided key is
@@ -733,12 +929,14 @@ fn expand_inline(
     buf: &[u8],
     args: &mut Args,
     defs: &mut Definitions,
+    iterated: &[String],
     name: &str,
 ) -> Result<Vec<u8>, ErrorKind> {
     let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
     while let Some(&b) = buf.get(i) {
         if let Some((key, end)) = placeholder_at(buf, i) {
+            reject_iterated(iterated, key, name)?;
             match resolve(args, defs, key) {
                 Some(values) if values.len() > 1 => {
                     return Err(ErrorKind::InlineMultiValue {
@@ -849,6 +1047,16 @@ fn physical_lines(buf: &[u8]) -> Vec<&[u8]> {
     }
 
     lines
+}
+
+/// Append one line to a buffer of LF-joined lines (no trailing LF), tracking
+/// whether the buffer is still empty so no separator leads the first line.
+fn push_line(out: &mut Vec<u8>, first: &mut bool, line: &[u8]) {
+    if !*first {
+        out.push(b'\n');
+    }
+    *first = false;
+    out.extend_from_slice(line);
 }
 
 /// Split a physical line into its content and its terminator (`b"\n"` or empty).
@@ -1114,6 +1322,69 @@ mod tests {
         );
         // An imported definition no call ever draws on.
         assert!(kind(t.expand(b"@@use(a)\n@@none\n")).contains("used by no call"));
+    }
+
+    #[test]
+    fn a_foreach_region_repeats_its_block_per_value() {
+        // The region is emitted once per value of `who`, blank-line separated,
+        // with `%who%` bound to that value alone. A non-iterated key inside the
+        // region behaves as anywhere else: its slot expands its full list in
+        // every instance.
+        let t = Templates::with(&[(
+            "t",
+            b"IF\n@@foreach(who)\n  See(%who%)\n  %extra%\n@@end\nEND\n",
+        )]);
+        assert_eq!(
+            t.expand(b"@@t(who=A; who=B; extra=X)\n").expect("region"),
+            b"IF\n  See(A)\n  X\n\n  See(B)\n  X\nEND\n"
+        );
+        assert_eq!(
+            t.expand(b"@@t(who=A; who=B; extra=X; extra=Y)\n")
+                .expect("region"),
+            b"IF\n  See(A)\n  X\n  Y\n\n  See(B)\n  X\n  Y\nEND\n"
+        );
+    }
+
+    #[test]
+    fn every_region_of_a_key_iterates_the_whole_list() {
+        // Two regions for one key, mirroring multi-slot behaviour; the values may
+        // come from a definition, and one region consumes the key for the whole
+        // template (no unused-key error).
+        let t = Templates::with(&[(
+            "t",
+            b"@@foreach(k)\nP(%k%)\n@@end\n@@foreach(k)\nQ(%k%)\n@@end\n",
+        )]);
+        assert_eq!(
+            t.expand(b"@@define k(1; 2)\n@@t\n").expect("two regions"),
+            b"P(1)\n\nP(2)\nQ(1)\n\nQ(2)\n"
+        );
+    }
+
+    #[test]
+    fn foreach_misuse_is_rejected() {
+        let t = Templates::with(&[
+            ("nest", b"@@foreach(k)\n@@foreach(j)\nX\n@@end\n@@end\n"),
+            ("unterm", b"@@foreach(k)\nX\n"),
+            ("stray", b"X\n@@end\n"),
+            ("empty", b"@@foreach(k)\n@@end\n"),
+            ("bad", b"@@foreach k\n"),
+            ("absent", b"@@foreach(k)\nX(%k%)\n@@end\n"),
+            ("slot", b"@@foreach(k)\nX(%k%)\n@@end\n%k%\n"),
+            ("inline", b"@@foreach(k)\nX(%k%)\n@@end\nY(%k%)\n"),
+        ]);
+        let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
+
+        assert!(kind(t.expand(b"@@nest(k=1; j=2)\n")).contains("nested @@foreach region"));
+        assert!(kind(t.expand(b"@@unterm(k=1)\n")).contains("unterminated @@foreach(k) region"));
+        assert!(kind(t.expand(b"@@stray\n")).contains("@@end without @@foreach"));
+        assert!(kind(t.expand(b"@@empty(k=1)\n")).contains("empty @@foreach(k) region"));
+        assert!(kind(t.expand(b"@@bad\n")).contains("malformed @@foreach line"));
+        // A region whose key the call never provides has no instance count.
+        assert!(kind(t.expand(b"@@absent\n")).contains("@@foreach key 'k' is not provided"));
+        // The iterated key is spent by the region: a slot or inline use outside it
+        // has nothing left to take.
+        assert!(kind(t.expand(b"@@slot(k=1)\n")).contains("iterated key 'k' referenced outside"));
+        assert!(kind(t.expand(b"@@inline(k=1)\n")).contains("iterated key 'k' referenced outside"));
     }
 
     #[test]
