@@ -164,9 +164,11 @@ by `<dir>/name.baf` before compiling, so a shared fragment lives in one place. A
 directive may pass `@@name(key=value; …)` args (also written over several lines)
 that fill the template's `%key%` slot lines and inline placeholders. A template
 may repeat a whole block per value by wrapping it in `@@foreach(key)` … `@@end`.
-A file-scoped `@@define key(…)` supplies a key that calls omit, and `@@use(name)` imports such
-definitions from a shared `<dir>/defs/name.baf`, so a value shared across scripts
-lives in one place; a single call opts out of a definition with `key=@none`. An
+A file-scoped `@@define key(…)` supplies a key that calls omit, and `@@use(name)`
+imports such definitions from a shared `<dir>/defs/name.baf`, so a value shared
+across scripts lives in one place. A template may open with `@@default key(…)`
+lines of its own — the last resort when neither the call nor a definition
+provides the key — and a single call opts out of either with `key=@none`. An
 unknown template, a malformed directive, or a leftover placeholder is an error.
 
 ```sh

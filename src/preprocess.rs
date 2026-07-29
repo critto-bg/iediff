@@ -2,7 +2,7 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v3.1); this
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v3.2); this
 //! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
@@ -32,13 +32,19 @@
 //! excluded from that call alone, as if it had never been provided, so its slot
 //! lines vanish. It is an opt-out, not an override — there is no form that
 //! replaces a definition's values.
+//!
+//! A template may in turn open with a block of `@@default key(…)` lines naming
+//! its own fallbacks, giving one precedence: the call's args, else a definition,
+//! else the template's default. Unlike a definition, a default no call ever
+//! reaches is not an error — whether it is needed is a property of the corpus,
+//! not of any one file.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// Template names the grammar forbids in a call. `define`/`use` head their own
-/// directives; `foreach`/`end` delimit a template's iteration regions.
-const RESERVED: [&str; 4] = ["foreach", "end", "define", "use"];
+/// Template names the grammar forbids in a call. `define`/`use`/`default` head
+/// their own directives; `foreach`/`end` delimit a template's iteration regions.
+const RESERVED: [&str; 5] = ["foreach", "end", "define", "use", "default"];
 
 /// The arg value that suppresses a key, reserved as a definition value so the
 /// two readings can never collide.
@@ -162,6 +168,14 @@ struct Def {
     from: Option<String>,
 }
 
+/// One `@@default` from a template's opening block: the values a call falls back
+/// to when neither its args nor a definition provide the key. No `used` flag —
+/// a default reached by no call is not an error, unlike a definition.
+struct Binding {
+    key: String,
+    values: Vec<Vec<u8>>,
+}
+
 /// A preprocessing failure, naming the source `.baf` and the offending
 /// construct. All are fatal — a mod that ships a bad directive must not compile.
 #[derive(Debug)]
@@ -228,7 +242,8 @@ enum ErrorKind {
         first: String,
         second: String,
     },
-    UnterminatedDefine {
+    UnterminatedBinding {
+        head: &'static str,
         key: String,
     },
     DefineCollision {
@@ -251,6 +266,7 @@ enum ErrorKind {
         name: String,
     },
     ReservedValue {
+        head: &'static str,
         key: String,
     },
     SuppressMixed {
@@ -261,7 +277,7 @@ enum ErrorKind {
         name: String,
         key: String,
     },
-    SuppressNoDefine {
+    SuppressUnbound {
         name: String,
         key: String,
     },
@@ -274,6 +290,21 @@ enum ErrorKind {
         key: String,
     },
     SuppressUnreferenced {
+        name: String,
+        key: String,
+    },
+    DefaultInSource {
+        line: String,
+    },
+    DefaultMisplaced {
+        name: String,
+        line: String,
+    },
+    DuplicateDefault {
+        name: String,
+        key: String,
+    },
+    DefaultUnreferenced {
         name: String,
         key: String,
     },
@@ -348,8 +379,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::DefineConflict { key, first, second } => {
                 write!(f, "key '{key}' is defined by both {first} and {second}")
             }
-            ErrorKind::UnterminatedDefine { key } => {
-                write!(f, "unterminated multi-line @@define {key}")
+            ErrorKind::UnterminatedBinding { head, key } => {
+                write!(f, "unterminated multi-line @@{head} {key}")
             }
             ErrorKind::DefineCollision { name, key, from } => {
                 write!(
@@ -370,8 +401,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::EmptyDefsFile { name } => {
                 write!(f, "@@use({name}): defs file defines nothing")
             }
-            ErrorKind::ReservedValue { key } => {
-                write!(f, "@@define {key}: '@none' is reserved as a value")
+            ErrorKind::ReservedValue { head, key } => {
+                write!(f, "@@{head} {key}: '@none' is reserved as a value")
             }
             ErrorKind::SuppressMixed { name, key } => {
                 write!(f, "@@{name}: key '{key}' is given both a value and @none")
@@ -379,10 +410,10 @@ impl fmt::Display for ErrorKind {
             ErrorKind::SuppressRepeated { name, key } => {
                 write!(f, "@@{name}: repeated @none for key '{key}'")
             }
-            ErrorKind::SuppressNoDefine { name, key } => {
+            ErrorKind::SuppressUnbound { name, key } => {
                 write!(
                     f,
-                    "@@{name}: @none for key '{key}', which has no definition to suppress"
+                    "@@{name}: @none for key '{key}', which has no definition or default to suppress"
                 )
             }
             ErrorKind::SuppressInline { name, key } => {
@@ -396,6 +427,21 @@ impl fmt::Display for ErrorKind {
             }
             ErrorKind::SuppressUnreferenced { name, key } => {
                 write!(f, "@@{name}: @none key '{key}' is not referenced by a slot")
+            }
+            ErrorKind::DefaultInSource { line } => {
+                write!(f, "@@default is valid only in a template: {line}")
+            }
+            ErrorKind::DefaultMisplaced { name, line } => {
+                write!(f, "@@{name}: @@default outside the opening block: {line}")
+            }
+            ErrorKind::DuplicateDefault { name, key } => {
+                write!(f, "@@{name}: duplicate @@default for key '{key}'")
+            }
+            ErrorKind::DefaultUnreferenced { name, key } => {
+                write!(
+                    f,
+                    "@@{name}: @@default key '{key}' is not referenced by the template"
+                )
             }
             ErrorKind::MalformedForeach { name, line } => {
                 write!(f, "@@{name}: malformed @@foreach line: {line}")
@@ -461,8 +507,15 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
     let mut i = 0;
     while let Some(&line) = lines.get(i) {
         let stripped = strip_leading_ws(split_newline(line).0);
-        if is_directive(stripped, b"define") {
-            let (key, values, end) = parse_define(&lines, i)?;
+        if is_binding(stripped, b"default") {
+            // A default belongs to a template's opening block; in a source it can
+            // only be a stray. (The keyless `@@default(…)` is an ordinary call,
+            // caught by the reserved-name check.)
+            return Err(ErrorKind::DefaultInSource {
+                line: lossy(stripped),
+            });
+        } else if is_directive(stripped, b"define") {
+            let (key, values, end) = parse_binding(&lines, i, "define")?;
             defs.insert(key, values, None)?;
             for slot in consumed.get_mut(i..=end).unwrap_or_default() {
                 *slot = true;
@@ -669,14 +722,33 @@ fn is_directive(stripped: &[u8], head: &[u8]) -> bool {
     after.get(..name_len) == Some(head)
 }
 
-/// Parse an `@@define key(…)` starting at line `i` (already known to head a
-/// define). Returns the key, its values, and the index of the last line the
-/// directive spans (its own line, or the closing `)` line for the multi-line
-/// form).
-fn parse_define(lines: &[&[u8]], i: usize) -> Result<(String, Vec<Vec<u8>>, usize), ErrorKind> {
+/// Whether a stripped line opens the spaced binding form `@@<head> key(…)` —
+/// what separates a `@@define`/`@@default` directive from a call of that name,
+/// which carries its parens straight after the name.
+fn is_binding(stripped: &[u8], head: &[u8]) -> bool {
+    matches!(
+        stripped
+            .strip_prefix(b"@@")
+            .and_then(|r| r.strip_prefix(head)),
+        Some([b' ', ..])
+    )
+}
+
+/// Parse a `@@<head> key(…)` binding starting at line `i` (already known to head
+/// one) — the shape `@@define` and `@@default` share. Returns the key, its
+/// values, and the index of the last line the directive spans (its own line, or
+/// the closing `)` line for the multi-line form).
+fn parse_binding(
+    lines: &[&[u8]],
+    i: usize,
+    head: &'static str,
+) -> Result<(String, Vec<Vec<u8>>, usize), ErrorKind> {
     let line = lines.get(i).copied().unwrap_or_default();
     let stripped = strip_leading_ws(split_newline(line).0);
-    let rest = stripped.strip_prefix(b"@@define").unwrap_or_default();
+    let rest = stripped
+        .strip_prefix(b"@@")
+        .and_then(|r| r.strip_prefix(head.as_bytes()))
+        .unwrap_or_default();
 
     // Exactly one space, then the key, then `(`.
     let after_space = match rest.split_first() {
@@ -695,7 +767,7 @@ fn parse_define(lines: &[&[u8]], i: usize) -> Result<(String, Vec<Vec<u8>>, usiz
 
     // `(` last on the line opens the multi-line form; otherwise `)` closes it here.
     if inside.is_empty() {
-        let (values, end) = gather_define_values(lines, i + 1, key)?;
+        let (values, end) = gather_binding_values(lines, i + 1, head, key)?;
         return Ok((key.to_owned(), values, end));
     }
 
@@ -711,6 +783,7 @@ fn parse_define(lines: &[&[u8]], i: usize) -> Result<(String, Vec<Vec<u8>>, usiz
         }
         if value == SUPPRESS {
             return Err(ErrorKind::ReservedValue {
+                head,
                 key: key.to_owned(),
             });
         }
@@ -719,18 +792,20 @@ fn parse_define(lines: &[&[u8]], i: usize) -> Result<(String, Vec<Vec<u8>>, usiz
     Ok((key.to_owned(), values, i))
 }
 
-/// Collect the `value;` lines of a multi-line `@@define`, from `start` to the
-/// lone `)` line whose index is returned. Every value line ends with `;` and
-/// there must be at least one — mirrors [`gather_multiline`].
-fn gather_define_values(
+/// Collect the `value;` lines of a multi-line binding, from `start` to the lone
+/// `)` line whose index is returned. Every value line ends with `;` and there
+/// must be at least one — mirrors [`gather_multiline`].
+fn gather_binding_values(
     lines: &[&[u8]],
     start: usize,
+    head: &'static str,
     key: &str,
 ) -> Result<(Vec<Vec<u8>>, usize), ErrorKind> {
     let mut values = Vec::new();
     let mut j = start;
     loop {
-        let line = lines.get(j).ok_or_else(|| ErrorKind::UnterminatedDefine {
+        let line = lines.get(j).ok_or_else(|| ErrorKind::UnterminatedBinding {
+            head,
             key: key.to_owned(),
         })?;
         let stripped = strip_leading_ws(split_newline(line).0);
@@ -749,6 +824,7 @@ fn gather_define_values(
                 }
                 if value == SUPPRESS {
                     return Err(ErrorKind::ReservedValue {
+                        head,
                         key: key.to_owned(),
                     });
                 }
@@ -794,7 +870,7 @@ fn import_defs(templates_dir: &Path, name: &str, defs: &mut Definitions) -> Resu
         if stripped.is_empty() || stripped.starts_with(b"//") {
             i += 1;
         } else if is_directive(stripped, b"define") {
-            let (key, values, end) = parse_define(&lines, i)?;
+            let (key, values, end) = parse_binding(&lines, i, "define")?;
             defs.insert(key, values, Some(name.to_owned()))?;
             count += 1;
             i = end + 1;
@@ -830,28 +906,6 @@ fn expand_call(
         });
     }
 
-    for entry in &args.entries {
-        match (entry.suppressed, defs.index_of(&entry.key)) {
-            // A key comes from the call or a file definition, never both.
-            (false, Some(idx)) => {
-                return Err(ErrorKind::DefineCollision {
-                    name: name.to_owned(),
-                    key: entry.key.clone(),
-                    from: defs.entries.get(idx).and_then(|d| d.from.clone()),
-                });
-            }
-            // Suppression opts out of a definition, so it needs one to opt out
-            // of: absence is the default, which would make the pair dead syntax.
-            (true, None) => {
-                return Err(ErrorKind::SuppressNoDefine {
-                    name: name.to_owned(),
-                    key: entry.key.clone(),
-                });
-            }
-            _ => {}
-        }
-    }
-
     let path = templates_dir.join(name).with_extension("baf");
     let template = std::fs::read(&path).map_err(|io| ErrorKind::UnknownTemplate {
         name: name.to_owned(),
@@ -860,8 +914,47 @@ fn expand_call(
     })?;
 
     // A template ends with exactly one LF; the splice text drops it so the
-    // directive line's own newline is the single separator that survives.
+    // directive line's own newline is the single separator that survives. The
+    // template is read before the args are checked because a suppression pair's
+    // legality turns on whether the template defaults the key.
     let splice = template.strip_suffix(b"\n").unwrap_or(&template);
+    let (defaults, splice) = split_defaults(splice, name)?;
+
+    for entry in &args.entries {
+        match (entry.suppressed, defs.index_of(&entry.key)) {
+            // A key comes from the call or a file definition, never both. (A
+            // default is the exception the other way: overriding one is the point.)
+            (false, Some(idx)) => {
+                return Err(ErrorKind::DefineCollision {
+                    name: name.to_owned(),
+                    key: entry.key.clone(),
+                    from: defs.entries.get(idx).and_then(|d| d.from.clone()),
+                });
+            }
+            // Suppression needs something to opt out of: absence is already the
+            // default, which would make the pair dead syntax.
+            (true, None) if !defaults.iter().any(|b| b.key == entry.key) => {
+                return Err(ErrorKind::SuppressUnbound {
+                    name: name.to_owned(),
+                    key: entry.key.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Provision precedence — args, then a definition, then the template's own
+    // default — read positionally: a default applies only where the two higher
+    // sources are silent. A suppression pair holds the args slot, so it blocks
+    // both lower sources at once.
+    for binding in &defaults {
+        if args.index_of(&binding.key).is_none() && defs.index_of(&binding.key).is_none() {
+            for value in &binding.values {
+                args.push(binding.key.clone(), value.clone());
+            }
+        }
+    }
+
     let (after_regions, iterated) = expand_regions(splice, &mut args, defs, name)?;
     let after_slots = expand_slots(&after_regions, &mut args, defs, &iterated, name)?;
     let expanded = expand_inline(&after_slots, &mut args, defs, &iterated, name)?;
@@ -879,6 +972,79 @@ fn expand_call(
         }),
         None => Ok(expanded),
     }
+}
+
+/// Split a template's opening `@@default` block from its splice text, returning
+/// the bindings and the body they precede. The block runs from the first line
+/// until a line that is neither a default nor blank; the blank lines inside and
+/// after it belong to it, so a template that merely opens with one keeps it.
+fn split_defaults<'a>(splice: &'a [u8], name: &str) -> Result<(Vec<Binding>, &'a [u8]), ErrorKind> {
+    let lines = physical_lines(splice);
+    let mut defaults: Vec<Binding> = Vec::new();
+    let mut i = 0;
+    while let Some(&line) = lines.get(i) {
+        let stripped = strip_leading_ws(split_newline(line).0);
+        if is_binding(stripped, b"default") {
+            let (key, values, end) = parse_binding(&lines, i, "default")?;
+            if defaults.iter().any(|b| b.key == key) {
+                return Err(ErrorKind::DuplicateDefault {
+                    name: name.to_owned(),
+                    key,
+                });
+            }
+            defaults.push(Binding { key, values });
+            i = end + 1;
+        } else if stripped.is_empty() && !defaults.is_empty() {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+
+    let consumed: usize = lines
+        .get(..i)
+        .unwrap_or_default()
+        .iter()
+        .map(|l| l.len())
+        .sum();
+    let body = splice.get(consumed..).unwrap_or_default();
+
+    for line in body.split(|&b| b == b'\n') {
+        if is_binding(strip_leading_ws(line), b"default") {
+            return Err(ErrorKind::DefaultMisplaced {
+                name: name.to_owned(),
+                line: lossy(line),
+            });
+        }
+    }
+    // A default for a key the body never mentions could never apply, so it is
+    // dead syntax rather than a harmless spare.
+    for binding in &defaults {
+        if !references(body, &binding.key) {
+            return Err(ErrorKind::DefaultUnreferenced {
+                name: name.to_owned(),
+                key: binding.key.clone(),
+            });
+        }
+    }
+
+    Ok((defaults, body))
+}
+
+/// Whether a template body mentions `key` at all — as a `%key%` placeholder
+/// (slot or inline) or as the header of an `@@foreach` region.
+fn references(body: &[u8], key: &str) -> bool {
+    let mut i = 0;
+    while i < body.len() {
+        match placeholder_at(body, i) {
+            Some((found, _)) if found == key => return true,
+            Some((_, end)) => i = end,
+            None => i += 1,
+        }
+    }
+
+    body.split(|&b| b == b'\n')
+        .any(|line| parse_paren_name(strip_leading_ws(line), b"@@foreach(").as_deref() == Some(key))
 }
 
 /// Step 0: replace each `@@foreach(key)` … `@@end` region (the delimiters
@@ -1497,9 +1663,9 @@ mod tests {
         ]);
         let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
 
-        // Absence is already the default, so there must be a definition to
-        // opt out of.
-        assert!(kind(t.expand(b"@@t(k=@none)\n")).contains("no definition to suppress"));
+        // Absence is already the default, so there must be a definition (or a
+        // template default) to opt out of.
+        assert!(kind(t.expand(b"@@t(k=@none)\n")).contains("no definition or default"));
         // Not an override: a value and `@none` for one key, in either order,
         // and no repeats.
         let mixed = "both a value and @none";
@@ -1519,6 +1685,65 @@ mod tests {
         assert!(kind(t.expand(b"@@define k(@none)\n@@t\n")).contains("reserved as a value"));
         // Suppression is not consumption: the definition still needs a real user.
         assert!(kind(t.expand(b"@@define k(a)\n@@t(k=@none)\n")).contains("used by no call"));
+    }
+
+    #[test]
+    fn a_default_supplies_a_key_no_higher_source_provides() {
+        let t = Templates::with(&[(
+            "t",
+            b"@@default guard(A)\n@@default verb(\n  Detect;\n)\n\nIF\n  %guard%\nTHEN\n  %verb%\nEND\n",
+        )]);
+        let bare = b"IF\n  A\nTHEN\n  Detect\nEND\n";
+        // The block itself leaves no trace, one-line and multi-line forms alike.
+        assert_eq!(t.expand(b"@@t\n").expect("defaults"), bare);
+        // Args outrank a default (overriding one is the point), a definition
+        // outranks it too, and the default it displaces is no error.
+        assert_eq!(
+            t.expand(b"@@t(guard=B)\n").expect("arg wins"),
+            b"IF\n  B\nTHEN\n  Detect\nEND\n"
+        );
+        assert_eq!(
+            t.expand(b"@@define guard(C)\n@@t\n").expect("define wins"),
+            b"IF\n  C\nTHEN\n  Detect\nEND\n"
+        );
+        // `@none` blocks the default as it blocks a definition.
+        assert_eq!(
+            t.expand(b"@@t(guard=@none)\n").expect("suppressed default"),
+            b"IF\nTHEN\n  Detect\nEND\n"
+        );
+
+        // An `@@foreach` header alone counts as referencing the key.
+        let r = Templates::with(&[("r", b"@@default k(1; 2)\n\n@@foreach(k)\nX\n@@end\n")]);
+        assert_eq!(r.expand(b"@@r\n").expect("region default"), b"X\n\nX\n");
+    }
+
+    #[test]
+    fn default_misuse_is_rejected() {
+        let t = Templates::with(&[
+            ("t", b"@@default k(a)\n\n%k%\n"),
+            ("dup", b"@@default k(a)\n@@default k(b)\n\n%k%\n"),
+            ("late", b"%k%\n@@default k(a)\n"),
+            ("dead", b"@@default j(a)\n\n%k%\n"),
+            ("reserved", b"@@default k(@none)\n\n%k%\n"),
+            ("empty", b"@@default k()\n\n%k%\n"),
+            ("unterm", b"@@default k(\n  a;\n"),
+            ("defs/d", b"@@default k(a)\n"),
+        ]);
+        let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
+
+        // A default belongs to a template's opening block: not to a source, not
+        // to a defs file, not to the body below it.
+        assert!(kind(t.expand(b"@@default k(a)\n@@t\n")).contains("valid only in a template"));
+        assert!(kind(t.expand(b"@@use(d)\n@@t\n")).contains("non-define content"));
+        assert!(kind(t.expand(b"@@late\n")).contains("outside the opening block"));
+        // The keyless form is an ordinary call, so it fails as a reserved name.
+        assert!(kind(t.expand(b"@@default(k=a)\n")).contains("reserved directive name @@default"));
+        assert!(kind(t.expand(b"@@dup\n")).contains("duplicate @@default for key 'k'"));
+        // A default the body never mentions could never apply.
+        assert!(kind(t.expand(b"@@dead\n")).contains("@@default key 'j' is not referenced"));
+        assert!(kind(t.expand(b"@@reserved\n")).contains("reserved as a value"));
+        assert!(kind(t.expand(b"@@empty\n")).contains("malformed directive"));
+        assert!(kind(t.expand(b"@@unterm\n")).contains("unterminated multi-line @@default k"));
     }
 
     #[test]
