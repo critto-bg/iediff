@@ -2,7 +2,7 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v3); this
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v3.1); this
 //! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
@@ -27,6 +27,11 @@
 //! independent), then their own lines are dropped from the output; an imported
 //! definition is thereafter indistinguishable from an in-file one, bar the
 //! origin kept for error messages.
+//!
+//! One call may opt out of a definition with the pair `key=@none`: the key is
+//! excluded from that call alone, as if it had never been provided, so its slot
+//! lines vanish. It is an opt-out, not an override — there is no form that
+//! replaces a definition's values.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -34,6 +39,10 @@ use std::path::{Path, PathBuf};
 /// Template names the grammar forbids in a call. `define`/`use` head their own
 /// directives; `foreach`/`end` delimit a template's iteration regions.
 const RESERVED: [&str; 4] = ["foreach", "end", "define", "use"];
+
+/// The arg value that suppresses a key, reserved as a definition value so the
+/// two readings can never collide.
+const SUPPRESS: &[u8] = b"@none";
 
 /// The `key=value` pairs of one directive, in call order. Duplicate keys
 /// accumulate their values (a key may fill a multi-value slot); `used` drives
@@ -56,19 +65,33 @@ impl Args {
                 key,
                 values: vec![value],
                 used: false,
+                suppressed: false,
             }),
         }
+    }
+
+    /// Record an `@none` pair. No value is stored: the entry exists only to
+    /// exclude the key from this call — [`resolve`] stops at it, so the
+    /// definition it opts out of never reaches the template.
+    fn suppress(&mut self, key: String) {
+        self.entries.push(Entry {
+            key,
+            values: Vec::new(),
+            used: false,
+            suppressed: true,
+        });
     }
 
     fn index_of(&self, key: &str) -> Option<usize> {
         self.entries.iter().position(|e| e.key == key)
     }
 
-    fn first_unused(&self) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|e| !e.used)
-            .map(|e| e.key.as_str())
+    fn is_suppressed(&self, key: &str) -> bool {
+        self.entries.iter().any(|e| e.key == key && e.suppressed)
+    }
+
+    fn first_unused(&self) -> Option<&Entry> {
+        self.entries.iter().find(|e| !e.used)
     }
 }
 
@@ -76,6 +99,7 @@ struct Entry {
     key: String,
     values: Vec<Vec<u8>>,
     used: bool,
+    suppressed: bool,
 }
 
 /// The file's definition bindings — a fallback value source for calls that omit
@@ -226,6 +250,33 @@ enum ErrorKind {
     EmptyDefsFile {
         name: String,
     },
+    ReservedValue {
+        key: String,
+    },
+    SuppressMixed {
+        name: String,
+        key: String,
+    },
+    SuppressRepeated {
+        name: String,
+        key: String,
+    },
+    SuppressNoDefine {
+        name: String,
+        key: String,
+    },
+    SuppressInline {
+        name: String,
+        key: String,
+    },
+    SuppressIterated {
+        name: String,
+        key: String,
+    },
+    SuppressUnreferenced {
+        name: String,
+        key: String,
+    },
     MalformedForeach {
         name: String,
         line: String,
@@ -318,6 +369,33 @@ impl fmt::Display for ErrorKind {
             }
             ErrorKind::EmptyDefsFile { name } => {
                 write!(f, "@@use({name}): defs file defines nothing")
+            }
+            ErrorKind::ReservedValue { key } => {
+                write!(f, "@@define {key}: '@none' is reserved as a value")
+            }
+            ErrorKind::SuppressMixed { name, key } => {
+                write!(f, "@@{name}: key '{key}' is given both a value and @none")
+            }
+            ErrorKind::SuppressRepeated { name, key } => {
+                write!(f, "@@{name}: repeated @none for key '{key}'")
+            }
+            ErrorKind::SuppressNoDefine { name, key } => {
+                write!(
+                    f,
+                    "@@{name}: @none for key '{key}', which has no definition to suppress"
+                )
+            }
+            ErrorKind::SuppressInline { name, key } => {
+                write!(f, "@@{name}: suppressed key '{key}' is required inline")
+            }
+            ErrorKind::SuppressIterated { name, key } => {
+                write!(
+                    f,
+                    "@@{name}: suppressed key '{key}' is required by @@foreach"
+                )
+            }
+            ErrorKind::SuppressUnreferenced { name, key } => {
+                write!(f, "@@{name}: @none key '{key}' is not referenced by a slot")
             }
             ErrorKind::MalformedForeach { name, line } => {
                 write!(f, "@@{name}: malformed @@foreach line: {line}")
@@ -549,7 +627,30 @@ fn parse_args(segments: Vec<&[u8]>, name: &str) -> Result<Args, ErrorKind> {
             });
         }
 
-        args.push(key.to_owned(), value.to_vec());
+        // Suppression is an opt-out, not an override: within one call `@none`
+        // combines with neither a value pair for the same key (in either order)
+        // nor a second `@none`.
+        let suppress = value == SUPPRESS;
+        match args.entries.iter().find(|e| e.key == key) {
+            Some(prior) if prior.suppressed && suppress => {
+                return Err(ErrorKind::SuppressRepeated {
+                    name: name.to_owned(),
+                    key: key.to_owned(),
+                });
+            }
+            Some(prior) if prior.suppressed || suppress => {
+                return Err(ErrorKind::SuppressMixed {
+                    name: name.to_owned(),
+                    key: key.to_owned(),
+                });
+            }
+            _ => {}
+        }
+
+        match suppress {
+            true => args.suppress(key.to_owned()),
+            false => args.push(key.to_owned(), value.to_vec()),
+        }
     }
 
     Ok(args)
@@ -608,6 +709,11 @@ fn parse_define(lines: &[&[u8]], i: usize) -> Result<(String, Vec<Vec<u8>>, usiz
         if value.is_empty() {
             return Err(malformed(stripped));
         }
+        if value == SUPPRESS {
+            return Err(ErrorKind::ReservedValue {
+                key: key.to_owned(),
+            });
+        }
         values.push(value.to_vec());
     }
     Ok((key.to_owned(), values, i))
@@ -640,6 +746,11 @@ fn gather_define_values(
                 let value = trim_ws(value);
                 if value.is_empty() {
                     return Err(malformed(stripped));
+                }
+                if value == SUPPRESS {
+                    return Err(ErrorKind::ReservedValue {
+                        key: key.to_owned(),
+                    });
                 }
                 values.push(value.to_vec());
             }
@@ -719,14 +830,25 @@ fn expand_call(
         });
     }
 
-    // A key comes from the call or a file definition, never both.
     for entry in &args.entries {
-        if let Some(idx) = defs.index_of(&entry.key) {
-            return Err(ErrorKind::DefineCollision {
-                name: name.to_owned(),
-                key: entry.key.clone(),
-                from: defs.entries.get(idx).and_then(|d| d.from.clone()),
-            });
+        match (entry.suppressed, defs.index_of(&entry.key)) {
+            // A key comes from the call or a file definition, never both.
+            (false, Some(idx)) => {
+                return Err(ErrorKind::DefineCollision {
+                    name: name.to_owned(),
+                    key: entry.key.clone(),
+                    from: defs.entries.get(idx).and_then(|d| d.from.clone()),
+                });
+            }
+            // Suppression opts out of a definition, so it needs one to opt out
+            // of: absence is the default, which would make the pair dead syntax.
+            (true, None) => {
+                return Err(ErrorKind::SuppressNoDefine {
+                    name: name.to_owned(),
+                    key: entry.key.clone(),
+                });
+            }
+            _ => {}
         }
     }
 
@@ -744,10 +866,16 @@ fn expand_call(
     let after_slots = expand_slots(&after_regions, &mut args, defs, &iterated, name)?;
     let expanded = expand_inline(&after_slots, &mut args, defs, &iterated, name)?;
 
+    // A suppressed key is "used" by the slot line it deletes; with none, the
+    // call opted out of something the template never asked for.
     match args.first_unused() {
-        Some(key) => Err(ErrorKind::UnusedKey {
+        Some(entry) if entry.suppressed => Err(ErrorKind::SuppressUnreferenced {
             name: name.to_owned(),
-            key: key.to_owned(),
+            key: entry.key.clone(),
+        }),
+        Some(entry) => Err(ErrorKind::UnusedKey {
+            name: name.to_owned(),
+            key: entry.key.clone(),
         }),
         None => Ok(expanded),
     }
@@ -814,6 +942,15 @@ fn expand_regions(
         }
         if close == i + 1 {
             return Err(ErrorKind::EmptyRegion {
+                name: name.to_owned(),
+                key,
+            });
+        }
+
+        // Rejected here rather than left to the absent-key error below, which
+        // would blame the template for what the call did.
+        if args.is_suppressed(&key) {
+            return Err(ErrorKind::SuppressIterated {
                 name: name.to_owned(),
                 key,
             });
@@ -937,6 +1074,14 @@ fn expand_inline(
     while let Some(&b) = buf.get(i) {
         if let Some((key, end)) = placeholder_at(buf, i) {
             reject_iterated(iterated, key, name)?;
+            // As for a region: a suppressed key here would otherwise surface as
+            // an unresolved placeholder, naming the template, not the call.
+            if args.is_suppressed(key) {
+                return Err(ErrorKind::SuppressInline {
+                    name: name.to_owned(),
+                    key: key.to_owned(),
+                });
+            }
             match resolve(args, defs, key) {
                 Some(values) if values.len() > 1 => {
                     return Err(ErrorKind::InlineMultiValue {
@@ -967,6 +1112,12 @@ fn expand_inline(
 fn resolve<'a>(args: &'a mut Args, defs: &'a mut Definitions, key: &str) -> Option<&'a [Vec<u8>]> {
     if let Some(idx) = args.index_of(key) {
         args.entries[idx].used = true;
+        // An `@none` pair stops the lookup short of the definition — this is
+        // where the key becomes absent. Only a slot gets this far; a region or
+        // an inline use of a suppressed key is rejected before resolving.
+        if args.entries[idx].suppressed {
+            return None;
+        }
         return Some(&args.entries[idx].values);
     }
     if let Some(idx) = defs.index_of(key) {
@@ -1322,6 +1473,52 @@ mod tests {
         );
         // An imported definition no call ever draws on.
         assert!(kind(t.expand(b"@@use(a)\n@@none\n")).contains("used by no call"));
+    }
+
+    #[test]
+    fn a_none_pair_opts_one_call_out_of_a_definition() {
+        // Both calls draw on the same definition; the second suppresses it, so
+        // its slot line is deleted exactly as if the key were never provided.
+        let t = Templates::with(&[("t", b"IF\n  %guard%\n  Global()\nEND\n")]);
+        assert_eq!(
+            t.expand(b"@@define guard(A)\n@@t\n@@t(guard=@none)\n")
+                .expect("suppressed"),
+            b"IF\n  A\n  Global()\nEND\nIF\n  Global()\nEND\n"
+        );
+    }
+
+    #[test]
+    fn none_misuse_is_rejected() {
+        let t = Templates::with(&[
+            ("t", b"IF\n  %k%\nEND\n"),
+            ("plain", b"Z\n"),
+            ("inline", b"Cast(%k%)\n"),
+            ("region", b"@@foreach(k)\nX(%k%)\n@@end\n"),
+        ]);
+        let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
+
+        // Absence is already the default, so there must be a definition to
+        // opt out of.
+        assert!(kind(t.expand(b"@@t(k=@none)\n")).contains("no definition to suppress"));
+        // Not an override: a value and `@none` for one key, in either order,
+        // and no repeats.
+        let mixed = "both a value and @none";
+        assert!(kind(t.expand(b"@@define k(a)\n@@t(k=@none; k=b)\n")).contains(mixed));
+        assert!(kind(t.expand(b"@@define k(a)\n@@t(k=b; k=@none)\n")).contains(mixed));
+        assert!(
+            kind(t.expand(b"@@define k(a)\n@@t(k=@none; k=@none)\n")).contains("repeated @none")
+        );
+        // The template must reference the key, and only by a slot.
+        assert!(kind(t.expand(b"@@define k(a)\n@@plain(k=@none)\n")).contains("not referenced"));
+        assert!(kind(t.expand(b"@@define k(a)\n@@inline(k=@none)\n")).contains("required inline"));
+        assert!(
+            kind(t.expand(b"@@define k(a)\n@@region(k=@none)\n")).contains("required by @@foreach")
+        );
+        // Reserved as a definition value, in-file and imported alike (one parse
+        // path serves both).
+        assert!(kind(t.expand(b"@@define k(@none)\n@@t\n")).contains("reserved as a value"));
+        // Suppression is not consumption: the definition still needs a real user.
+        assert!(kind(t.expand(b"@@define k(a)\n@@t(k=@none)\n")).contains("used by no call"));
     }
 
     #[test]

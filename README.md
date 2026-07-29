@@ -166,8 +166,8 @@ that fill the template's `%key%` slot lines and inline placeholders. A template
 may repeat a whole block per value by wrapping it in `@@foreach(key)` … `@@end`.
 A file-scoped `@@define key(…)` supplies a key that calls omit, and `@@use(name)` imports such
 definitions from a shared `<dir>/defs/name.baf`, so a value shared across scripts
-lives in one place. An unknown template, a malformed directive, or a leftover
-placeholder is an error.
+lives in one place; a single call opts out of a definition with `key=@none`. An
+unknown template, a malformed directive, or a leftover placeholder is an error.
 
 ```sh
 iediff --file S!hlkang.baf --templates ImprovedAnvil/scripts/_templates --out build
