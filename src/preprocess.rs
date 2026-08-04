@@ -2,59 +2,57 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v4); this
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v4). This
 //! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
 //! A directive is a whole line whose first non-blank characters are `@@`. It
-//! names a template and carries optional `key=value` args — on the one line, or
+//! names a template and carries optional `key=value` args, on the one line or
 //! spread over several `@@name(` … `)` lines. Args fill the template's `%key%`
-//! *slot lines* (a whole line that is only `%key%`, repeated once per value and
-//! deleted when the key is absent) and its inline `%key%` placeholders. The
-//! spliced text is inserted verbatim and never rescanned; after every directive
-//! is expanded, a leftover `@@` line or `%token%` anywhere is a fatal error.
+//! placeholders, inline or as *slot lines*. A slot line is a whole line that is
+//! only `%key%`. It repeats once per value, and vanishes when the key is absent.
+//! The spliced text goes in verbatim, and nothing rescans it. Once every directive
+//! has expanded, a leftover `@@` line or `%token%` anywhere is a fatal error.
 //!
 //! A template body, or a source, may wrap a run of lines in `@@foreach(key)` …
-//! `@@end`: the block is emitted once per value of `key`, blank-line separated,
+//! `@@end`. The block repeats once per value of `key`, blank-line separated,
 //! with `%key%` bound to that one value. A template's region draws its values
-//! from the call; a source has no call, so its values come from a definition in
-//! scope, and it is stamped before any call expands — a directive line inside a
-//! region is repeated first and expanded after, once per instance.
+//! from the call. A source has no call, so its values come from a definition in
+//! scope. A source region is stamped before any call expands, so a directive
+//! line inside one repeats first and expands after, once per instance.
 //!
-//! `@@define key(v1; v2; …)` binds a key at file scope: any call whose template
+//! `@@define key(v1; v2; …)` binds a key at file scope. Any call whose template
 //! references `key` but whose args omit it draws the definition's values, as if
 //! the call had passed them. `@@use(name)` imports the same kind of definitions
-//! from a shared defs file (`<templates-dir>/defs/name.baf`), which holds only
-//! definitions. Both are collected in a first pass (they are position-
-//! independent), then their own lines are dropped from the output; an imported
-//! definition is thereafter indistinguishable from an in-file one, bar the
-//! origin kept for error messages.
+//! from a shared defs file (`<templates-dir>/defs/name.baf`), which holds
+//! nothing else. Both forms are position-independent, so a first pass collects
+//! them and drops their lines. After that an imported definition matches an
+//! in-file one, bar the origin kept for error messages.
 //!
-//! One call may opt out of a definition with the pair `key=@none`: the key is
-//! excluded from that call alone, as if it had never been provided, so its slot
-//! lines vanish. It is an opt-out, not an override — there is no form that
-//! replaces a definition's values.
+//! One call may opt out of a definition with the pair `key=@none`. That call
+//! alone loses the key, as if nothing had provided it, so its slot lines vanish.
+//! This is an opt-out, not an override — no form replaces a definition's values.
 //!
 //! A template may in turn open with a block of `@@default key(…)` lines naming
-//! its own fallbacks, giving one precedence: the call's args, else a definition,
-//! else the template's default. Unlike a definition, a default no call ever
-//! reaches is not an error — whether it is needed is a property of the corpus,
-//! not of any one file.
+//! its own fallbacks. One precedence follows: the call's args, else a
+//! definition, else the template's default. Unlike a definition, a default no
+//! call ever reaches is not an error — the corpus decides whether it is needed,
+//! not any one file.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Template names the grammar forbids in a call. `define`/`use`/`default` head
-/// their own directives; `foreach`/`end` delimit iteration regions.
+/// their own directives. `foreach`/`end` delimit iteration regions.
 const RESERVED: [&str; 5] = ["foreach", "end", "define", "use", "default"];
 
-/// The arg value that suppresses a key, reserved as a definition value so the
-/// two readings can never collide.
+/// The arg value that suppresses a key. No definition may hold it as a value, so
+/// the two readings never collide.
 const SUPPRESS: &[u8] = b"@none";
 
 /// The `key=value` pairs of one directive, in call order. Duplicate keys
-/// accumulate their values (a key may fill a multi-value slot); `used` drives
-/// the "provided but never referenced" check.
+/// accumulate their values, since one key may fill a multi-value slot. `used`
+/// drives the "provided but never referenced" check.
 struct Args {
     entries: Vec<Entry>,
 }
@@ -78,9 +76,9 @@ impl Args {
         }
     }
 
-    /// Record an `@none` pair. No value is stored: the entry exists only to
-    /// exclude the key from this call — [`resolve`] stops at it, so the
-    /// definition it opts out of never reaches the template.
+    /// Record an `@none` pair. The entry holds no value. It exists only to drop
+    /// the key from this call: [`resolve`] stops at it, so the definition it
+    /// opts out of never reaches the template.
     fn suppress(&mut self, key: String) {
         self.entries.push(Entry {
             key,
@@ -111,9 +109,9 @@ struct Entry {
 }
 
 /// The file's definition bindings — a fallback value source for calls that omit
-/// a key. Fed by in-file `@@define`s and `@@use`d imports alike; `used` is set
-/// when some call draws on a definition, and one left unused by every call is a
-/// fatal error, so a stale definition never passes silently.
+/// a key. In-file `@@define`s and `@@use` imports feed it alike. Drawing on a
+/// definition marks it `used`. One no call or region ever draws on is a fatal
+/// error, so a stale definition never passes silently.
 struct Definitions {
     entries: Vec<Def>,
 }
@@ -125,10 +123,10 @@ impl Definitions {
         }
     }
 
-    /// Record a definition, rejecting a second one for the same key. `from` is
-    /// the defs file it was imported from, or `None` for an in-file `@@define`;
-    /// it origins the collision message (all in-file inserts precede imports, so
-    /// the older entry is never the more-remote one).
+    /// Record a definition, rejecting a second one for the same key. `from`
+    /// names the defs file it came from, or is `None` for an in-file
+    /// `@@define`, and labels the collision message. Every in-file insert
+    /// precedes the imports, so the older entry is never the more remote one.
     fn insert(
         &mut self,
         key: String,
@@ -178,9 +176,9 @@ struct Def {
     from: Option<String>,
 }
 
-/// One `@@default` from a template's opening block: the values a call falls back
-/// to when neither its args nor a definition provide the key. No `used` flag —
-/// a default reached by no call is not an error, unlike a definition.
+/// One `@@default` from a template's opening block: the values a call uses when
+/// neither its args nor a definition provide the key. It carries no `used` flag,
+/// because a default no call reaches is not an error, unlike a definition.
 struct Binding {
     key: String,
     values: Vec<Vec<u8>>,
@@ -194,8 +192,8 @@ struct Region {
     close: usize,
 }
 
-/// Which file a region error is about. A template names itself in the message;
-/// a source needs no prefix, being named by the enclosing [`PreprocessError`].
+/// Which file a region error is about. A template names itself in the message.
+/// A source needs no prefix, since the enclosing [`PreprocessError`] names it.
 #[derive(Clone, Debug)]
 enum Site {
     Template(String),
@@ -546,9 +544,8 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
     guard_regions(&lines)?;
 
     // Pass 1: collect every `@@define` and `@@use` (both position-independent
-    // and file-scoped) and mark their lines so pass 2 drops them. Imports are
-    // read after all in-file definitions, so a key clash reports the import as
-    // the newcomer.
+    // and file-scoped) and mark their lines so pass 2 drops them. It reads the
+    // imports last, so a key clash reports the import as the newcomer.
     let mut defs = Definitions::new();
     let mut uses: Vec<String> = Vec::new();
     let mut consumed = vec![false; lines.len()];
@@ -556,9 +553,9 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
     while let Some(&line) = lines.get(i) {
         let stripped = strip_leading_ws(split_newline(line).0);
         if is_binding(stripped, b"default") {
-            // A default belongs to a template's opening block; in a source it can
-            // only be a stray. (The keyless `@@default(…)` is an ordinary call,
-            // caught by the reserved-name check.)
+            // A default belongs to a template's opening block. In a source it
+            // can only be a stray. (The keyless `@@default(…)` is an ordinary
+            // call, which the reserved-name check catches.)
             return Err(ErrorKind::DefaultInSource {
                 line: lossy(stripped),
             });
@@ -586,10 +583,10 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
         import_defs(templates_dir, name, &mut defs)?;
     }
 
-    // Pass 2: stamp the source's own iteration regions, over a buffer the
+    // Pass 2: stamp the source's own iteration regions over a buffer the
     // definition lines have already left — a region must repeat script text, not
-    // them. Calls are left to pass 3, so a directive inside a region is by then
-    // an ordinary one per instance, its `%key%` already resolved.
+    // them. Pass 3 takes the calls, so a directive inside a region is by then
+    // one ordinary call per instance, its `%key%` already resolved.
     let mut staged = Vec::with_capacity(source.len());
     for (n, &line) in lines.iter().enumerate() {
         if !consumed.get(n).copied().unwrap_or(false) {
@@ -611,8 +608,8 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
             continue;
         }
 
-        // A directive replaces its whole line; its own indentation is discarded
-        // but its trailing newline is kept, so neighbouring blocks stay apart.
+        // A directive replaces its whole line. The expansion drops the line's
+        // indentation but keeps its newline, so neighboring blocks stay apart.
         match classify(stripped)? {
             Directive::Bare(name) => {
                 out.extend_from_slice(&expand_call(name, Args::new(), &mut defs, templates_dir)?);
@@ -661,8 +658,8 @@ fn classify(stripped: &[u8]) -> Result<Directive<'_>, ErrorKind> {
     match rest {
         b"" => Ok(Directive::Bare(name)),
         b"(" => Ok(Directive::MultiOpen(name)),
-        // A one-line call closes `)` as the final character; empty `()` is not a
-        // no-args call but malformed (the bare form omits the parens entirely).
+        // A one-line call ends with `)`. Empty `()` is malformed, not a no-args
+        // call — the bare form omits the parens entirely.
         _ if rest.first() == Some(&b'(') && rest.last() == Some(&b')') && rest.len() > 2 => Ok(
             Directive::OneLine(name, rest.get(1..rest.len() - 1).unwrap_or_default()),
         ),
@@ -676,9 +673,9 @@ enum Directive<'a> {
     MultiOpen(&'a str),
 }
 
-/// Collect the `key=value;` argument lines of a multi-line call, starting at
-/// `start`, up to the lone `)` line whose index is returned. Every arg line must
-/// end with `;` and there must be at least one.
+/// Collect the `key=value;` argument lines of a multi-line call, from `start` to
+/// the lone `)` line whose index this returns. Every arg line ends with `;`, and
+/// the call needs at least one.
 fn gather_multiline<'a>(
     lines: &[&'a [u8]],
     start: usize,
@@ -698,8 +695,8 @@ fn gather_multiline<'a>(
             return Ok((segments, j));
         }
 
-        // An arg line is `pair ;`; the value cannot contain `;`, so the final
-        // byte is the separator. Anything else in the span is a fatal error.
+        // An arg line is `pair ;`. A value cannot contain `;`, so the final byte
+        // is the separator. Anything else in the span is a fatal error.
         match stripped.split_last() {
             Some((&b';', pair)) => segments.push(pair),
             _ => return Err(malformed(stripped)),
@@ -736,9 +733,9 @@ fn parse_args(segments: Vec<&[u8]>, name: &str) -> Result<Args, ErrorKind> {
             });
         }
 
-        // Suppression is an opt-out, not an override: within one call `@none`
-        // combines with neither a value pair for the same key (in either order)
-        // nor a second `@none`.
+        // Suppression is an opt-out, not an override. Within one call, `@none`
+        // pairs with neither a value for the same key (in either order) nor a
+        // second `@none`.
         let suppress = value == SUPPRESS;
         match args.entries.iter().find(|e| e.key == key) {
             Some(prior) if prior.suppressed && suppress => {
@@ -765,10 +762,10 @@ fn parse_args(segments: Vec<&[u8]>, name: &str) -> Result<Args, ErrorKind> {
     Ok(args)
 }
 
-/// Whether a stripped directive line heads the directive `head` — its name is
-/// exactly that, so a template whose name merely starts with it (`@@definers`)
-/// stays an ordinary call. Matches a malformed head too, so the specific error
-/// can be reported over "malformed directive".
+/// Whether a stripped line heads the directive `head`. The name must match in
+/// full, so a template whose name merely starts with it (`@@definers`) stays an
+/// ordinary call. A malformed head matches too, so the caller can report the
+/// specific error over "malformed directive".
 fn is_directive(stripped: &[u8], head: &[u8]) -> bool {
     let after = match stripped.strip_prefix(b"@@") {
         Some(after) => after,
@@ -778,8 +775,8 @@ fn is_directive(stripped: &[u8], head: &[u8]) -> bool {
     after.get(..name_len) == Some(head)
 }
 
-/// Whether a stripped line opens the spaced binding form `@@<head> key(…)` —
-/// what separates a `@@define`/`@@default` directive from a call of that name,
+/// Whether a stripped line opens the spaced binding form `@@<head> key(…)`. The
+/// space separates a `@@define`/`@@default` directive from a call of that name,
 /// which carries its parens straight after the name.
 fn is_binding(stripped: &[u8], head: &[u8]) -> bool {
     matches!(
@@ -790,10 +787,10 @@ fn is_binding(stripped: &[u8], head: &[u8]) -> bool {
     )
 }
 
-/// Parse a `@@<head> key(…)` binding starting at line `i` (already known to head
-/// one) — the shape `@@define` and `@@default` share. Returns the key, its
-/// values, and the index of the last line the directive spans (its own line, or
-/// the closing `)` line for the multi-line form).
+/// Parse the `@@<head> key(…)` binding at line `i`, the shape `@@define` and
+/// `@@default` share. Returns the key, its values, and the last line index the
+/// directive spans. That is its own line, or the closing `)` of the multi-line
+/// form.
 fn parse_binding(
     lines: &[&[u8]],
     i: usize,
@@ -821,7 +818,7 @@ fn parse_binding(
         _ => return Err(malformed(stripped)),
     };
 
-    // `(` last on the line opens the multi-line form; otherwise `)` closes it here.
+    // `(` last on the line opens the multi-line form. Otherwise `)` closes it here.
     if inside.is_empty() {
         let (values, end) = gather_binding_values(lines, i + 1, head, key)?;
         return Ok((key.to_owned(), values, end));
@@ -849,8 +846,8 @@ fn parse_binding(
 }
 
 /// Collect the `value;` lines of a multi-line binding, from `start` to the lone
-/// `)` line whose index is returned. Every value line ends with `;` and there
-/// must be at least one — mirrors [`gather_multiline`].
+/// `)` line whose index this returns. Every value line ends with `;`, and the
+/// binding needs at least one. Mirrors [`gather_multiline`].
 fn gather_binding_values(
     lines: &[&[u8]],
     start: usize,
@@ -893,9 +890,9 @@ fn gather_binding_values(
     }
 }
 
-/// The lone name a directive line carries after `prefix` — the shape shared by
-/// `@@use(name)` and `@@foreach(key)`: `prefix` ws* name ws* `)`. `None` if the
-/// line does not match.
+/// The lone name a directive line carries after `prefix`: `prefix` ws* name ws*
+/// `)`, the shape `@@use(name)` and `@@foreach(key)` share. `None` if the line
+/// does not match.
 fn parse_paren_name(stripped: &[u8], prefix: &[u8]) -> Option<String> {
     let after = strip_leading_ws(stripped.strip_prefix(prefix)?);
     let name_len = after.iter().take_while(|b| is_name(b)).count();
@@ -906,10 +903,10 @@ fn parse_paren_name(stripped: &[u8], prefix: &[u8]) -> Option<String> {
     (strip_leading_ws(after.get(name_len..)?) == b")").then(|| name.to_owned())
 }
 
-/// Read `<templates-dir>/defs/<name>.baf` and fold its definitions into `defs`
-/// (origin `name`). A defs file holds only definitions, blank lines, and `//`
-/// comments; any other content — a template call, a nested `@@use` — is a fatal
-/// error, as is one contributing no definitions.
+/// Read `<templates-dir>/defs/<name>.baf` and add its definitions to `defs`
+/// under the origin `name`. A defs file holds only definitions, blank lines, and
+/// `//` comments. Any other content — a template call, a nested `@@use` — is a
+/// fatal error, as is a file that defines nothing.
 fn import_defs(templates_dir: &Path, name: &str, defs: &mut Definitions) -> Result<(), ErrorKind> {
     let path = templates_dir.join("defs").join(name).with_extension("baf");
     let content = std::fs::read(&path).map_err(|io| ErrorKind::MissingDefsFile {
@@ -969,10 +966,10 @@ fn expand_call(
         io,
     })?;
 
-    // A template ends with exactly one LF; the splice text drops it so the
+    // A template ends with exactly one LF. The splice text drops it, so the
     // directive line's own newline is the single separator that survives. The
-    // template is read before the args are checked because a suppression pair's
-    // legality turns on whether the template defaults the key.
+    // read precedes the arg checks because a suppression pair's legality turns
+    // on whether the template defaults the key.
     let splice = template.strip_suffix(b"\n").unwrap_or(&template);
     let (defaults, splice) = split_defaults(splice, name)?;
 
@@ -999,10 +996,9 @@ fn expand_call(
         }
     }
 
-    // Provision precedence — args, then a definition, then the template's own
-    // default — read positionally: a default applies only where the two higher
-    // sources are silent. A suppression pair holds the args slot, so it blocks
-    // both lower sources at once.
+    // Precedence runs args, then a definition, then the template's own default.
+    // A default applies only where both higher sources are silent. A suppression
+    // pair fills the args slot, so it blocks both lower sources at once.
     for binding in &defaults {
         if args.index_of(&binding.key).is_none() && defs.index_of(&binding.key).is_none() {
             for value in &binding.values {
@@ -1015,8 +1011,8 @@ fn expand_call(
     let after_slots = expand_slots(&after_regions, &mut args, defs, &iterated, name)?;
     let expanded = expand_inline(&after_slots, &mut args, defs, &iterated, name)?;
 
-    // A suppressed key is "used" by the slot line it deletes; with none, the
-    // call opted out of something the template never asked for.
+    // A suppressed key counts as used by the slot line it deletes. With no such
+    // slot, the call opted out of something the template never asked for.
     match args.first_unused() {
         Some(entry) if entry.suppressed => Err(ErrorKind::SuppressUnreferenced {
             name: name.to_owned(),
@@ -1031,9 +1027,9 @@ fn expand_call(
 }
 
 /// Split a template's opening `@@default` block from its splice text, returning
-/// the bindings and the body they precede. The block runs from the first line
-/// until a line that is neither a default nor blank; the blank lines inside and
-/// after it belong to it, so a template that merely opens with one keeps it.
+/// the bindings and the body they precede. The block runs from the first line to
+/// the first line that is neither a default nor blank. The blank lines inside
+/// and after it belong to the block, so the body never opens with the separator.
 fn split_defaults<'a>(splice: &'a [u8], name: &str) -> Result<(Vec<Binding>, &'a [u8]), ErrorKind> {
     let lines = physical_lines(splice);
     let mut defaults: Vec<Binding> = Vec::new();
@@ -1087,7 +1083,7 @@ fn split_defaults<'a>(splice: &'a [u8], name: &str) -> Result<(Vec<Binding>, &'a
     Ok((defaults, body))
 }
 
-/// Whether a template body mentions `key` at all — as a `%key%` placeholder
+/// Whether a template body mentions `key` at all, as a `%key%` placeholder
 /// (slot or inline) or as the header of an `@@foreach` region.
 fn references(body: &[u8], key: &str) -> bool {
     let mut i = 0;
@@ -1103,13 +1099,13 @@ fn references(body: &[u8], key: &str) -> bool {
         .any(|line| parse_paren_name(strip_leading_ws(line), b"@@foreach(").as_deref() == Some(key))
 }
 
-/// Replace each of the source's own `@@foreach(key)` … `@@end` regions (the
-/// delimiters included) with one instance of its body per value of `key`,
-/// separated by a blank line and with `%key%` bound to that one value.
+/// Replace each of the source's own `@@foreach(key)` … `@@end` regions, the
+/// delimiters included, with one instance of its body per value of `key`. A
+/// blank line separates the instances, and `%key%` holds one value in each.
 ///
 /// A source has no call and no template, so a definition in scope is the only
-/// value source — and using one counts as consuming it. A `%key%` outside every
-/// region of that key is left alone, for the postcondition to reject.
+/// value source. A region consumes the definition it draws on. A `%key%` outside
+/// every region of that key stays put, for the postcondition to reject.
 fn expand_source_regions(source: &[u8], defs: &mut Definitions) -> Result<Vec<u8>, ErrorKind> {
     let lines = physical_lines(source);
     let mut out = Vec::with_capacity(source.len());
@@ -1143,10 +1139,11 @@ fn expand_source_regions(source: &[u8], defs: &mut Definitions) -> Result<Vec<u8
 }
 
 /// Reject a `@@define`, `@@use` or `@@default` line inside a source region.
-/// Those are position-independent: collected file-wide and deleted before the
-/// region is stamped, so one written inside would hoist silently out of it
-/// rather than repeat. This runs before that collection, the last point at
-/// which it is still visible. A malformed span is left to [`next_region`].
+/// Those are position-independent: pass 1 collects them file-wide and drops
+/// their lines before any region stamps, so one written inside would leave the
+/// region silently rather than repeat. This check runs before that pass, the
+/// last point at which the line is still in place. [`next_region`] takes a
+/// malformed span.
 fn guard_regions(lines: &[&[u8]]) -> Result<(), ErrorKind> {
     let mut inside = false;
     for &line in lines {
@@ -1169,9 +1166,9 @@ fn guard_regions(lines: &[&[u8]]) -> Result<(), ErrorKind> {
     Ok(())
 }
 
-/// Step 0: the same, for a template's regions — where the values come from the
-/// call instead. Returns the rewritten splice text and the keys the regions
-/// consumed.
+/// As [`expand_source_regions`], for a template's regions, where the values come
+/// from the call instead. Returns the rewritten splice text and the keys the
+/// regions consumed.
 fn expand_regions(
     splice: &[u8],
     args: &mut Args,
@@ -1190,8 +1187,8 @@ fn expand_regions(
             push_line(&mut out, &mut first, line);
         }
 
-        // Rejected here rather than left to the absent-key error below, which
-        // would blame the template for what the call did.
+        // Caught here rather than by the absent-key error below, which would
+        // blame the template for what the call did.
         if args.is_suppressed(&region.key) {
             return Err(ErrorKind::SuppressIterated {
                 name: name.to_owned(),
@@ -1199,8 +1196,8 @@ fn expand_regions(
             });
         }
 
-        // Unlike a slot, an iterated key has no absent form: there is no
-        // sensible number of instances to emit.
+        // Unlike a slot, an iterated key has no absent form: no number of
+        // instances would be right.
         let values = match resolve(args, defs, &region.key) {
             Some(values) => values.to_vec(),
             None => {
@@ -1214,8 +1211,8 @@ fn expand_regions(
             if n > 0 {
                 push_line(&mut out, &mut first, b"");
             }
-            // A slot line of the iterated key is `<ws>%key%`, so substituting a
-            // single value in place leaves exactly the slot's indentation.
+            // A slot line of the iterated key is `<ws>%key%`, so one value put
+            // in place keeps exactly the slot's indentation.
             for &body in lines.get(region.open + 1..region.close).unwrap_or_default() {
                 push_line(&mut out, &mut first, &substitute(body, &region.key, value));
             }
@@ -1235,7 +1232,7 @@ fn expand_regions(
 
 /// The next region in `lines` at or after `from`, `None` once none remains. The
 /// lines skipped on the way must be ordinary text — a stray `@@end` is an error.
-/// Region shape is one grammar for both sites, so one scanner serves both.
+/// One grammar gives region shape at both sites, so one scanner serves both.
 fn next_region(lines: &[&[u8]], from: usize, site: &Site) -> Result<Option<Region>, ErrorKind> {
     let mut open = from;
     let stripped = loop {
@@ -1316,7 +1313,7 @@ fn substitute(line: &[u8], key: &str, value: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reject a reference to a key some region already consumed: its values belong
+/// Reject a reference to a key some region already consumed. Its values belong
 /// to the instances, so a slot or `%key%` outside every region of that key has
 /// no value left to take.
 fn reject_iterated(iterated: &[String], key: &str, name: &str) -> Result<(), ErrorKind> {
@@ -1365,7 +1362,7 @@ fn expand_slots(
 }
 
 /// Replace each remaining `%key%` with its single value. A provided key is
-/// marked used; an unprovided one is left for the postcondition to reject; a
+/// marked used. An unprovided one stays for the postcondition to reject. A
 /// multi-value key used inline is a fatal error.
 fn expand_inline(
     buf: &[u8],
@@ -1379,8 +1376,9 @@ fn expand_inline(
     while let Some(&b) = buf.get(i) {
         if let Some((key, end)) = placeholder_at(buf, i) {
             reject_iterated(iterated, key, name)?;
-            // As for a region: a suppressed key here would otherwise surface as
-            // an unresolved placeholder, naming the template, not the call.
+            // As for a region: a suppressed key here would otherwise reach the
+            // postcondition as an unresolved placeholder, naming the template
+            // rather than the call.
             if args.is_suppressed(key) {
                 return Err(ErrorKind::SuppressInline {
                     name: name.to_owned(),
@@ -1412,14 +1410,14 @@ fn expand_inline(
 }
 
 /// Values bound to `key` — the call's args first, else a file definition —
-/// marking whichever source consumed. `None` if neither provides it (a slot then
-/// vanishes; an inline `%key%` is left for the postcondition to reject).
+/// marking whichever source it consumed. `None` if neither provides it: a slot
+/// then vanishes, and an inline `%key%` stays for the postcondition to reject.
 fn resolve<'a>(args: &'a mut Args, defs: &'a mut Definitions, key: &str) -> Option<&'a [Vec<u8>]> {
     if let Some(idx) = args.index_of(key) {
         args.entries[idx].used = true;
         // An `@none` pair stops the lookup short of the definition — this is
-        // where the key becomes absent. Only a slot gets this far; a region or
-        // an inline use of a suppressed key is rejected before resolving.
+        // where the key becomes absent. Only a slot reaches it. A region or an
+        // inline use of a suppressed key fails earlier.
         if args.entries[idx].suppressed {
             return None;
         }
@@ -1501,8 +1499,8 @@ fn physical_lines(buf: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
-/// Append one line to a buffer of LF-joined lines (no trailing LF), tracking
-/// whether the buffer is still empty so no separator leads the first line.
+/// Append one line to a buffer of LF-joined lines (no trailing LF). `first`
+/// tracks an empty buffer, so no separator leads the first line.
 fn push_line(out: &mut Vec<u8>, first: &mut bool, line: &[u8]) {
     if !*first {
         out.push(b'\n');
@@ -1519,8 +1517,8 @@ fn split_newline(line: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// Split one-line args (`inner` between the parens) into pair segments on `;`;
-/// values never contain `;`, so this is exact.
+/// Split one-line args (`inner` between the parens) into pair segments on `;`.
+/// A value never contains `;`, so the split is exact.
 fn split_pairs(inner: &[u8]) -> Vec<&[u8]> {
     inner.split(|&b| b == b';').collect()
 }
@@ -1607,15 +1605,15 @@ mod tests {
     fn bare_marker_splices_the_fragment_less_one_newline() {
         let t = Templates::with(&[("vocalize", b"IF\n  True()\nEND\n")]);
         let out = t.expand(b"A\n\n@@vocalize\n\nB\n").expect("expands");
-        // The fragment's own trailing newline is dropped, the marker line's kept:
-        // exactly one blank line survives on either side.
+        // The splice drops the fragment's own trailing newline and keeps the
+        // marker line's, so one blank line survives on either side.
         assert_eq!(out, b"A\n\nIF\n  True()\nEND\n\nB\n");
     }
 
     #[test]
     fn an_indented_directive_expands_but_a_mid_line_at_at_does_not() {
-        // v2: leading blanks are discarded, so an indented marker is a directive.
-        // A mid-line `@@` (first non-blank is `D`) is left for the compiler.
+        // v2 discards leading blanks, so an indented marker is a directive. A
+        // mid-line `@@` (first non-blank is `D`) stays for the compiler.
         let t = Templates::with(&[("x", b"Y\n")]);
         assert_eq!(t.expand(b"\t@@x\n").expect("indented expands"), b"Y\n");
         assert_eq!(t.expand(b"Do(@@x)\n").expect("inline left"), b"Do(@@x)\n");
@@ -1665,21 +1663,21 @@ mod tests {
 
         assert!(kind(t.expand(b"@@missing\n")).contains("unknown template @@missing"));
         assert!(kind(t.expand(b"@@use\n")).contains("reserved directive name @@use"));
-        // v4 made `@@foreach` a source form too, so a bare one is a malformed
+        // v4 makes `@@foreach` a source form too, so a bare one is a malformed
         // region opener — the pointed error, ahead of the reserved-name backstop.
         assert!(kind(t.expand(b"@@foreach\n")).contains("malformed @@foreach line"));
         assert!(kind(t.expand(b"@@slot()\n")).contains("malformed directive"));
         assert!(kind(t.expand(b"@@slot(x=)\n")).contains("empty value for key 'x'"));
         assert!(kind(t.expand(b"@@none(x=1)\n")).contains("key 'x' is not used"));
         assert!(kind(t.expand(b"@@inline(x=1; x=2)\n")).contains("multi-value key 'x'"));
-        // A required inline key left unprovided surfaces as a residual placeholder.
+        // A required inline key nobody provides reaches the postcondition.
         assert!(kind(t.expand(b"@@inline\n")).contains("unresolved placeholder"));
         assert!(kind(t.expand(b"@@t(\n  a=1;\n")).contains("unterminated multi-line call @@t"));
     }
 
     #[test]
     fn a_define_feeds_a_key_the_call_omits() {
-        // The call provides `verb`; `giveup` (a multi-value slot) comes from the
+        // The call provides `verb`. `giveup` (a multi-value slot) comes from the
         // file definition. The one-line and multi-line define forms agree, and
         // the define's own lines leave no trace.
         let t = Templates::with(&[("t", b"IF\n  %verb%\nTHEN\n  %giveup%\nEND\n")]);
@@ -1694,9 +1692,9 @@ mod tests {
 
     #[test]
     fn a_define_is_lazy_and_position_independent() {
-        // A template that never references the key is unaffected — no unused-key
-        // error — as long as some other call consumes the definition. The define
-        // may sit after the call that uses it.
+        // A template that never references the key raises no unused-key error,
+        // as long as some other call consumes the definition. The define may sit
+        // after the call that uses it.
         let t = Templates::with(&[("uses", b"X(%k%)\n"), ("ignores", b"Y\n")]);
         let src = b"@@ignores\n@@uses\n@@define k(v)\n";
         assert_eq!(t.expand(src).expect("lazy define"), b"Y\nX(v)\n");
@@ -1716,7 +1714,7 @@ mod tests {
         assert!(kind(t.expand(b"@@define k(a)\n@@t(k=b)\n")).contains("also set by @@define"));
         // A definition no call ever draws on.
         assert!(kind(t.expand(b"@@define k(a)\n@@none\n")).contains("used by no call"));
-        // Multi-line define running off the end with no closing `)`.
+        // A multi-line define that reaches the end with no closing `)`.
         assert!(
             kind(t.expand(b"@@define k(\n  a;\n")).contains("unterminated multi-line @@define k")
         );
@@ -1728,9 +1726,9 @@ mod tests {
 
     #[test]
     fn an_imported_define_feeds_a_key_the_call_omits() {
-        // `@@use` pulls the `giveup` definition from a shared defs file; it fills
-        // the template's slot exactly as an in-file define would, and both the
-        // use line and the defs file leave no trace in the output.
+        // `@@use` takes the `giveup` definition from a shared defs file. It fills
+        // the template's slot exactly as an in-file define would. The use line
+        // and the defs file leave no trace in the output.
         let t = Templates::with(&[
             ("t", b"IF\n  %verb%\nTHEN\n  %giveup%\nEND\n"),
             (
@@ -1781,8 +1779,8 @@ mod tests {
 
     #[test]
     fn a_none_pair_opts_one_call_out_of_a_definition() {
-        // Both calls draw on the same definition; the second suppresses it, so
-        // its slot line is deleted exactly as if the key were never provided.
+        // Both calls draw on the same definition. The second suppresses it, so
+        // its slot line goes exactly as if nothing had provided the key.
         let t = Templates::with(&[("t", b"IF\n  %guard%\n  Global()\nEND\n")]);
         assert_eq!(
             t.expand(b"@@define guard(A)\n@@t\n@@t(guard=@none)\n")
@@ -1801,7 +1799,7 @@ mod tests {
         ]);
         let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
 
-        // Absence is already the default, so there must be a definition (or a
+        // Absence is already the default, so the call needs a definition (or a
         // template default) to opt out of.
         assert!(kind(t.expand(b"@@t(k=@none)\n")).contains("no definition or default"));
         // Not an override: a value and `@none` for one key, in either order,
@@ -1818,8 +1816,8 @@ mod tests {
         assert!(
             kind(t.expand(b"@@define k(a)\n@@region(k=@none)\n")).contains("required by @@foreach")
         );
-        // Reserved as a definition value, in-file and imported alike (one parse
-        // path serves both).
+        // Reserved as a definition value, in-file and imported alike, since one
+        // parse path serves both.
         assert!(kind(t.expand(b"@@define k(@none)\n@@t\n")).contains("reserved as a value"));
         // Suppression is not consumption: the definition still needs a real user.
         assert!(kind(t.expand(b"@@define k(a)\n@@t(k=@none)\n")).contains("used by no call"));
@@ -1834,8 +1832,8 @@ mod tests {
         let bare = b"IF\n  A\nTHEN\n  Detect\nEND\n";
         // The block itself leaves no trace, one-line and multi-line forms alike.
         assert_eq!(t.expand(b"@@t\n").expect("defaults"), bare);
-        // Args outrank a default (overriding one is the point), a definition
-        // outranks it too, and the default it displaces is no error.
+        // Args outrank a default, since overriding one is the point. A
+        // definition outranks it too, and the default it displaces is no error.
         assert_eq!(
             t.expand(b"@@t(guard=B)\n").expect("arg wins"),
             b"IF\n  B\nTHEN\n  Detect\nEND\n"
@@ -1869,7 +1867,7 @@ mod tests {
         ]);
         let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
 
-        // A default belongs to a template's opening block: not to a source, not
+        // A default belongs to a template's opening block — not to a source, not
         // to a defs file, not to the body below it.
         assert!(kind(t.expand(b"@@default k(a)\n@@t\n")).contains("valid only in a template"));
         assert!(kind(t.expand(b"@@use(d)\n@@t\n")).contains("non-define content"));
@@ -1886,10 +1884,10 @@ mod tests {
 
     #[test]
     fn a_foreach_region_repeats_its_block_per_value() {
-        // The region is emitted once per value of `who`, blank-line separated,
-        // with `%who%` bound to that value alone. A non-iterated key inside the
-        // region behaves as anywhere else: its slot expands its full list in
-        // every instance.
+        // The region repeats once per value of `who`, blank-line separated, with
+        // `%who%` bound to that value alone. A non-iterated key inside the region
+        // acts as anywhere else: its slot expands its full list in every
+        // instance.
         let t = Templates::with(&[(
             "t",
             b"IF\n@@foreach(who)\n  See(%who%)\n  %extra%\n@@end\nEND\n",
@@ -1907,9 +1905,9 @@ mod tests {
 
     #[test]
     fn every_region_of_a_key_iterates_the_whole_list() {
-        // Two regions for one key, mirroring multi-slot behaviour; the values may
+        // Two regions for one key, mirroring multi-slot behavior. The values may
         // come from a definition, and one region consumes the key for the whole
-        // template (no unused-key error).
+        // template, so no unused-key error follows.
         let t = Templates::with(&[(
             "t",
             b"@@foreach(k)\nP(%k%)\n@@end\n@@foreach(k)\nQ(%k%)\n@@end\n",
@@ -1941,7 +1939,7 @@ mod tests {
         assert!(kind(t.expand(b"@@bad\n")).contains("malformed @@foreach line"));
         // A region whose key the call never provides has no instance count.
         assert!(kind(t.expand(b"@@absent\n")).contains("@@foreach key 'k' is not provided"));
-        // The iterated key is spent by the region: a slot or inline use outside it
+        // The region spends the iterated key, so a slot or inline use outside it
         // has nothing left to take.
         assert!(kind(t.expand(b"@@slot(k=1)\n")).contains("iterated key 'k' referenced outside"));
         assert!(kind(t.expand(b"@@inline(k=1)\n")).contains("iterated key 'k' referenced outside"));
@@ -1949,7 +1947,7 @@ mod tests {
 
     #[test]
     fn a_source_region_repeats_its_block_per_defined_value() {
-        // No call and no template at source level: the values come from a
+        // A source has no call and no template, so the values come from a
         // definition, in-file or imported alike, and the region consumes it.
         let t = Templates::with(&[
             ("t", b"Cast(%who%)\n"),
@@ -1966,8 +1964,8 @@ mod tests {
             b"X(1)\n\nX(2)\n"
         );
 
-        // A directive inside a region is stamped first and expanded after, so
-        // each instance is an ordinary call with its `%pn%` already resolved.
+        // A directive inside a region stamps first and expands after, so each
+        // instance is an ordinary call with its `%pn%` already resolved.
         assert_eq!(
             t.expand(b"@@define pn(1; 2)\n@@foreach(pn)\n@@t(who=Player%pn%)\n@@end\n")
                 .expect("call in region"),
@@ -2001,8 +1999,8 @@ mod tests {
             kind(t.expand(b"@@foreach(j)\nX\n@@end\n"))
                 .contains("@@foreach key 'j' has no definition in scope")
         );
-        // Position-independent directives would hoist out of the region instead
-        // of repeating, so they are rejected before they can be collected.
+        // A position-independent directive would leave the region instead of
+        // repeating, so the guard rejects it before pass 1 collects it.
         for inner in ["@@define j(a)", "@@use(shared)", "@@default j(a)"] {
             let region = format!("@@foreach(k)\n{inner}\nX\n@@end\n");
             assert!(
@@ -2010,8 +2008,8 @@ mod tests {
                 "{inner}"
             );
         }
-        // The source is named by the wrapping message, so no `@@template:`
-        // prefix leads these — unlike their template-side twins.
+        // The wrapping message names the source, so no `@@template:` prefix
+        // leads these — unlike their template-side twins.
         assert!(
             kind(t.expand(&src("@@foreach(k)\n@@end\n"))).starts_with("empty @@foreach(k) region")
         );

@@ -33,6 +33,12 @@ under `game/ImprovedAnvil/workspace/baf`), not just the engine.
   of need.
 - **Brevity.** In docs, output, and comments alike.
 
+## Writing
+
+Use the `ste-writing` skill for all technical writing in this project. This
+covers documentation, commit text, error messages, comments, and the prose of
+replies. Be brief in documentation, program output, and comments alike.
+
 ## Comments
 
 Comments explain _why_, not _what_ — the code already says what it does.
