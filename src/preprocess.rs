@@ -2,7 +2,7 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v3.2); this
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v4); this
 //! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
@@ -14,10 +14,12 @@
 //! spliced text is inserted verbatim and never rescanned; after every directive
 //! is expanded, a leftover `@@` line or `%token%` anywhere is a fatal error.
 //!
-//! A template body may wrap a run of lines in `@@foreach(key)` … `@@end`: the
-//! block is emitted once per value of `key`, blank-line separated, with `%key%`
-//! bound to that one value. Regions are a template-only form — in a source
-//! `foreach` and `end` stay reserved names.
+//! A template body, or a source, may wrap a run of lines in `@@foreach(key)` …
+//! `@@end`: the block is emitted once per value of `key`, blank-line separated,
+//! with `%key%` bound to that one value. A template's region draws its values
+//! from the call; a source has no call, so its values come from a definition in
+//! scope, and it is stamped before any call expands — a directive line inside a
+//! region is repeated first and expanded after, once per instance.
 //!
 //! `@@define key(v1; v2; …)` binds a key at file scope: any call whose template
 //! references `key` but whose args omit it draws the definition's values, as if
@@ -43,7 +45,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Template names the grammar forbids in a call. `define`/`use`/`default` head
-/// their own directives; `foreach`/`end` delimit a template's iteration regions.
+/// their own directives; `foreach`/`end` delimit iteration regions.
 const RESERVED: [&str; 5] = ["foreach", "end", "define", "use", "default"];
 
 /// The arg value that suppresses a key, reserved as a definition value so the
@@ -156,6 +158,14 @@ impl Definitions {
         self.entries.iter().position(|d| d.key == key)
     }
 
+    /// The values bound to `key`, marking the definition consumed.
+    fn consume(&mut self, key: &str) -> Option<&[Vec<u8>]> {
+        let idx = self.index_of(key)?;
+        let def = self.entries.get_mut(idx)?;
+        def.used = true;
+        Some(&def.values)
+    }
+
     fn first_unused(&self) -> Option<&Def> {
         self.entries.iter().find(|d| !d.used)
     }
@@ -174,6 +184,31 @@ struct Def {
 struct Binding {
     key: String,
     values: Vec<Vec<u8>>,
+}
+
+/// One `@@foreach` … `@@end` span: the key it iterates and the line indices of
+/// its two delimiters.
+struct Region {
+    key: String,
+    open: usize,
+    close: usize,
+}
+
+/// Which file a region error is about. A template names itself in the message;
+/// a source needs no prefix, being named by the enclosing [`PreprocessError`].
+#[derive(Clone, Debug)]
+enum Site {
+    Template(String),
+    Source,
+}
+
+impl fmt::Display for Site {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Site::Template(name) => write!(f, "@@{name}: "),
+            Site::Source => Ok(()),
+        }
+    }
 }
 
 /// A preprocessing failure, naming the source `.baf` and the offending
@@ -309,22 +344,22 @@ enum ErrorKind {
         key: String,
     },
     MalformedForeach {
-        name: String,
+        site: Site,
         line: String,
     },
     NestedRegion {
-        name: String,
+        site: Site,
         key: String,
     },
     UnterminatedRegion {
-        name: String,
+        site: Site,
         key: String,
     },
     UnopenedRegion {
-        name: String,
+        site: Site,
     },
     EmptyRegion {
-        name: String,
+        site: Site,
         key: String,
     },
     RegionKeyAbsent {
@@ -334,6 +369,12 @@ enum ErrorKind {
     IteratedOutsideRegion {
         name: String,
         key: String,
+    },
+    RegionKeyUndefined {
+        key: String,
+    },
+    DirectiveInRegion {
+        line: String,
     },
     ResidualDirective {
         line: String,
@@ -443,23 +484,20 @@ impl fmt::Display for ErrorKind {
                     "@@{name}: @@default key '{key}' is not referenced by the template"
                 )
             }
-            ErrorKind::MalformedForeach { name, line } => {
-                write!(f, "@@{name}: malformed @@foreach line: {line}")
+            ErrorKind::MalformedForeach { site, line } => {
+                write!(f, "{site}malformed @@foreach line: {line}")
             }
-            ErrorKind::NestedRegion { name, key } => {
-                write!(
-                    f,
-                    "@@{name}: nested @@foreach region inside @@foreach({key})"
-                )
+            ErrorKind::NestedRegion { site, key } => {
+                write!(f, "{site}nested @@foreach region inside @@foreach({key})")
             }
-            ErrorKind::UnterminatedRegion { name, key } => {
-                write!(f, "@@{name}: unterminated @@foreach({key}) region")
+            ErrorKind::UnterminatedRegion { site, key } => {
+                write!(f, "{site}unterminated @@foreach({key}) region")
             }
-            ErrorKind::UnopenedRegion { name } => {
-                write!(f, "@@{name}: @@end without @@foreach")
+            ErrorKind::UnopenedRegion { site } => {
+                write!(f, "{site}@@end without @@foreach")
             }
-            ErrorKind::EmptyRegion { name, key } => {
-                write!(f, "@@{name}: empty @@foreach({key}) region")
+            ErrorKind::EmptyRegion { site, key } => {
+                write!(f, "{site}empty @@foreach({key}) region")
             }
             ErrorKind::RegionKeyAbsent { name, key } => {
                 write!(f, "@@{name}: @@foreach key '{key}' is not provided")
@@ -468,6 +506,15 @@ impl fmt::Display for ErrorKind {
                 write!(
                     f,
                     "@@{name}: iterated key '{key}' referenced outside its @@foreach region"
+                )
+            }
+            ErrorKind::RegionKeyUndefined { key } => {
+                write!(f, "@@foreach key '{key}' has no definition in scope")
+            }
+            ErrorKind::DirectiveInRegion { line } => {
+                write!(
+                    f,
+                    "@@define/@@use/@@default inside a @@foreach region: {line}"
                 )
             }
             ErrorKind::ResidualDirective { line } => {
@@ -496,6 +543,7 @@ pub fn expand(
 
 fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKind> {
     let lines = physical_lines(source);
+    guard_regions(&lines)?;
 
     // Pass 1: collect every `@@define` and `@@use` (both position-independent
     // and file-scoped) and mark their lines so pass 2 drops them. Imports are
@@ -538,15 +586,23 @@ fn expand_inner(source: &[u8], templates_dir: &Path) -> Result<Vec<u8>, ErrorKin
         import_defs(templates_dir, name, &mut defs)?;
     }
 
-    // Pass 2: expand each call (drawing on the definitions), pass the rest through.
-    let mut out = Vec::with_capacity(source.len());
+    // Pass 2: stamp the source's own iteration regions, over a buffer the
+    // definition lines have already left — a region must repeat script text, not
+    // them. Calls are left to pass 3, so a directive inside a region is by then
+    // an ordinary one per instance, its `%key%` already resolved.
+    let mut staged = Vec::with_capacity(source.len());
+    for (n, &line) in lines.iter().enumerate() {
+        if !consumed.get(n).copied().unwrap_or(false) {
+            staged.extend_from_slice(line);
+        }
+    }
+    let staged = expand_source_regions(&staged, &mut defs)?;
+    let lines = physical_lines(&staged);
+
+    // Pass 3: expand each call (drawing on the definitions), pass the rest through.
+    let mut out = Vec::with_capacity(staged.len());
     let mut i = 0;
     while let Some(&line) = lines.get(i) {
-        if *consumed.get(i).unwrap_or(&false) {
-            i += 1;
-            continue;
-        }
-
         let (content, newline) = split_newline(line);
         let stripped = strip_leading_ws(content);
         if !stripped.starts_with(b"@@") {
@@ -1047,10 +1103,75 @@ fn references(body: &[u8], key: &str) -> bool {
         .any(|line| parse_paren_name(strip_leading_ws(line), b"@@foreach(").as_deref() == Some(key))
 }
 
-/// Step 0: replace each `@@foreach(key)` … `@@end` region (the delimiters
-/// included) with one instance of its body per value of `key`, in value order
-/// and separated by a blank line, `%key%` bound to that one value. Returns the
-/// rewritten splice text and the keys the regions consumed.
+/// Replace each of the source's own `@@foreach(key)` … `@@end` regions (the
+/// delimiters included) with one instance of its body per value of `key`,
+/// separated by a blank line and with `%key%` bound to that one value.
+///
+/// A source has no call and no template, so a definition in scope is the only
+/// value source — and using one counts as consuming it. A `%key%` outside every
+/// region of that key is left alone, for the postcondition to reject.
+fn expand_source_regions(source: &[u8], defs: &mut Definitions) -> Result<Vec<u8>, ErrorKind> {
+    let lines = physical_lines(source);
+    let mut out = Vec::with_capacity(source.len());
+    let mut i = 0;
+
+    while let Some(region) = next_region(&lines, i, &Site::Source)? {
+        for &line in lines.get(i..region.open).unwrap_or_default() {
+            out.extend_from_slice(line);
+        }
+
+        let values = match defs.consume(&region.key) {
+            Some(values) => values.to_vec(),
+            None => return Err(ErrorKind::RegionKeyUndefined { key: region.key }),
+        };
+        for (n, value) in values.iter().enumerate() {
+            if n > 0 {
+                out.push(b'\n');
+            }
+            for &body in lines.get(region.open + 1..region.close).unwrap_or_default() {
+                out.extend_from_slice(&substitute(body, &region.key, value));
+            }
+        }
+
+        i = region.close + 1;
+    }
+    for &line in lines.get(i..).unwrap_or_default() {
+        out.extend_from_slice(line);
+    }
+
+    Ok(out)
+}
+
+/// Reject a `@@define`, `@@use` or `@@default` line inside a source region.
+/// Those are position-independent: collected file-wide and deleted before the
+/// region is stamped, so one written inside would hoist silently out of it
+/// rather than repeat. This runs before that collection, the last point at
+/// which it is still visible. A malformed span is left to [`next_region`].
+fn guard_regions(lines: &[&[u8]]) -> Result<(), ErrorKind> {
+    let mut inside = false;
+    for &line in lines {
+        let stripped = strip_leading_ws(split_newline(line).0);
+        if is_directive(stripped, b"foreach") {
+            inside = true;
+        } else if stripped == b"@@end" {
+            inside = false;
+        } else if inside
+            && (is_binding(stripped, b"define")
+                || is_binding(stripped, b"default")
+                || stripped.starts_with(b"@@use("))
+        {
+            return Err(ErrorKind::DirectiveInRegion {
+                line: lossy(stripped),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Step 0: the same, for a template's regions — where the values come from the
+/// call instead. Returns the rewritten splice text and the keys the regions
+/// consumed.
 fn expand_regions(
     splice: &[u8],
     args: &mut Args,
@@ -1058,78 +1179,34 @@ fn expand_regions(
     name: &str,
 ) -> Result<(Vec<u8>, Vec<String>), ErrorKind> {
     let lines: Vec<&[u8]> = splice.split(|&b| b == b'\n').collect();
+    let site = Site::Template(name.to_owned());
     let mut out = Vec::with_capacity(splice.len());
     let mut iterated: Vec<String> = Vec::new();
     let mut first = true;
     let mut i = 0;
 
-    while let Some(&line) = lines.get(i) {
-        let stripped = strip_leading_ws(line);
-        if !is_directive(stripped, b"foreach") {
-            if stripped == b"@@end" {
-                return Err(ErrorKind::UnopenedRegion {
-                    name: name.to_owned(),
-                });
-            }
+    while let Some(region) = next_region(&lines, i, &site)? {
+        for &line in lines.get(i..region.open).unwrap_or_default() {
             push_line(&mut out, &mut first, line);
-            i += 1;
-            continue;
-        }
-
-        let key = parse_paren_name(stripped, b"@@foreach(").ok_or_else(|| {
-            ErrorKind::MalformedForeach {
-                name: name.to_owned(),
-                line: lossy(stripped),
-            }
-        })?;
-
-        // Regions do not nest, so the first `@@end` closes this one and an
-        // opener before it is an error rather than an inner region.
-        let mut close = i + 1;
-        loop {
-            let inner = lines
-                .get(close)
-                .copied()
-                .ok_or_else(|| ErrorKind::UnterminatedRegion {
-                    name: name.to_owned(),
-                    key: key.clone(),
-                })?;
-            let inner = strip_leading_ws(inner);
-            if inner == b"@@end" {
-                break;
-            }
-            if is_directive(inner, b"foreach") {
-                return Err(ErrorKind::NestedRegion {
-                    name: name.to_owned(),
-                    key,
-                });
-            }
-            close += 1;
-        }
-        if close == i + 1 {
-            return Err(ErrorKind::EmptyRegion {
-                name: name.to_owned(),
-                key,
-            });
         }
 
         // Rejected here rather than left to the absent-key error below, which
         // would blame the template for what the call did.
-        if args.is_suppressed(&key) {
+        if args.is_suppressed(&region.key) {
             return Err(ErrorKind::SuppressIterated {
                 name: name.to_owned(),
-                key,
+                key: region.key,
             });
         }
 
         // Unlike a slot, an iterated key has no absent form: there is no
         // sensible number of instances to emit.
-        let values = match resolve(args, defs, &key) {
+        let values = match resolve(args, defs, &region.key) {
             Some(values) => values.to_vec(),
             None => {
                 return Err(ErrorKind::RegionKeyAbsent {
                     name: name.to_owned(),
-                    key,
+                    key: region.key,
                 });
             }
         };
@@ -1139,18 +1216,80 @@ fn expand_regions(
             }
             // A slot line of the iterated key is `<ws>%key%`, so substituting a
             // single value in place leaves exactly the slot's indentation.
-            for &body in lines.get(i + 1..close).unwrap_or_default() {
-                push_line(&mut out, &mut first, &substitute(body, &key, value));
+            for &body in lines.get(region.open + 1..region.close).unwrap_or_default() {
+                push_line(&mut out, &mut first, &substitute(body, &region.key, value));
             }
         }
 
-        if !iterated.contains(&key) {
-            iterated.push(key);
+        if !iterated.contains(&region.key) {
+            iterated.push(region.key);
         }
-        i = close + 1;
+        i = region.close + 1;
+    }
+    for &line in lines.get(i..).unwrap_or_default() {
+        push_line(&mut out, &mut first, line);
     }
 
     Ok((out, iterated))
+}
+
+/// The next region in `lines` at or after `from`, `None` once none remains. The
+/// lines skipped on the way must be ordinary text — a stray `@@end` is an error.
+/// Region shape is one grammar for both sites, so one scanner serves both.
+fn next_region(lines: &[&[u8]], from: usize, site: &Site) -> Result<Option<Region>, ErrorKind> {
+    let mut open = from;
+    let stripped = loop {
+        let stripped = match lines.get(open) {
+            Some(&line) => strip_leading_ws(split_newline(line).0),
+            None => return Ok(None),
+        };
+        if is_directive(stripped, b"foreach") {
+            break stripped;
+        }
+        if stripped == b"@@end" {
+            return Err(ErrorKind::UnopenedRegion { site: site.clone() });
+        }
+        open += 1;
+    };
+
+    let key =
+        parse_paren_name(stripped, b"@@foreach(").ok_or_else(|| ErrorKind::MalformedForeach {
+            site: site.clone(),
+            line: lossy(stripped),
+        })?;
+
+    // Regions do not nest, so the first `@@end` closes this one and an opener
+    // before it is an error rather than an inner region.
+    let mut close = open + 1;
+    loop {
+        let inner = match lines.get(close) {
+            Some(&line) => strip_leading_ws(split_newline(line).0),
+            None => {
+                return Err(ErrorKind::UnterminatedRegion {
+                    site: site.clone(),
+                    key,
+                });
+            }
+        };
+        if inner == b"@@end" {
+            break;
+        }
+        if is_directive(inner, b"foreach") {
+            return Err(ErrorKind::NestedRegion {
+                site: site.clone(),
+                key,
+            });
+        }
+        close += 1;
+    }
+    if close == open + 1 {
+        return Err(ErrorKind::EmptyRegion {
+            site: site.clone(),
+            key,
+        });
+    }
+
+    Ok(Some(Region { key, open, close }))
 }
 
 /// Replace every `%key%` in one line with `value`, leaving other keys'
@@ -1286,11 +1425,7 @@ fn resolve<'a>(args: &'a mut Args, defs: &'a mut Definitions, key: &str) -> Opti
         }
         return Some(&args.entries[idx].values);
     }
-    if let Some(idx) = defs.index_of(key) {
-        defs.entries[idx].used = true;
-        return Some(&defs.entries[idx].values);
-    }
-    None
+    defs.consume(key)
 }
 
 /// Reject the two whole-file leftovers the grammar forbids: a line that still
@@ -1529,7 +1664,10 @@ mod tests {
         let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
 
         assert!(kind(t.expand(b"@@missing\n")).contains("unknown template @@missing"));
-        assert!(kind(t.expand(b"@@foreach\n")).contains("reserved directive name @@foreach"));
+        assert!(kind(t.expand(b"@@use\n")).contains("reserved directive name @@use"));
+        // v4 made `@@foreach` a source form too, so a bare one is a malformed
+        // region opener — the pointed error, ahead of the reserved-name backstop.
+        assert!(kind(t.expand(b"@@foreach\n")).contains("malformed @@foreach line"));
         assert!(kind(t.expand(b"@@slot()\n")).contains("malformed directive"));
         assert!(kind(t.expand(b"@@slot(x=)\n")).contains("empty value for key 'x'"));
         assert!(kind(t.expand(b"@@none(x=1)\n")).contains("key 'x' is not used"));
@@ -1807,6 +1945,76 @@ mod tests {
         // has nothing left to take.
         assert!(kind(t.expand(b"@@slot(k=1)\n")).contains("iterated key 'k' referenced outside"));
         assert!(kind(t.expand(b"@@inline(k=1)\n")).contains("iterated key 'k' referenced outside"));
+    }
+
+    #[test]
+    fn a_source_region_repeats_its_block_per_defined_value() {
+        // No call and no template at source level: the values come from a
+        // definition, in-file or imported alike, and the region consumes it.
+        let t = Templates::with(&[
+            ("t", b"Cast(%who%)\n"),
+            ("defs/party", b"@@define pn(1; 2)\n"),
+        ]);
+        let src = b"@@define pn(1; 2)\nA\n@@foreach(pn)\nSee(Player%pn%)\n@@end\nB\n";
+        assert_eq!(
+            t.expand(src).expect("region"),
+            b"A\nSee(Player1)\n\nSee(Player2)\nB\n"
+        );
+        assert_eq!(
+            t.expand(b"@@use(party)\n@@foreach(pn)\nX(%pn%)\n@@end\n")
+                .expect("imported"),
+            b"X(1)\n\nX(2)\n"
+        );
+
+        // A directive inside a region is stamped first and expanded after, so
+        // each instance is an ordinary call with its `%pn%` already resolved.
+        assert_eq!(
+            t.expand(b"@@define pn(1; 2)\n@@foreach(pn)\n@@t(who=Player%pn%)\n@@end\n")
+                .expect("call in region"),
+            b"Cast(Player1)\n\nCast(Player2)\n"
+        );
+    }
+
+    #[test]
+    fn source_region_misuse_is_rejected() {
+        let t = Templates::with(&[("t", b"Z\n")]);
+        let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
+        let def = "@@define k(1; 2)\n".as_bytes();
+        let src = |body: &str| [def, body.as_bytes()].concat();
+
+        assert!(
+            kind(t.expand(&src("@@foreach(k)\n@@foreach(j)\nX\n@@end\n@@end\n")))
+                .contains("nested @@foreach region")
+        );
+        assert!(
+            kind(t.expand(&src("@@foreach(k)\nX\n"))).contains("unterminated @@foreach(k) region")
+        );
+        assert!(kind(t.expand(&src("X\n@@end\n"))).contains("@@end without @@foreach"));
+        assert!(
+            kind(t.expand(&src("@@foreach(k)\n@@end\n"))).contains("empty @@foreach(k) region")
+        );
+        assert!(
+            kind(t.expand(&src("@@foreach k\nX\n@@end\n"))).contains("malformed @@foreach line")
+        );
+        // Template defaults cannot reach here — there is no call and no template.
+        assert!(
+            kind(t.expand(b"@@foreach(j)\nX\n@@end\n"))
+                .contains("@@foreach key 'j' has no definition in scope")
+        );
+        // Position-independent directives would hoist out of the region instead
+        // of repeating, so they are rejected before they can be collected.
+        for inner in ["@@define j(a)", "@@use(shared)", "@@default j(a)"] {
+            let region = format!("@@foreach(k)\n{inner}\nX\n@@end\n");
+            assert!(
+                kind(t.expand(&src(&region))).contains("inside a @@foreach region"),
+                "{inner}"
+            );
+        }
+        // The source is named by the wrapping message, so no `@@template:`
+        // prefix leads these — unlike their template-side twins.
+        assert!(
+            kind(t.expand(&src("@@foreach(k)\n@@end\n"))).starts_with("empty @@foreach(k) region")
+        );
     }
 
     #[test]

@@ -162,9 +162,10 @@ Some mods also preprocess their BAF with their own directives. `--templates`
 supports one such convention (ImprovedAnvil's): a whole line `@@name` is replaced
 by `<dir>/name.baf` before compiling, so a shared fragment lives in one place. A
 directive may pass `@@name(key=value; …)` args (also written over several lines)
-that fill the template's `%key%` slot lines and inline placeholders. A template
-may repeat a whole block per value by wrapping it in `@@foreach(key)` … `@@end`.
-A file-scoped `@@define key(…)` supplies a key that calls omit, and `@@use(name)`
+that fill the template's `%key%` slot lines and inline placeholders. Either a
+template or a source may repeat a whole block per value by wrapping it in
+`@@foreach(key)` … `@@end`. A file-scoped `@@define key(…)` supplies a key that
+calls omit — and the values a source's own region iterates — while `@@use(name)`
 imports such definitions from a shared `<dir>/defs/name.baf`, so a value shared
 across scripts lives in one place. A template may open with `@@default key(…)`
 lines of its own — the last resort when neither the call nor a definition
