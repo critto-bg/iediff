@@ -2,7 +2,7 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v4). This
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v4.1). This
 //! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
@@ -31,7 +31,9 @@
 //!
 //! One call may opt out of a definition with the pair `key=@none`. That call
 //! alone loses the key, as if nothing had provided it, so its slot lines vanish.
-//! This is an opt-out, not an override — no form replaces a definition's values.
+//! A line that names the key inline vanishes whole, which is how a template
+//! makes a parameterized line optional. This is an opt-out, not an override — no
+//! form replaces a definition's values.
 //!
 //! A template may in turn open with a block of `@@default key(…)` lines naming
 //! its own fallbacks. One precedence follows: the call's args, else a
@@ -314,10 +316,6 @@ enum ErrorKind {
         name: String,
         key: String,
     },
-    SuppressInline {
-        name: String,
-        key: String,
-    },
     SuppressIterated {
         name: String,
         key: String,
@@ -455,9 +453,6 @@ impl fmt::Display for ErrorKind {
                     "@@{name}: @none for key '{key}', which has no definition or default to suppress"
                 )
             }
-            ErrorKind::SuppressInline { name, key } => {
-                write!(f, "@@{name}: suppressed key '{key}' is required inline")
-            }
             ErrorKind::SuppressIterated { name, key } => {
                 write!(
                     f,
@@ -465,7 +460,7 @@ impl fmt::Display for ErrorKind {
                 )
             }
             ErrorKind::SuppressUnreferenced { name, key } => {
-                write!(f, "@@{name}: @none key '{key}' is not referenced by a slot")
+                write!(f, "@@{name}: @none key '{key}' is not referenced")
             }
             ErrorKind::DefaultInSource { line } => {
                 write!(f, "@@default is valid only in a template: {line}")
@@ -1009,10 +1004,12 @@ fn expand_call(
 
     let (after_regions, iterated) = expand_regions(splice, &mut args, defs, name)?;
     let after_slots = expand_slots(&after_regions, &mut args, defs, &iterated, name)?;
-    let expanded = expand_inline(&after_slots, &mut args, defs, &iterated, name)?;
+    let after_deletions = delete_suppressed_lines(&after_slots, &mut args);
+    let expanded = expand_inline(&after_deletions, &mut args, defs, &iterated, name)?;
 
-    // A suppressed key counts as used by the slot line it deletes. With no such
-    // slot, the call opted out of something the template never asked for.
+    // A suppressed key counts as used by whatever it deleted, slot line or
+    // inline line. With neither, the call opted out of something the template
+    // never asked for.
     match args.first_unused() {
         Some(entry) if entry.suppressed => Err(ErrorKind::SuppressUnreferenced {
             name: name.to_owned(),
@@ -1086,17 +1083,24 @@ fn split_defaults<'a>(splice: &'a [u8], name: &str) -> Result<(Vec<Binding>, &'a
 /// Whether a template body mentions `key` at all, as a `%key%` placeholder
 /// (slot or inline) or as the header of an `@@foreach` region.
 fn references(body: &[u8], key: &str) -> bool {
+    mentions(body, key)
+        || body.split(|&b| b == b'\n').any(|line| {
+            parse_paren_name(strip_leading_ws(line), b"@@foreach(").as_deref() == Some(key)
+        })
+}
+
+/// Whether `buf` holds a `%key%` placeholder anywhere.
+fn mentions(buf: &[u8], key: &str) -> bool {
     let mut i = 0;
-    while i < body.len() {
-        match placeholder_at(body, i) {
+    while i < buf.len() {
+        match placeholder_at(buf, i) {
             Some((found, _)) if found == key => return true,
             Some((_, end)) => i = end,
             None => i += 1,
         }
     }
 
-    body.split(|&b| b == b'\n')
-        .any(|line| parse_paren_name(strip_leading_ws(line), b"@@foreach(").as_deref() == Some(key))
+    false
 }
 
 /// Replace each of the source's own `@@foreach(key)` … `@@end` regions, the
@@ -1361,6 +1365,45 @@ fn expand_slots(
     Ok(out)
 }
 
+/// Delete every line that still names a suppressed key inline, so `key=@none`
+/// makes a parameterized line disappear rather than fail. Slot lines are already
+/// gone, so any `%key%` left is an inline one.
+///
+/// Marking precedes deletion: one line may name several suppressed keys, and
+/// removing it for the first would hide the rest from the unreferenced check.
+///
+/// A deleted line never reaches [`expand_inline`], so the other keys on it
+/// consume nothing. An arg only that line named is unused (fatal), and a
+/// definition only deleted lines named stays unconsumed. Both are deliberate:
+/// the line is gone, so nothing on it can still be needed.
+fn delete_suppressed_lines(buf: &[u8], args: &mut Args) -> Vec<u8> {
+    let keys: Vec<String> = args
+        .entries
+        .iter()
+        .filter(|e| e.suppressed)
+        .map(|e| e.key.clone())
+        .collect();
+    if keys.is_empty() {
+        return buf.to_vec();
+    }
+
+    for key in &keys {
+        if let Some(entry) = args.index_of(key).and_then(|i| args.entries.get_mut(i)) {
+            entry.used |= mentions(buf, key);
+        }
+    }
+
+    let mut out = Vec::with_capacity(buf.len());
+    let mut first = true;
+    for line in buf.split(|&b| b == b'\n') {
+        if !keys.iter().any(|key| mentions(line, key)) {
+            push_line(&mut out, &mut first, line);
+        }
+    }
+
+    out
+}
+
 /// Replace each remaining `%key%` with its single value. A provided key is
 /// marked used. An unprovided one stays for the postcondition to reject. A
 /// multi-value key used inline is a fatal error.
@@ -1376,15 +1419,6 @@ fn expand_inline(
     while let Some(&b) = buf.get(i) {
         if let Some((key, end)) = placeholder_at(buf, i) {
             reject_iterated(iterated, key, name)?;
-            // As for a region: a suppressed key here would otherwise reach the
-            // postcondition as an unresolved placeholder, naming the template
-            // rather than the call.
-            if args.is_suppressed(key) {
-                return Err(ErrorKind::SuppressInline {
-                    name: name.to_owned(),
-                    key: key.to_owned(),
-                });
-            }
             match resolve(args, defs, key) {
                 Some(values) if values.len() > 1 => {
                     return Err(ErrorKind::InlineMultiValue {
@@ -1416,8 +1450,8 @@ fn resolve<'a>(args: &'a mut Args, defs: &'a mut Definitions, key: &str) -> Opti
     if let Some(idx) = args.index_of(key) {
         args.entries[idx].used = true;
         // An `@none` pair stops the lookup short of the definition — this is
-        // where the key becomes absent. Only a slot reaches it. A region or an
-        // inline use of a suppressed key fails earlier.
+        // where the key becomes absent. Only a slot reaches it: an inline use
+        // took its line with it, and a region fails earlier.
         if args.entries[idx].suppressed {
             return None;
         }
@@ -1790,11 +1824,62 @@ mod tests {
     }
 
     #[test]
+    fn a_none_pair_deletes_the_line_that_names_the_key_inline() {
+        let t = Templates::with(&[
+            (
+                "opt",
+                b"@@default k(A)\n\nIF\n  Test(%k%)\n  Global()\nEND\n",
+            ),
+            ("two", b"IF\n  X(%a%,%b%)\n  Y\nEND\n"),
+            (
+                "region",
+                b"@@default k(A)\n\n@@foreach(p)\nX(%p%,%k%)\nY(%p%)\n@@end\n",
+            ),
+            ("strand", b"@@default k(A)\n\nX(%k%,%c%)\n"),
+        ]);
+        let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
+
+        // This is how a template offers an optional parameterized line: the
+        // default fills it, and `@none` takes it away whole.
+        assert_eq!(
+            t.expand(b"@@opt\n").expect("default"),
+            b"IF\n  Test(A)\n  Global()\nEND\n"
+        );
+        assert_eq!(
+            t.expand(b"@@opt(k=@none)\n").expect("deleted"),
+            b"IF\n  Global()\nEND\n"
+        );
+
+        // Counting precedes deletion, so one line answers for both pairs. Were
+        // the first deletion to hide the second key, its pair would look unused.
+        assert_eq!(
+            t.expand(b"@@define a(1)\n@@define b(2)\n@@two\n@@two(a=@none; b=@none)\n")
+                .expect("both counted"),
+            b"IF\n  X(1,2)\n  Y\nEND\nIF\n  Y\nEND\n"
+        );
+
+        // A region stamps the line into every instance, and every copy goes.
+        assert_eq!(
+            t.expand(b"@@region(p=1; p=2)\n").expect("stamped"),
+            b"X(1,A)\nY(1)\n\nX(2,A)\nY(2)\n"
+        );
+        assert_eq!(
+            t.expand(b"@@region(p=1; p=2; k=@none)\n")
+                .expect("stamped and deleted"),
+            b"Y(1)\n\nY(2)\n"
+        );
+
+        // A deleted line consumes nothing, so an arg it alone carried is unused,
+        // and a definition it alone named finds no consumer.
+        assert!(kind(t.expand(b"@@strand(k=@none; c=9)\n")).contains("key 'c' is not used"));
+        assert!(kind(t.expand(b"@@define c(9)\n@@strand(k=@none)\n")).contains("used by no call"));
+    }
+
+    #[test]
     fn none_misuse_is_rejected() {
         let t = Templates::with(&[
             ("t", b"IF\n  %k%\nEND\n"),
             ("plain", b"Z\n"),
-            ("inline", b"Cast(%k%)\n"),
             ("region", b"@@foreach(k)\nX(%k%)\n@@end\n"),
         ]);
         let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
@@ -1810,9 +1895,9 @@ mod tests {
         assert!(
             kind(t.expand(b"@@define k(a)\n@@t(k=@none; k=@none)\n")).contains("repeated @none")
         );
-        // The template must reference the key, and only by a slot.
+        // The template must reference the key, by a slot or inline, and must not
+        // iterate it.
         assert!(kind(t.expand(b"@@define k(a)\n@@plain(k=@none)\n")).contains("not referenced"));
-        assert!(kind(t.expand(b"@@define k(a)\n@@inline(k=@none)\n")).contains("required inline"));
         assert!(
             kind(t.expand(b"@@define k(a)\n@@region(k=@none)\n")).contains("required by @@foreach")
         );
