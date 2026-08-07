@@ -78,6 +78,19 @@ impl Args {
         }
     }
 
+    /// Fill a key from the template's own default. The entry starts used, since
+    /// a call answers only for the keys it passed. The tpa gets this for free: it
+    /// materializes a default where a placeholder reads it, so one nothing reads
+    /// — a line deletion took it — never enters its ledger at all.
+    fn push_default(&mut self, key: &str, values: &[Vec<u8>]) {
+        for value in values {
+            self.push(key.to_owned(), value.clone());
+        }
+        if let Some(entry) = self.index_of(key).and_then(|i| self.entries.get_mut(i)) {
+            entry.used = true;
+        }
+    }
+
     /// Record an `@none` pair. The entry holds no value. It exists only to drop
     /// the key from this call: [`resolve`] stops at it, so the definition it
     /// opts out of never reaches the template.
@@ -996,9 +1009,7 @@ fn expand_call(
     // pair fills the args slot, so it blocks both lower sources at once.
     for binding in &defaults {
         if args.index_of(&binding.key).is_none() && defs.index_of(&binding.key).is_none() {
-            for value in &binding.values {
-                args.push(binding.key.clone(), value.clone());
-            }
+            args.push_default(&binding.key, &binding.values);
         }
     }
 
@@ -1835,6 +1846,7 @@ mod tests {
                 "region",
                 b"@@default k(A)\n\n@@foreach(p)\nX(%p%,%k%)\nY(%p%)\n@@end\n",
             ),
+            ("pair", b"@@default a(1)\n@@default b(2)\n\nX(%a%,%b%)\nY\n"),
             ("strand", b"@@default k(A)\n\nX(%k%,%c%)\n"),
         ]);
         let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
@@ -1857,6 +1869,13 @@ mod tests {
                 .expect("both counted"),
             b"IF\n  X(1,2)\n  Y\nEND\nIF\n  Y\nEND\n"
         );
+        // The same with defaults, where a lost count shows as the pair's own
+        // fatal rather than as a definition no call consumed.
+        assert_eq!(
+            t.expand(b"@@pair(a=@none; b=@none)\n")
+                .expect("both counted"),
+            b"Y\n"
+        );
 
         // A region stamps the line into every instance, and every copy goes.
         assert_eq!(
@@ -1867,6 +1886,21 @@ mod tests {
             t.expand(b"@@region(p=1; p=2; k=@none)\n")
                 .expect("stamped and deleted"),
             b"Y(1)\n\nY(2)\n"
+        );
+
+        // A default the deleted line alone named is different from an arg: the
+        // template offered it, so no call answers for it. Two calls that suppress
+        // different sets each get their own answer, in either order.
+        assert_eq!(t.expand(b"@@pair(a=@none)\n").expect("stranded"), b"Y\n");
+        assert_eq!(
+            t.expand(b"@@pair(a=@none)\n@@pair(a=@none; b=@none)\n")
+                .expect("per call"),
+            b"Y\nY\n"
+        );
+        assert_eq!(
+            t.expand(b"@@pair(a=@none; b=@none)\n@@pair(a=@none)\n")
+                .expect("per call"),
+            b"Y\nY\n"
         );
 
         // A deleted line consumes nothing, so an arg it alone carried is unused,
