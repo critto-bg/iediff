@@ -2,7 +2,7 @@
 //! expanded from a directory of template fragments before the source reaches
 //! the compiler.
 //!
-//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v4.1). This
+//! The normative grammar is `baf-preprocessor-grammar.md` (syntax v4.2). This
 //! mirrors the mod's own `lib/tpa/baf_preprocessor.tpa`, and the two MUST
 //! produce byte-identical expansions.
 //!
@@ -39,7 +39,9 @@
 //! its own fallbacks. One precedence follows: the call's args, else a
 //! definition, else the template's default. Unlike a definition, a default no
 //! call ever reaches is not an error — the corpus decides whether it is needed,
-//! not any one file.
+//! not any one file. A default of `@none` declares the key *optional*: where no
+//! arg and no definition provide it, the call suppresses it, exactly as the pair
+//! `key=@none` would.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -49,7 +51,8 @@ use std::path::{Path, PathBuf};
 const RESERVED: [&str; 5] = ["foreach", "end", "define", "use", "default"];
 
 /// The arg value that suppresses a key. No definition may hold it as a value, so
-/// the two readings never collide.
+/// the two readings never collide. A template default may (v4.2), where it says
+/// the key is optional rather than naming a fallback.
 const SUPPRESS: &[u8] = b"@none";
 
 /// The `key=value` pairs of one directive, in call order. Duplicate keys
@@ -91,9 +94,10 @@ impl Args {
         }
     }
 
-    /// Record an `@none` pair. The entry holds no value. It exists only to drop
-    /// the key from this call: [`resolve`] stops at it, so the definition it
-    /// opts out of never reaches the template.
+    /// Record a suppression — an `@none` pair, or a key whose template default
+    /// is `@none` and which nothing else provides. The entry holds no value. It
+    /// exists only to drop the key from this call: [`resolve`] stops at it, so
+    /// the source it opts out of never reaches the template.
     fn suppress(&mut self, key: String) {
         self.entries.push(Entry {
             key,
@@ -194,6 +198,10 @@ struct Def {
 /// One `@@default` from a template's opening block: the values a call uses when
 /// neither its args nor a definition provide the key. It carries no `used` flag,
 /// because a default no call reaches is not an error, unlike a definition.
+///
+/// No values is the `@none` default of v4.2: the key is optional, and a call
+/// that no other source provides it suppresses it. [`split_defaults`] makes the
+/// encoding; [`expand_call`] reads it.
 struct Binding {
     key: String,
     values: Vec<Vec<u8>>,
@@ -352,6 +360,10 @@ enum ErrorKind {
         name: String,
         key: String,
     },
+    DefaultNoneMixed {
+        name: String,
+        key: String,
+    },
     MalformedForeach {
         site: Site,
         line: String,
@@ -489,6 +501,9 @@ impl fmt::Display for ErrorKind {
                     f,
                     "@@{name}: @@default key '{key}' is not referenced by the template"
                 )
+            }
+            ErrorKind::DefaultNoneMixed { name, key } => {
+                write!(f, "@@{name}: @@default {key} mixes @none with values")
             }
             ErrorKind::MalformedForeach { site, line } => {
                 write!(f, "{site}malformed @@foreach line: {line}")
@@ -842,7 +857,7 @@ fn parse_binding(
         if value.is_empty() {
             return Err(malformed(stripped));
         }
-        if value == SUPPRESS {
+        if value == SUPPRESS && !none_allowed(head) {
             return Err(ErrorKind::ReservedValue {
                 head,
                 key: key.to_owned(),
@@ -851,6 +866,14 @@ fn parse_binding(
         values.push(value.to_vec());
     }
     Ok((key.to_owned(), values, i))
+}
+
+/// Whether `@none` is a legal value of this binding. A definition never holds
+/// one. A template default does since v4.2, where a sole `@none` declares an
+/// optional key — [`split_defaults`] resolves it, since only the caller knows
+/// the template to blame for a mixed one.
+fn none_allowed(head: &str) -> bool {
+    head == "default"
 }
 
 /// Collect the `value;` lines of a multi-line binding, from `start` to the lone
@@ -883,7 +906,7 @@ fn gather_binding_values(
                 if value.is_empty() {
                     return Err(malformed(stripped));
                 }
-                if value == SUPPRESS {
+                if value == SUPPRESS && !none_allowed(head) {
                     return Err(ErrorKind::ReservedValue {
                         head,
                         key: key.to_owned(),
@@ -1007,9 +1030,17 @@ fn expand_call(
     // Precedence runs args, then a definition, then the template's own default.
     // A default applies only where both higher sources are silent. A suppression
     // pair fills the args slot, so it blocks both lower sources at once.
+    //
+    // An `@none` default (no values) suppresses the key here instead, which
+    // leaves the call indistinguishable from one that passed `key=@none`. Every
+    // later step then applies unchanged — regions reject it, slot lines and
+    // inline lines delete, the unreferenced check counts it.
     for binding in &defaults {
         if args.index_of(&binding.key).is_none() && defs.index_of(&binding.key).is_none() {
-            args.push_default(&binding.key, &binding.values);
+            match binding.values.is_empty() {
+                true => args.suppress(binding.key.clone()),
+                false => args.push_default(&binding.key, &binding.values),
+            }
         }
     }
 
@@ -1052,6 +1083,7 @@ fn split_defaults<'a>(splice: &'a [u8], name: &str) -> Result<(Vec<Binding>, &'a
                     key,
                 });
             }
+            let values = resolve_none_default(name, &key, values)?;
             defaults.push(Binding { key, values });
             i = end + 1;
         } else if stripped.is_empty() && !defaults.is_empty() {
@@ -1089,6 +1121,27 @@ fn split_defaults<'a>(splice: &'a [u8], name: &str) -> Result<(Vec<Binding>, &'a
     }
 
     Ok((defaults, body))
+}
+
+/// Turn the parsed values of one `@@default` into its binding values. A sole
+/// `@none` (v4.2) becomes no values at all — the encoding of an optional key.
+/// Mixed with real values it has no reading: the key cannot both fall back and
+/// be absent.
+fn resolve_none_default(
+    name: &str,
+    key: &str,
+    values: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, ErrorKind> {
+    if !values.iter().any(|v| v.as_slice() == SUPPRESS) {
+        return Ok(values);
+    }
+    if values.len() > 1 {
+        return Err(ErrorKind::DefaultNoneMixed {
+            name: name.to_owned(),
+            key: key.to_owned(),
+        });
+    }
+    Ok(Vec::new())
 }
 
 /// Whether a template body mentions `key` at all, as a `%key%` placeholder
@@ -1973,13 +2026,59 @@ mod tests {
     }
 
     #[test]
+    fn a_none_default_makes_a_key_optional() {
+        let t = Templates::with(&[
+            (
+                "opt",
+                b"@@default k(@none)\n\nIF\n  %k%\n  Test(%k%)\n  Global()\nEND\n",
+            ),
+            ("mline", b"@@default k(\n  @none;\n)\n\nX(%k%)\nY\n"),
+            ("pair", b"@@default r(@none)\n\nX(%r%,%pct%)\nY\n"),
+        ]);
+        let kind = |r: Result<Vec<u8>, PreprocessError>| format!("{}", r.expect_err("fatal").kind);
+        let bare = b"IF\n  Global()\nEND\n";
+
+        // Nothing provides the key, so the call drops it: the slot line goes and
+        // the line naming it inline goes whole. A value brings both back.
+        assert_eq!(t.expand(b"@@opt\n").expect("optional"), bare);
+        assert_eq!(
+            t.expand(b"@@opt(k=A)\n").expect("provided"),
+            b"IF\n  A\n  Test(A)\n  Global()\nEND\n"
+        );
+        // An explicit pair says the same thing, and stays legal.
+        assert_eq!(t.expand(b"@@opt(k=@none)\n").expect("redundant"), bare);
+        assert_eq!(t.expand(b"@@mline\n").expect("multi-line form"), b"Y\n");
+
+        // The precedence ladder is unchanged: a definition in scope outranks the
+        // default, and another call can still opt out of it.
+        assert_eq!(
+            t.expand(b"@@define k(C)\n@@opt\n@@opt(k=@none)\n")
+                .expect("define wins"),
+            b"IF\n  C\n  Test(C)\n  Global()\nEND\nIF\n  Global()\nEND\n"
+        );
+
+        // A parameter that rides on an optional line falls with it, so half an
+        // add-on is the unused-key error rather than a silent half-expansion.
+        assert_eq!(
+            t.expand(b"@@pair(r=1; pct=95)\n").expect("both"),
+            b"X(1,95)\nY\n"
+        );
+        assert!(kind(t.expand(b"@@pair(pct=95)\n")).contains("key 'pct' is not used"));
+    }
+
+    #[test]
     fn default_misuse_is_rejected() {
         let t = Templates::with(&[
             ("t", b"@@default k(a)\n\n%k%\n"),
             ("dup", b"@@default k(a)\n@@default k(b)\n\n%k%\n"),
             ("late", b"%k%\n@@default k(a)\n"),
             ("dead", b"@@default j(a)\n\n%k%\n"),
-            ("reserved", b"@@default k(@none)\n\n%k%\n"),
+            ("mixed", b"@@default k(a; @none)\n\n%k%\n"),
+            ("dead_none", b"@@default j(@none)\n\n%k%\n"),
+            (
+                "region",
+                b"@@default k(@none)\n\n@@foreach(k)\nX(%k%)\n@@end\n",
+            ),
             ("empty", b"@@default k()\n\n%k%\n"),
             ("unterm", b"@@default k(\n  a;\n"),
             ("defs/d", b"@@default k(a)\n"),
@@ -1996,7 +2095,12 @@ mod tests {
         assert!(kind(t.expand(b"@@dup\n")).contains("duplicate @@default for key 'k'"));
         // A default the body never mentions could never apply.
         assert!(kind(t.expand(b"@@dead\n")).contains("@@default key 'j' is not referenced"));
-        assert!(kind(t.expand(b"@@reserved\n")).contains("reserved as a value"));
+        // `@none` says the key is optional, which no fallback value can also
+        // say. An optional key is still a key the body must name, and one no
+        // instance count would suit cannot be iterated.
+        assert!(kind(t.expand(b"@@mixed\n")).contains("mixes @none with values"));
+        assert!(kind(t.expand(b"@@dead_none\n")).contains("@@default key 'j' is not referenced"));
+        assert!(kind(t.expand(b"@@region\n")).contains("required by @@foreach"));
         assert!(kind(t.expand(b"@@empty\n")).contains("malformed directive"));
         assert!(kind(t.expand(b"@@unterm\n")).contains("unterminated multi-line @@default k"));
     }
