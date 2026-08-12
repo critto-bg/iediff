@@ -57,6 +57,7 @@ Usage:
   iediff <name>.ext --uses list the resources that reference this resource
   iediff strref:<n>        resolve a dialog.tlk string by index
   iediff strref:<n> --uses list the resources that reference the string
+  iediff --edges           dump every reference in the index, one record per line
   iediff --file <path>     print a discrete file by path, bypassing the index
                            (a .baf is compiled to a .bcs next to it)
   iediff --stats           summarise the KEY index and override directory
@@ -68,7 +69,7 @@ Options:
   --file                read the argument as a filesystem path (type from its extension)
   --uses                find where a resource or string is referenced; the query
                         must name a type (sw1h01.itm, strref:8000)
-  --type <ext>          with --uses, scan only one resource type (e.g. itm)
+  --type <ext>          with --uses or --edges, scan only one resource type
   --out <dir>           with --file on a .baf, write the .bcs into <dir>
   --using <tra>         with --file on a .baf, resolve @N strings from this tra
                         (repeatable; later files win a shared @N)
@@ -87,6 +88,15 @@ calls' arguments typed, so a script naming an item, spell (by number too),
 creature, store or strref is a hard hit. A .pro is named by projectl.ids number
 rather than by resref, and resolved through that table. 2DA/IDS tables are
 scanned as text and reported separately as candidates.
+
+--edges dumps those same references with nothing filtered out: one tab-separated
+record per occurrence, holding the source and its type, the field path, the
+target and its type, hard or soft, whether the target resolves (1/0), and the
+layer the source came from. Records are sorted by source type, then source, then
+path. Naming a resource (iediff map.are --edges) dumps only its references. A
+2DA/IDS token is resolved against the index, so a table naming a resource that
+does not exist contributes nothing — only a typed field reports a dangling
+reference.
 
 Reads ./chitin.key if present (run from a game root), else game/chitin.key.
 ";
@@ -351,6 +361,14 @@ pub fn decrypt_text(bytes: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+/// The type an extension names, as a query suffix or a `--type` argument.
+/// Extensions are matched in lower case; an unknown one is an error rather than
+/// a silent empty search.
+fn resource_type(ext: &str) -> Result<u16, String> {
+    extension_type(&ext.to_ascii_lowercase())
+        .ok_or_else(|| format!("unknown resource extension: .{ext}"))
+}
+
 /// Resolve a query and print it. A query loads a single resource only when it
 /// fully specifies both name and type (`AERIE6.cre`) and that resource exists;
 /// every other query — a name without an extension, or a `name.ext` with no
@@ -376,10 +394,7 @@ fn lookup_and_print(
     let type_filter = match ext {
         None => None,
         Some("") => return Err(format!("malformed query (empty extension): {query:?}").into()),
-        Some(ext) => match extension_type(&ext.to_ascii_lowercase()) {
-            Some(res_type) => Some(res_type),
-            None => return Err(format!("unknown resource extension: .{ext}").into()),
-        },
+        Some(ext) => Some(resource_type(ext)?),
     };
 
     // An exact hit needs both name and type. Try it; a not-found falls through
@@ -629,13 +644,7 @@ fn print_strref_uses(
             "strref -1 (0xffffffff) is the \"no string\" sentinel, not a searchable index".into(),
         );
     }
-    let type_filter = match type_ext {
-        None => None,
-        Some(ext) => Some(
-            extension_type(&ext.to_ascii_lowercase())
-                .ok_or_else(|| format!("unknown resource extension: .{ext}"))?,
-        ),
-    };
+    let type_filter = type_ext.map(resource_type).transpose()?;
 
     // Lead with the string itself for context, when it resolves.
     match manager.string(strref) {
@@ -691,15 +700,8 @@ fn print_resref_uses(
     if name.len() > 8 {
         return Err(format!("not a resref (over 8 characters): {name:?}").into());
     }
-    let kind = extension_type(&ext.to_ascii_lowercase())
-        .ok_or_else(|| format!("unknown resource extension: .{ext}"))?;
-    let type_filter = match type_ext {
-        None => None,
-        Some(ext) => Some(
-            extension_type(&ext.to_ascii_lowercase())
-                .ok_or_else(|| format!("unknown resource extension: .{ext}"))?,
-        ),
-    };
+    let kind = resource_type(ext)?;
+    let type_filter = type_ext.map(resource_type).transpose()?;
 
     // Lead with where the target itself resolves, for context — and say so when
     // it resolves nowhere, since that changes how to read the results.
@@ -739,6 +741,55 @@ fn print_resref_uses(
         )?;
         print_hits(out, &soft)?;
     }
+    Ok(())
+}
+
+/// Dump every reference in the index (`--edges`), one tab-separated record per
+/// occurrence, in the fixed order [`search::each_edge`] emits them in. Nothing
+/// is truncated and no header is written, so the dump diffs cleanly and a
+/// consumer can check the sort with `sort -c`.
+///
+/// A `query` naming one resource dumps only its references, for debugging;
+/// `--type` narrows a whole-index sweep instead, so the two are exclusive.
+fn print_edges(
+    out: &mut impl Write,
+    manager: &mut ResourceManager,
+    query: Option<&str>,
+    source: Source,
+    type_ext: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (only, type_filter) = match query {
+        None => (None, type_ext.map(resource_type).transpose()?),
+        Some(query) => {
+            if type_ext.is_some() {
+                return Err("--type narrows a whole-index --edges sweep, not one resource".into());
+            }
+            // One resref can exist as several types, so a named source must say
+            // which, exactly as a --uses target does.
+            let Some((name, ext)) = query.rsplit_once('.') else {
+                return Err(format!("--edges needs a resource type: {query}.<ext>").into());
+            };
+            if name.is_empty() {
+                return Err(format!("no resource name in query: {query:?}").into());
+            }
+            (Some(name.to_string()), Some(resource_type(ext)?))
+        }
+    };
+
+    search::each_edge(manager, source, type_filter, only.as_deref(), |edge| {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            edge.source,
+            type_extension(edge.source_type),
+            edge.path,
+            edge.target,
+            type_extension(edge.target_type),
+            if edge.soft { "soft" } else { "hard" },
+            u8::from(edge.exists),
+            edge.origin,
+        )
+    })?;
     Ok(())
 }
 
@@ -798,6 +849,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = false;
     let mut help = false;
     let mut uses = false;
+    let mut edges = false;
     let mut type_ext: Option<String> = None;
     let mut out_dir: Option<String> = None;
     let mut using: Vec<String> = Vec::new();
@@ -816,6 +868,8 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
             "--file" => file = true,
             // Report where a `strref:<n>` query's string is referenced.
             "--uses" => uses = true,
+            // Dump every reference in the index rather than one target's.
+            "--edges" => edges = true,
             // Narrow `--uses` to a single resource type (e.g. `--type itm`).
             "--type" => {
                 type_ext = Some(
@@ -842,7 +896,7 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if help || (query.is_none() && !stats) {
+    if help || (query.is_none() && !stats && !edges) {
         write!(out, "{USAGE}")?;
         return Ok(());
     }
@@ -872,6 +926,18 @@ fn run(out: &mut impl Write) -> Result<(), Box<dyn std::error::Error>> {
     }
     if templates.is_some() {
         return Err("--templates applies only when compiling a --file .baf".into());
+    }
+
+    // Before the query is read as a lookup: with `--edges` it names the one
+    // source to sweep instead.
+    if edges {
+        return print_edges(
+            out,
+            &mut manager,
+            query.as_deref(),
+            source,
+            type_ext.as_deref(),
+        );
     }
 
     if stats {

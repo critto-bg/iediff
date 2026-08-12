@@ -231,19 +231,21 @@ impl ResourceManager {
         self.vocabulary.clone()
     }
 
-    /// The `projectl.ids` numbers naming this projectile, for a reverse search:
-    /// items and spells fire one by number, never by resref. Often several, as
-    /// the table gives one file more than one number.
-    pub(crate) fn projectile_numbers(&mut self, resref: &str) -> Vec<i64> {
-        self.load_ids("PROJECTL")
-            .map(|ids| {
-                ids.entries()
-                    .iter()
-                    .filter(|e| e.name.eq_ignore_ascii_case(resref))
-                    .map(|e| e.value)
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// `projectl.ids` keyed by number: items and spells fire a projectile by
+    /// number and never by resref, so this table is the only thing that names
+    /// the file. Both sides are many — the table gives one file several numbers,
+    /// and a modded one may give a number several files.
+    pub(crate) fn projectile_table(&mut self) -> HashMap<i64, Vec<String>> {
+        let mut table: HashMap<i64, Vec<String>> = HashMap::new();
+        if let Some(ids) = self.load_ids("PROJECTL") {
+            for entry in ids.entries() {
+                table
+                    .entry(entry.value)
+                    .or_default()
+                    .push(entry.name.clone());
+            }
+        }
+        table
     }
 
     /// Resolve a resource to a concrete location: an override file when one

@@ -86,10 +86,15 @@ Two cross-cutting rules for ordering methods (in 5) and free functions (in 6):
 - `src/resource.rs` — `ResourceManager`: the coordinator that resolves a
   resource through the KEY and serves its bytes from a lazily-opened, cached
   BIF. One resource at a time: resolve, read, decode.
-- `src/search.rs` — finding resources: by name prefix, and by what references
-  them (`--uses`). Reaches the index through two `pub(crate)` methods on
-  `ResourceManager` (`index_entries`, `read_for_scan`) and owns the per-format
-  dispatch.
+- `src/search.rs` — finding resources: by name prefix, by what references them
+  (`--uses`), and every reference at once (`--edges`). Reaches the index through
+  two `pub(crate)` methods on `ResourceManager` (`index_entries`,
+  `read_for_scan`) and owns the per-format dispatch. `--uses` and `--edges` share
+  one extraction, so filtering the dump by target reproduces the search for it —
+  the tests assert that. The exception is a 2DA/IDS table, which carries no
+  types: a search matches its text against the query, while the dump can only ask
+  the index what each token names, so only a typed field reports a dangling
+  reference.
 - `src/script.rs` — the script-call `Vocabulary`: `ACTION.IDS` / `TRIGGER.IDS`
   signatures read from the install, plus the curated meaning of each parameter
   name (which `S:ResRef*` is an item, which is a variable), so a call's argument

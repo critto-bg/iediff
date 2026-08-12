@@ -8,12 +8,15 @@
 //! - **by reference** — [`find_strref`] and [`find_resref`] answer the reverse
 //!   question, "what points *at* this?", by parsing every candidate resource
 //!   and inspecting its typed fields.
+//! - **every reference at once** — [`each_edge`] runs the same extraction with
+//!   no target to filter by, for a consumer that wants the whole graph.
 //!
 //! The reverse search reads and parses the whole install per query, and skips
 //! anything that fails rather than aborting the sweep: one corrupt file should
 //! not hide every other answer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io;
 
 use crate::formats::are::{ARE_TYPE, Are};
 use crate::formats::bcs::{BCS_TYPE, Script};
@@ -22,6 +25,7 @@ use crate::formats::dlg::{DLG_TYPE, Dlg};
 use crate::formats::eff::{EFF_TYPE, Eff};
 use crate::formats::ids::IDS_TYPE;
 use crate::formats::itm::{ITM_TYPE, Itm};
+use crate::formats::key::type_extension;
 use crate::formats::pro::{PRO_TYPE, Pro};
 use crate::formats::spl::{SPL_TYPE, Spl};
 use crate::formats::sto::{STO_TYPE, Sto};
@@ -59,6 +63,9 @@ pub const REFERENCEABLE_KINDS: [u16; 18] = [
 /// scanned too, but is already in [`SCANNED_TYPES`] for its typed fields.
 const SOFT_TYPES: [u16; 2] = [TWODA_TYPE, IDS_TYPE];
 
+/// `projectl.ids` keyed by number. See [`ResourceManager::projectile_table`].
+type Projectiles = HashMap<i64, Vec<String>>;
+
 /// One resource matched by a prefix search: its name and type.
 pub struct SearchHit {
     pub name: String,
@@ -87,6 +94,81 @@ pub struct RefHit {
     pub origin: Origin,
     pub fields: Vec<String>,
     pub soft: bool,
+}
+
+/// One reference occurrence in the whole-index dump ([`each_edge`]): where it
+/// was found, what it names, and enough context to judge it without a second
+/// query. Resrefs are upper-cased, so the dump has one spelling per resource.
+pub struct Edge {
+    pub source: String,
+    pub source_type: u16,
+    /// `"override"` or `"biff"` — the layer the *source* was read from, which is
+    /// how a modded referrer is told from a stock one. Not the full [`Origin`]:
+    /// that carries a local path, and a dump has to diff across machines.
+    pub origin: &'static str,
+    pub path: String,
+    pub target: String,
+    pub target_type: u16,
+    /// Untyped by convention, as in [`RefHit`].
+    pub soft: bool,
+    /// Whether the target resolves in the index. A dangling reference is
+    /// reported, not dropped — it is what a dead-reference audit looks for.
+    pub exists: bool,
+}
+
+/// One reference lifted out of the resource it was parsed from: a [`ResrefUse`]
+/// with its borrow resolved, and a projectile number already turned into the
+/// name it stands for.
+///
+/// Owning costs one short `String` per reference, on top of the path each format
+/// already formats. Both searches pay it so that both run off one extraction:
+/// [`each_edge`] and [`find_resref`] cannot then answer differently about a
+/// typed field.
+struct Reference {
+    kind: u16,
+    value: String,
+    path: String,
+    soft: bool,
+}
+
+/// Every name the index resolves, upper-cased. It answers the dump's `exists`
+/// column, and it is the only way to read a text table backwards
+/// ([`probe_text`]).
+struct Catalog {
+    types: HashMap<String, Vec<u16>>,
+}
+
+impl Catalog {
+    /// Index both layers, `Biff` dropping the override as everywhere else.
+    fn build(over: &[(&str, u16)], key: &[(&str, u16)], source: Source) -> Catalog {
+        let mut types: HashMap<String, Vec<u16>> = HashMap::new();
+        let mut add = |name: &str, res_type: u16| {
+            let kinds = types.entry(name.to_ascii_uppercase()).or_default();
+            if !kinds.contains(&res_type) {
+                kinds.push(res_type);
+            }
+        };
+        if source != Source::Biff {
+            for &(name, res_type) in over {
+                add(name, res_type);
+            }
+        }
+        for &(name, res_type) in key {
+            add(name, res_type);
+        }
+        Catalog { types }
+    }
+
+    /// Whether the index holds an upper-cased `name` as a `kind`.
+    fn resolves(&self, name: &str, kind: u16) -> bool {
+        self.types_of(name).contains(&kind)
+    }
+
+    /// Every type an upper-cased `name` resolves as; empty when nothing of that
+    /// name exists.
+    fn types_of(&self, name: &str) -> &[u16] {
+        self.types.get(name).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Resources whose name starts with `prefix`, optionally filtered to a single
@@ -200,14 +282,10 @@ pub fn find_resref(
     let mut types = SCANNED_TYPES.to_vec();
     types.extend_from_slice(&SOFT_TYPES);
 
-    // Built once so compiled scripts and DLG script blocks can be typed.
+    // Built once so compiled scripts and DLG script blocks can be typed, and so
+    // a projectile fired by number can be named.
     let vocabulary = manager.vocabulary();
-
-    // A projectile is named by number, so the query becomes table numbers.
-    let projectiles = match kind {
-        PRO_TYPE => manager.projectile_numbers(name),
-        _ => Vec::new(),
-    };
+    let projectiles = manager.projectile_table();
 
     // Snapshot the universe first: these names borrow the index, which the
     // read loop below needs `&mut manager` for.
@@ -250,6 +328,72 @@ pub fn find_resref(
     }
     hits.sort_by(|a, b| a.name.cmp(&b.name).then(a.res_type.cmp(&b.res_type)));
     hits
+}
+
+/// Walk the whole index and hand every reference found to `emit`, in a fixed
+/// total order: source type, then source name, then field path, then the target
+/// type and the target. `type_filter` narrows the *source* types swept, and
+/// `only` restricts the sweep to one source resource; both are debugging aids.
+///
+/// This is [`find_resref`]'s extraction with nothing filtered out — save for one
+/// documented exception. A 2DA/IDS table carries no types, so the only way to
+/// read one backwards is to ask the index what each token names
+/// ([`probe_text`]): a table naming a resource that does not exist contributes
+/// nothing here, though `--uses` still finds it when that name is the query.
+/// Only a typed field can report a dangling reference.
+pub fn each_edge<F>(
+    manager: &mut ResourceManager,
+    source: Source,
+    type_filter: Option<u16>,
+    only: Option<&str>,
+    mut emit: F,
+) -> io::Result<()>
+where
+    F: FnMut(&Edge) -> io::Result<()>,
+{
+    let mut types = SCANNED_TYPES.to_vec();
+    types.extend_from_slice(&SOFT_TYPES);
+
+    let vocabulary = manager.vocabulary();
+    let projectiles = manager.projectile_table();
+
+    // Snapshot the universe and the catalogue first: both borrow the index,
+    // which the read loop below needs `&mut manager` for.
+    let (over, key) = manager.index_entries();
+    let catalog = Catalog::build(&over, &key, source);
+    let universe = sweep_order(
+        scan_universe(&over, &key, source, type_filter, &types),
+        only,
+    );
+    drop((over, key));
+
+    for (name, res_type) in universe {
+        let Some((origin, bytes)) = manager.read_for_scan(&name, res_type, source) else {
+            continue;
+        };
+        let origin = match origin {
+            Origin::Override(_) => "override",
+            _ => "biff",
+        };
+        let refs = match res_type {
+            TWODA_TYPE | IDS_TYPE => probe_text(&bytes, &catalog),
+            _ => extract_refs(res_type, &bytes, vocabulary.as_deref(), &projectiles),
+        };
+        for r in emit_order(refs) {
+            let exists = catalog.resolves(&r.value, r.kind);
+            emit(&Edge {
+                source: name.clone(),
+                source_type: res_type,
+                origin,
+                path: r.path,
+                target: r.value,
+                target_type: r.kind,
+                soft: r.soft,
+                exists,
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// The `(name, type)` set to scan. Under `Auto` an override entry shadows the
@@ -371,145 +515,202 @@ fn soft_text_matches(data: &[u8], target: u32) -> Vec<String> {
 /// Where `data` names `name` as a resource of type `kind`, as matching field
 /// paths split into typed ("hard") and judge-me ("soft").
 ///
-/// `projectiles` holds the `projectl.ids` numbers of the queried `.pro`, empty
-/// for any other kind.
-///
-/// The [`ResrefUse`]s borrow from the parsed resource and die inside each `map`
-/// closure; only the matching paths escape. That is what stops a full-install
-/// scan cloning every resref in the game.
+/// A text table is matched against the query rather than extracted: a bare token
+/// types nothing, so the name being searched for is the only thing that can
+/// identify one. That is the single place this and [`each_edge`] read a resource
+/// differently.
 fn match_resrefs(
     res_type: u16,
     data: &[u8],
     name: &str,
     kind: u16,
     vocabulary: Option<&Vocabulary>,
-    projectiles: &[i64],
+    projectiles: &Projectiles,
 ) -> (Vec<String>, Vec<String>) {
     match res_type {
+        TWODA_TYPE | IDS_TYPE => (Vec::new(), soft_text_resref_matches(data, name)),
+        _ => split_refs(
+            extract_refs(res_type, data, vocabulary, projectiles),
+            name,
+            kind,
+        ),
+    }
+}
+
+/// Every resource `data` names. Bytes that don't parse yield nothing, so one
+/// corrupt file cannot hide the rest of a sweep. BCS scripts and a DLG's
+/// trigger and action scripts name resources through their calls, so they need
+/// the [`Vocabulary`]; without one they contribute nothing.
+fn extract_refs(
+    res_type: u16,
+    data: &[u8],
+    vocabulary: Option<&Vocabulary>,
+    projectiles: &Projectiles,
+) -> Vec<Reference> {
+    // Only the formats that fire a projectile pass `projectile_uses`; an ARE
+    // names the one in a trap by resref, so it goes through the named path.
+    match res_type {
         EFF_TYPE => Eff::parse(data)
-            .map(|r| {
-                split_all(
-                    r.resref_uses(),
-                    r.projectile_uses(),
-                    name,
-                    kind,
-                    projectiles,
-                )
-            })
+            .map(|r| own_refs(r.resref_uses(), r.projectile_uses(), projectiles))
             .unwrap_or_default(),
         ITM_TYPE => Itm::parse(data)
-            .map(|r| {
-                split_all(
-                    r.resref_uses(),
-                    r.projectile_uses(),
-                    name,
-                    kind,
-                    projectiles,
-                )
-            })
+            .map(|r| own_refs(r.resref_uses(), r.projectile_uses(), projectiles))
             .unwrap_or_default(),
         SPL_TYPE => Spl::parse(data)
-            .map(|r| {
-                split_all(
-                    r.resref_uses(),
-                    r.projectile_uses(),
-                    name,
-                    kind,
-                    projectiles,
-                )
-            })
+            .map(|r| own_refs(r.resref_uses(), r.projectile_uses(), projectiles))
             .unwrap_or_default(),
         CRE_TYPE => Cre::parse(data)
-            .map(|r| {
-                split_all(
-                    r.resref_uses(),
-                    r.projectile_uses(),
-                    name,
-                    kind,
-                    projectiles,
-                )
-            })
+            .map(|r| own_refs(r.resref_uses(), r.projectile_uses(), projectiles))
             .unwrap_or_default(),
         PRO_TYPE => Pro::parse(data)
-            .map(|r| {
-                split_all(
-                    r.resref_uses(),
-                    r.projectile_uses(),
-                    name,
-                    kind,
-                    projectiles,
-                )
-            })
+            .map(|r| own_refs(r.resref_uses(), r.projectile_uses(), projectiles))
             .unwrap_or_default(),
         STO_TYPE => Sto::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .map(|r| own_refs(r.resref_uses(), Vec::new(), projectiles))
             .unwrap_or_default(),
         ARE_TYPE => Are::parse(data)
-            .map(|r| split_matches(r.resref_uses(), name, kind))
+            .map(|r| own_refs(r.resref_uses(), Vec::new(), projectiles))
             .unwrap_or_default(),
         // A dialogue names resources in two ways: `next_dlg` is a typed field,
         // and its trigger and action scripts name them by call — the latter
         // compiled and typed exactly, so those are hard too.
         DLG_TYPE => Dlg::parse(data)
             .map(|r| {
-                let (mut hard, soft) = split_matches(r.resref_uses(), name, kind);
+                let mut refs = own_refs(r.resref_uses(), Vec::new(), projectiles);
                 if let Some(vocabulary) = vocabulary {
-                    let (script_hard, _) =
-                        split_matches(r.script_references(vocabulary), name, kind);
-                    hard.extend(script_hard);
+                    refs.extend(own_refs(
+                        r.script_references(vocabulary),
+                        Vec::new(),
+                        projectiles,
+                    ));
                 }
-                (hard, soft)
+                refs
             })
             .unwrap_or_default(),
         // A compiled script names resources through its calls' arguments, typed
         // by the same vocabulary — but exactly, from the parsed record rather
-        // than from text, so these are hard matches.
+        // than from text, so these are hard references.
         BCS_TYPE => match vocabulary {
             Some(vocabulary) => Script::parse(data)
-                .map(|r| split_matches(r.references(vocabulary), name, kind))
+                .map(|r| own_refs(r.references(vocabulary), Vec::new(), projectiles))
                 .unwrap_or_default(),
-            None => (Vec::new(), Vec::new()),
+            None => Vec::new(),
         },
-        // Text tables have no typed fields at all, so every match is a
-        // candidate — and an untyped one, which is why `kind` is not consulted:
-        // a bare token in a 2DA says nothing about what type it names.
-        TWODA_TYPE | IDS_TYPE => (Vec::new(), soft_text_resref_matches(data, name)),
-        _ => (Vec::new(), Vec::new()),
+        _ => Vec::new(),
     }
 }
 
-/// Split the uses naming `name` as a `kind` into hard and soft paths. Resrefs
-/// are ASCII and case-insensitive.
-fn split_matches(uses: Vec<ResrefUse<'_>>, name: &str, kind: u16) -> (Vec<String>, Vec<String>) {
-    let mut hard = Vec::new();
-    let mut soft = Vec::new();
-    for u in uses {
-        if u.kind != kind || !u.value.eq_ignore_ascii_case(name) {
-            continue;
-        }
-        if u.soft { &mut soft } else { &mut hard }.push(u.path);
-    }
-    (hard, soft)
-}
-
-/// [`split_matches`] for a format that also names projectiles by number. Those
-/// are hard matches too: a `projectl.ids` number identifies a `.pro` as exactly
-/// as a resref would.
-fn split_all(
+/// Lift a parsed resource's references out of it, resolving any projectile
+/// number through `projectl.ids`. Those are hard: a number identifies a `.pro`
+/// as exactly as a resref would. A number the table does not name resolves to
+/// nothing, and so yields no reference — the resref is the only name a consumer
+/// can act on.
+fn own_refs(
     uses: Vec<ResrefUse<'_>>,
     projectiles: Vec<ProjectileUse>,
-    name: &str,
-    kind: u16,
-    numbers: &[i64],
-) -> (Vec<String>, Vec<String>) {
-    let (mut hard, soft) = split_matches(uses, name, kind);
-    hard.extend(
-        projectiles
-            .into_iter()
-            .filter(|u| numbers.contains(&u.number))
-            .map(|u| u.path),
-    );
+    table: &Projectiles,
+) -> Vec<Reference> {
+    let mut refs: Vec<Reference> = uses
+        .into_iter()
+        .map(|u| Reference {
+            kind: u.kind,
+            value: u.value.into_owned(),
+            path: u.path,
+            soft: u.soft,
+        })
+        .collect();
+    for u in projectiles {
+        for name in table.get(&u.number).into_iter().flatten() {
+            refs.push(Reference {
+                kind: PRO_TYPE,
+                value: name.clone(),
+                path: u.path.clone(),
+                soft: false,
+            });
+        }
+    }
+    refs
+}
+
+/// Split the references naming `name` as a `kind` into hard and soft paths.
+/// Resrefs are ASCII and case-insensitive.
+fn split_refs(refs: Vec<Reference>, name: &str, kind: u16) -> (Vec<String>, Vec<String>) {
+    let mut hard = Vec::new();
+    let mut soft = Vec::new();
+    for r in refs {
+        if r.kind != kind || !r.value.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if r.soft { &mut soft } else { &mut hard }.push(r.path);
+    }
     (hard, soft)
+}
+
+/// The resources a text table names, read backwards: every whitespace token the
+/// index resolves, on the line it sits on. Each is soft, and each type the name
+/// resolves as is a separate candidate — a bare token says nothing about what it
+/// names. Types nothing can reference are skipped, so the dump answers exactly
+/// what [`find_resref`] accepts as a query.
+///
+/// A line is the whole path a table can give, so one name gets one reference per
+/// line however many tokens on it carry the name — which is what
+/// [`soft_text_resref_matches`] reports from the same line.
+fn probe_text(data: &[u8], catalog: &Catalog) -> Vec<Reference> {
+    let text = crate::decrypt_text(data);
+    let text = String::from_utf8_lossy(&text);
+    let mut refs = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let mut seen = HashSet::new();
+        for token in line.split_whitespace() {
+            for name in token_names(token) {
+                for &kind in catalog.types_of(&name) {
+                    if REFERENCEABLE_KINDS.contains(&kind) && seen.insert((name.clone(), kind)) {
+                        refs.push(Reference {
+                            kind,
+                            value: name.clone(),
+                            path: format!("line {}", i + 1),
+                            soft: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    refs
+}
+
+/// The universe in dump order — source type, then name — with the names upper-
+/// cased, which is the one spelling the dump uses. Both index layers key on the
+/// upper-cased name, so a canonical name still resolves.
+fn sweep_order(universe: Vec<(String, u16)>, only: Option<&str>) -> Vec<(String, u16)> {
+    let mut out: Vec<(String, u16)> = universe
+        .into_iter()
+        .filter(|(name, _)| only.is_none_or(|o| name.eq_ignore_ascii_case(o)))
+        .map(|(name, res_type)| (name.to_ascii_uppercase(), res_type))
+        .collect();
+    out.sort_by(|a, b| {
+        type_extension(a.1)
+            .cmp(type_extension(b.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out
+}
+
+/// One resource's references in dump order, upper-cased. Records that agree on
+/// every column survive: two calls in one script block share a path, and they
+/// are still two occurrences.
+fn emit_order(mut refs: Vec<Reference>) -> Vec<Reference> {
+    for r in &mut refs {
+        r.value.make_ascii_uppercase();
+    }
+    refs.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| type_extension(a.kind).cmp(type_extension(b.kind)))
+            .then_with(|| a.value.cmp(&b.value))
+            .then_with(|| a.soft.cmp(&b.soft))
+    });
+    refs
 }
 
 /// Soft resref match in a 2DA/IDS table: the 1-based lines where `target` is a
@@ -520,29 +721,30 @@ fn split_all(
 fn soft_text_resref_matches(data: &[u8], target: &str) -> Vec<String> {
     let text = crate::decrypt_text(data);
     let text = String::from_utf8_lossy(&text);
+    let upper = target.to_ascii_uppercase();
     text.lines()
         .enumerate()
         .filter(|(_, line)| {
             line.split_whitespace()
-                .any(|token| token_names(token, target))
+                .any(|token| token_names(token).iter().any(|n| n == &upper))
         })
         .map(|(i, _)| format!("line {}", i + 1))
         .collect()
 }
 
-/// Does a table token name `target`? Directly, or through a two-letter action
-/// prefix: the level-up and CLAB tables list a spell as `GA_<resref>` (gain
-/// ability) or `AP_<resref>` (apply), never the bare resref. A `.ext` suffix is
-/// ignored either way.
-fn token_names(token: &str, target: &str) -> bool {
-    let token = token.split_once('.').map_or(token, |(stem, _)| stem);
-    if token.eq_ignore_ascii_case(target) {
-        return true;
+/// The resource names a table token could be: the token itself without any
+/// `.ext`, and — since the level-up and CLAB tables list a spell as `GA_<resref>`
+/// (gain ability) or `AP_<resref>` (apply), never bare — whatever follows a
+/// two-letter action prefix. Upper-cased, as the index is keyed.
+fn token_names(token: &str) -> Vec<String> {
+    let stem = token.split_once('.').map_or(token, |(stem, _)| stem);
+    let mut names = vec![stem.to_ascii_uppercase()];
+    if matches!(stem.as_bytes(), [a, b, b'_', ..] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic())
+        && let Some(rest) = stem.get(3..)
+    {
+        names.push(rest.to_ascii_uppercase());
     }
-    matches!(token.as_bytes(), [a, b, b'_', ..] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic())
-        && token
-            .get(3..)
-            .is_some_and(|rest| rest.eq_ignore_ascii_case(target))
+    names
 }
 
 #[cfg(test)]
@@ -677,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn split_matches_keys_on_kind_and_ignores_resref_case() {
+    fn split_refs_keys_on_kind_and_ignores_resref_case() {
         let uses = vec![
             ResrefUse::new(ITM_TYPE, "SW1H01", "item[0]"),
             // Same name, different type: a SPL named SW1H01 is not the item.
@@ -688,9 +890,37 @@ mod tests {
             ResrefUse::new(ITM_TYPE, "SW1H011", "item[2]"),
             ResrefUse::new(ITM_TYPE, "SW1H01", "op318.resource").soft(),
         ];
-        let (hard, soft) = split_matches(uses, "sW1h01", ITM_TYPE);
+        let refs = own_refs(uses, Vec::new(), &Projectiles::new());
+        let (hard, soft) = split_refs(refs, "sW1h01", ITM_TYPE);
         assert_eq!(hard, vec!["item[0]".to_string(), "item[1]".to_string()]);
         assert_eq!(soft, vec!["op318.resource".to_string()]);
+    }
+
+    #[test]
+    fn own_refs_names_a_projectile_through_the_table() {
+        let table = Projectiles::from([(7, vec!["PROJ01".to_string(), "PROJ02".to_string()])]);
+        let refs = own_refs(
+            Vec::new(),
+            vec![
+                ProjectileUse::new(7, "ability[0].projectile"),
+                ProjectileUse::new(9, "ability[1].projectile"),
+            ],
+            &table,
+        );
+        // Both files the number names are references; a number the table does
+        // not name yields nothing, since the resref is the only usable name.
+        let named: Vec<_> = refs
+            .iter()
+            .map(|r| (r.value.as_str(), r.path.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("PROJ01", "ability[0].projectile"),
+                ("PROJ02", "ability[0].projectile"),
+            ]
+        );
+        assert!(refs.iter().all(|r| r.kind == PRO_TYPE && !r.soft));
     }
 
     // ---- end-to-end, against the synthetic game in `fixture` ----------------
@@ -729,13 +959,16 @@ mod tests {
         // The table ties the two together, and gives PRO_TARGET two numbers.
         let game = fixture::build();
         let mut m = fixture_manager(&game);
-        assert_eq!(
-            m.projectile_numbers(fixture::PRO_TARGET),
-            vec![
-                i64::from(fixture::PROJECTILE_NUMBER),
-                i64::from(fixture::PROJECTILE_NUMBER) + 40
-            ]
-        );
+        let table = m.projectile_table();
+        for number in [
+            i64::from(fixture::PROJECTILE_NUMBER),
+            i64::from(fixture::PROJECTILE_NUMBER) + 40,
+        ] {
+            assert_eq!(
+                table.get(&number).map(Vec::as_slice),
+                Some([fixture::PRO_TARGET.to_string()].as_slice())
+            );
+        }
 
         let found = find_resref(&mut m, fixture::PRO_TARGET, PRO_TYPE, Source::Auto, None);
         let hit = found
@@ -963,6 +1196,212 @@ mod tests {
         // The shadowed creature is listed under both layers, by design: the
         // grouping shows where each copy lives, not which one would win.
         assert_eq!(results.total(), 4);
+    }
+
+    // ---- the whole-index dump ------------------------------------------------
+    //
+    // The same fixture read the other way round: every reference at once rather
+    // than one target's. `DECLARED` below is the hand-written list of what the
+    // fixture contains, so it doubles as the expected dump.
+
+    /// One dump record, kept whole so a test can filter it by any column.
+    struct Row {
+        source: String,
+        source_type: u16,
+        path: String,
+        target: String,
+        target_type: u16,
+        soft: bool,
+        exists: bool,
+        origin: &'static str,
+    }
+
+    impl Row {
+        /// The record as one readable line, the CLI's columns in its order.
+        fn line(&self) -> String {
+            format!(
+                "{}.{} {} -> {}.{} {} {} {}",
+                self.source,
+                type_extension(self.source_type),
+                self.path,
+                self.target,
+                type_extension(self.target_type),
+                if self.soft { "soft" } else { "hard" },
+                u8::from(self.exists),
+                self.origin,
+            )
+        }
+    }
+
+    /// Every edge of the fixture game, in the order [`each_edge`] emits them.
+    fn dump(m: &mut ResourceManager, source: Source) -> Vec<Row> {
+        let mut rows = Vec::new();
+        each_edge(m, source, None, None, |e| {
+            rows.push(Row {
+                source: e.source.clone(),
+                source_type: e.source_type,
+                path: e.path.clone(),
+                target: e.target.clone(),
+                target_type: e.target_type,
+                soft: e.soft,
+                exists: e.exists,
+                origin: e.origin,
+            });
+            Ok(())
+        })
+        .expect("collecting into memory cannot fail");
+        rows
+    }
+
+    #[test]
+    fn the_dump_holds_every_declared_reference() {
+        let game = fixture::build();
+        let mut m = fixture_manager(&game);
+        let lines: Vec<String> = dump(&mut m, Source::Auto).iter().map(Row::line).collect();
+
+        for &(referrer, kind, target, path) in DECLARED {
+            let edge = format!(" {path} -> {target}.{} ", type_extension(kind));
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("{referrer}.")) && l.contains(&edge)),
+                "the dump is missing {referrer} -> {target} at {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dump_and_a_reverse_search_answer_alike() {
+        // The acceptance test, and what pins both modes to one extraction:
+        // filtering the dump by target must reproduce the reverse search for
+        // that target. Text tables are the documented exception — the dump types
+        // them through the index, a search through the query.
+        let game = fixture::build();
+        let mut m = fixture_manager(&game);
+        let rows = dump(&mut m, Source::Auto);
+        let typed = |res_type: u16| !matches!(res_type, TWODA_TYPE | IDS_TYPE);
+
+        let mut targets: Vec<(String, u16)> = rows
+            .iter()
+            .map(|r| (r.target.clone(), r.target_type))
+            .collect();
+        targets.sort();
+        targets.dedup();
+        assert!(
+            targets.len() >= REFERENCEABLE_KINDS.len(),
+            "the fixture should put every kind in the dump"
+        );
+
+        for (target, kind) in targets {
+            let mut want: Vec<(String, String, bool)> = rows
+                .iter()
+                .filter(|r| typed(r.source_type) && r.target_type == kind && r.target == target)
+                .map(|r| (r.source.clone(), r.path.clone(), r.soft))
+                .collect();
+            let mut got: Vec<(String, String, bool)> =
+                find_resref(&mut m, &target, kind, Source::Auto, None)
+                    .iter()
+                    .filter(|h| typed(h.res_type))
+                    .flat_map(|h| {
+                        h.fields
+                            .iter()
+                            .map(move |f| (h.name.to_ascii_uppercase(), f.clone(), h.soft))
+                    })
+                    .collect();
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "{target}.{}", type_extension(kind));
+        }
+    }
+
+    #[test]
+    fn a_dangling_reference_is_reported_but_an_unknown_table_token_is_not() {
+        let game = fixture::build();
+        let mut m = fixture_manager(&game);
+        let lines: Vec<String> = dump(&mut m, Source::Auto).iter().map(Row::line).collect();
+        let has = |line: &str| lines.iter().any(|l| l == line);
+
+        // Only the item exists; every other fixture target is named but absent,
+        // which is exactly what a dead-reference audit is looking for.
+        assert!(has("ARCHIVED.cre item[0] -> SW1H01.itm hard 1 biff"));
+        assert!(has(
+            "ARCHIVED.cre known_spell[0] -> MAGICMIS.spl hard 0 biff"
+        ));
+
+        // The origin column names the layer the source came from: the override
+        // copy of the creature wins, and the store lives there alone.
+        assert!(has("SHADOWED.cre item[1] -> SW1H01.itm hard 1 override"));
+        assert!(has("LOOSE.sto sale[0] -> SW1H01.itm hard 1 override"));
+
+        // A table is read through the index, so it yields the name that resolves
+        // and says nothing about SW1H01A, which resolves as nothing. That is the
+        // one reference a dump cannot report.
+        let table: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.starts_with("LOOT.2da"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            table,
+            vec![
+                "LOOT.2da line 4 -> SW1H01.itm soft 1 biff",
+                "LOOT.2da line 5 -> SW1H01.itm soft 1 biff",
+            ]
+        );
+        assert!(!find_resref(&mut m, "SW1H01A", ITM_TYPE, Source::Auto, None).is_empty());
+    }
+
+    #[test]
+    fn the_dump_comes_out_in_one_fixed_order() {
+        let game = fixture::build();
+        let mut m = fixture_manager(&game);
+        let rows = dump(&mut m, Source::Auto);
+
+        let key = |r: &Row| {
+            (
+                type_extension(r.source_type),
+                r.source.clone(),
+                r.path.clone(),
+                type_extension(r.target_type),
+                r.target.clone(),
+                r.soft,
+            )
+        };
+        let keys: Vec<_> = rows.iter().map(key).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            keys, sorted,
+            "records must come out in the documented order"
+        );
+
+        // One case per resref, so the dump diffs against itself across runs.
+        assert!(rows.iter().all(|r| {
+            r.source == r.source.to_ascii_uppercase() && r.target == r.target.to_ascii_uppercase()
+        }));
+    }
+
+    #[test]
+    fn a_named_source_dumps_its_own_references_and_no_others() {
+        let game = fixture::build();
+        let mut m = fixture_manager(&game);
+        let all: Vec<String> = dump(&mut m, Source::Auto)
+            .iter()
+            .filter(|r| r.source == "MAP")
+            .map(Row::line)
+            .collect();
+
+        let mut one = Vec::new();
+        each_edge(&mut m, Source::Auto, Some(ARE_TYPE), Some("map"), |e| {
+            one.push(format!("{}.{}", e.source, type_extension(e.source_type)));
+            Ok(())
+        })
+        .expect("collect");
+        assert_eq!(one.len(), all.len());
+        assert!(
+            one.iter().all(|s| s == "MAP.are"),
+            "restricted to one source"
+        );
     }
 
     // ---- coverage invariants over the fixture --------------------------------
