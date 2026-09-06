@@ -5,11 +5,12 @@ Guidance for working in this repo. See `README.md` for project intent.
 ## What this is
 
 `iediff` parses, prints, and diffs Infinity Engine resource files, developed and
-tested against a real BG2:EE install. See `README.md` for goals.
+tested against real BG:EE and BG2:EE installs — and so against EET, which merges
+both into one BG2:EE install. See `README.md` for goals.
 
 ## Mod-specific features
 
-Some features serve a *specific mod*, not the engine or the wider toolchain: they
+Some features serve a _specific mod_, not the engine or the wider toolchain: they
 implement one mod's own build convention rather than a game file format or a
 WeiDU feature. (Contrast the BAF compiler's `--using`, which is core WeiDU — a
 mod merely provided the tra files to test it against.) So far the only such
@@ -117,9 +118,14 @@ Two cross-cutting rules for ordering methods (in 5) and free functions (in 6):
 - `md/` — symlink: IESDP format docs. Authoritative reference for every format.
   Start at `md/iesdp/file_formats/index.md`; conventions in
   `md/iesdp/file_formats/general.md`.
-- `game/` — symlink: BG2:EE install used as test data.
-- Both symlinks are git-ignored and local-only, so no test may depend on them:
-  each format's unit tests build their own byte fixtures, and whole-install
+- `game/` — symlink: the BG2:EE install used as test data, currently with
+  ImprovedAnvil on it. The directory it points at gets renamed, so nothing may
+  depend on its name.
+- `gamebg1/` — symlink: a stock BG:EE install. The two games differ in ways only
+  a second install catches, such as the GAM version of `baldur.gam`. Run the
+  binary from that root to test against it.
+- All three symlinks are git-ignored and local-only, so no test may depend on
+  them: each format's unit tests build their own byte fixtures, and whole-install
   tests use `src/fixture.rs`.
 
 ## How the game data fits together
@@ -148,6 +154,17 @@ how they add wholly new ones (which exist only in override, with no KEY entry).
 `ResourceManager` honours this priority by default; `--biff` skips override to
 reach the untouched original.
 
+One resource stands outside this scheme: `baldur.gam` describes the _game_ rather
+than a thing in it — the area a new game starts in, the NPCs it can still
+recruit and where they wait, and the familiar each alignment summons. A save
+game is the same format, and carries every party member's whole CRE inline.
+
+The two games disagree on its version. BG2:EE ships `GAME V2.0`, but BG:EE still
+ships BG1's `V1.1`, even though it writes `V2.0` saves. The two share the header
+size and every record size. `V2.0` fills the 76 bytes `V1.1` leaves unused and
+adds the sections they point at, so a `V1.1` file read under `V2.0` rules takes
+those unused bytes for a familiar table.
+
 Each resource type then has its own format under `md/iesdp/file_formats/ie_formats/`
 (e.g. `cre_v1.md`, `itm_v1.md`, `2da.md`). Many formats are versioned; read the
 4-byte signature + version from the header before parsing. Some text formats
@@ -162,7 +179,7 @@ BCS is a compiled script (an ASCII token stream); BAF is its textual form. The
 codec was verified against the install's own scripts and WeiDU (the community
 compiler used as an oracle), by three round-trip metrics.
 
-Counts are per *stored copy*, not per name: a script the override layer shadows
+Counts are per _stored copy_, not per name: a script the override layer shadows
 is two different byte sequences, and both must round-trip. The local install
 holds 5535 — a total mods change, so it is the last sweep's denominator, not a
 constant.

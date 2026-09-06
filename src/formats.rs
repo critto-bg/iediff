@@ -12,6 +12,7 @@ pub mod cre;
 pub mod dlg;
 pub mod eff;
 pub mod fields;
+pub mod gam;
 pub mod ids;
 pub mod itm;
 pub mod key;

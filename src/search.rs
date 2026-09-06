@@ -23,6 +23,7 @@ use crate::formats::bcs::{BCS_TYPE, Script};
 use crate::formats::cre::{CRE_TYPE, Cre};
 use crate::formats::dlg::{DLG_TYPE, Dlg};
 use crate::formats::eff::{EFF_TYPE, Eff};
+use crate::formats::gam::{GAM_TYPE, Gam};
 use crate::formats::ids::IDS_TYPE;
 use crate::formats::itm::{ITM_TYPE, Itm};
 use crate::formats::key::type_extension;
@@ -40,8 +41,9 @@ use crate::{ProjectileUse, ResrefUse, StrrefUse};
 /// The decoded binary formats, and so the resources a reverse search reads.
 /// BCS scripts name resources through their calls, so they are scanned too —
 /// but only with a [`Vocabulary`] to say what each call's arguments mean.
-const SCANNED_TYPES: [u16; 9] = [
-    EFF_TYPE, ITM_TYPE, SPL_TYPE, CRE_TYPE, PRO_TYPE, STO_TYPE, ARE_TYPE, DLG_TYPE, BCS_TYPE,
+const SCANNED_TYPES: [u16; 10] = [
+    EFF_TYPE, ITM_TYPE, SPL_TYPE, CRE_TYPE, PRO_TYPE, STO_TYPE, ARE_TYPE, DLG_TYPE, GAM_TYPE,
+    BCS_TYPE,
 ];
 
 /// The types [`find_resref`] can find. A query for anything else has nothing to
@@ -464,6 +466,9 @@ fn extract_strrefs(res_type: u16, data: &[u8], vocabulary: Option<&Vocabulary>) 
         ARE_TYPE => Are::parse(data)
             .map(|a| a.strref_uses())
             .unwrap_or_default(),
+        GAM_TYPE => Gam::parse(data)
+            .map(|g| g.strref_uses())
+            .unwrap_or_default(),
         DLG_TYPE => Dlg::parse(data)
             .map(|d| {
                 let mut uses = d.strref_uses();
@@ -569,6 +574,9 @@ fn extract_refs(
             .map(|r| own_refs(r.resref_uses(), Vec::new(), projectiles))
             .unwrap_or_default(),
         ARE_TYPE => Are::parse(data)
+            .map(|r| own_refs(r.resref_uses(), Vec::new(), projectiles))
+            .unwrap_or_default(),
+        GAM_TYPE => Gam::parse(data)
             .map(|r| own_refs(r.resref_uses(), Vec::new(), projectiles))
             .unwrap_or_default(),
         // A dialogue names resources in two ways: `next_dlg` is a typed field,
@@ -1002,6 +1010,35 @@ mod tests {
     }
 
     #[test]
+    fn a_game_state_names_its_roster_and_its_journal_entry() {
+        let game = fixture::build();
+        let mut m = fixture_manager(&game);
+
+        // The roster entry names the creature waiting to be recruited, and the
+        // familiar table names the one the spell summons.
+        let found = find_resref(&mut m, fixture::CRE_TARGET, CRE_TYPE, Source::Auto, None);
+        let hit = found
+            .iter()
+            .find(|h| h.name == "NEWGAME")
+            .expect("the game state names the roster");
+        assert!(!hit.soft);
+        assert_eq!(hit.fields, vec!["npc[0].character", "familiar.lg"]);
+
+        // The party member's script name carries the engine's `*` mark, so it
+        // names no file and nothing can find it.
+        assert!(find_resref(&mut m, "*IDDEN", CRE_TYPE, Source::Auto, None).is_empty());
+
+        // A journal entry is a typed strref, like an area's info text.
+        let found = find_strref(&mut m, fixture::JOURNAL_STRREF, Source::Auto, None);
+        let hit = found
+            .iter()
+            .find(|h| h.name == "NEWGAME")
+            .expect("the game state holds the journal entry");
+        assert!(!hit.soft);
+        assert_eq!(hit.fields, vec!["journal[0].text"]);
+    }
+
+    #[test]
     fn finds_every_referrer_across_both_layers() {
         let game = fixture::build();
         let mut m = fixture_manager(&game);
@@ -1029,6 +1066,16 @@ mod tests {
                 (
                     "MAP.are".into(),
                     vec!["item[0]".to_string(), "door[0].key_item".to_string()]
+                ),
+                // The game state names the item three ways: a statistic, the
+                // party's shared pack, and the creature it carries inline.
+                (
+                    "NEWGAME.gam".into(),
+                    vec![
+                        "party[0].favourite_weapon[0]".to_string(),
+                        "party[0].cre.item[0]".to_string(),
+                        "inventory[0]".to_string(),
+                    ],
                 ),
                 // The override copy wins, and it names the item twice.
                 (
@@ -1098,6 +1145,7 @@ mod tests {
                 "ARCHIVED.cre",
                 "MAGIC.spl",
                 "MAP.are",
+                "NEWGAME.gam",
                 "SHADOWED.cre",
                 "SINGLE.eff",
                 "SW1H01.itm",
@@ -1544,6 +1592,33 @@ mod tests {
             "transition[0].next_dlg",
         ),
         ("SINGLE", ITM_TYPE, fixture::ITM_TARGET, "op122.resource"),
+        // GAM: the starting area and worldmap, where the party stands and what
+        // it carries, the roster it can still recruit, and the familiar table.
+        ("NEWGAME", ARE_TYPE, fixture::ARE_TARGET, "main_area"),
+        ("NEWGAME", WMP_TYPE, fixture::WMP_TARGET, "worldmap"),
+        ("NEWGAME", ARE_TYPE, fixture::ARE_TARGET, "party[0].area"),
+        (
+            "NEWGAME",
+            SPL_TYPE,
+            fixture::SPL_TARGET,
+            "party[0].quick_spell[0]",
+        ),
+        (
+            "NEWGAME",
+            ITM_TYPE,
+            fixture::ITM_TARGET,
+            "party[0].favourite_weapon[0]",
+        ),
+        // The creature a save carries inline is decoded, not skipped.
+        (
+            "NEWGAME",
+            ITM_TYPE,
+            fixture::ITM_TARGET,
+            "party[0].cre.item[0]",
+        ),
+        ("NEWGAME", CRE_TYPE, fixture::CRE_TARGET, "npc[0].character"),
+        ("NEWGAME", ITM_TYPE, fixture::ITM_TARGET, "inventory[0]"),
+        ("NEWGAME", CRE_TYPE, fixture::CRE_TARGET, "familiar.lg"),
         // BCS: a trigger's string, an action's strings, and a spell by number.
         (
             "AISCRIPT",

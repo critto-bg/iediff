@@ -18,6 +18,7 @@ use crate::formats::bcs::BCS_TYPE;
 use crate::formats::cre::CRE_TYPE;
 use crate::formats::dlg::DLG_TYPE;
 use crate::formats::eff::{EFF_TYPE, FEATURE_SIZE};
+use crate::formats::gam::GAM_TYPE;
 use crate::formats::itm::ITM_TYPE;
 use crate::formats::pro::PRO_TYPE;
 use crate::formats::spl::SPL_TYPE;
@@ -29,6 +30,9 @@ pub const SPELL_BY_NUMBER: &str = "SPWI001";
 
 /// The strref the fixture script passes to `DisplayString`.
 pub const SCRIPT_STRREF: u32 = 12345;
+
+/// The strref of the journal entry in the fixture's game state.
+pub const JOURNAL_STRREF: u32 = 54321;
 
 /// The `projectl.ids` number the fixture gives [`PRO_TARGET`], which is the
 /// only way a spell or item can name it.
@@ -115,6 +119,7 @@ struct Entry {
 /// | `TALK.dlg`     | bif            | a DLG handoff, plus a trigger and action |
 /// | `SINGLE.eff`   | bif            | a standalone effect naming an item     |
 /// | `LOOT.2da`     | bif            | the item as a row label and as a cell  |
+/// | `NEWGAME.gam`  | bif            | the roster, an embedded CRE, familiars |
 /// | `LOOSE.sto`    | override only  | rumours, a sale item, a cure           |
 pub fn build() -> FixtureGame {
     let root = temp_dir();
@@ -178,6 +183,11 @@ pub fn build() -> FixtureGame {
             name: "AISCRIPT",
             res_type: BCS_TYPE,
             data: bcs(),
+        },
+        Entry {
+            name: "NEWGAME",
+            res_type: GAM_TYPE,
+            data: gam(),
         },
     ];
 
@@ -510,6 +520,65 @@ fn bcs() -> Vec<u8> {
     .into_bytes()
 }
 
+/// A game state: the party, the roster it can still recruit, one shared
+/// inventory item, a journal entry and the familiar table — the sections
+/// `baldur.gam` fills in. The party member carries a whole CRE, as a save does.
+fn gam() -> Vec<u8> {
+    const NPC_SIZE: usize = 0x160;
+    const INVENTORY_SIZE: usize = 0x14;
+    const JOURNAL_SIZE: usize = 0x0c;
+    const FAMILIAR_SIZE: usize = 0x190;
+
+    let mut d = vec![0u8; 0xb4];
+    d[0x00..0x04].copy_from_slice(b"GAME");
+    d[0x04..0x08].copy_from_slice(b"V2.0");
+    put_resref(&mut d, 0x40, ARE_TARGET); // main area
+    put_resref(&mut d, 0x8c, WMP_TARGET); // worldmap
+
+    let party_off = d.len();
+    d.resize(party_off + NPC_SIZE, 0);
+    // The engine marks a character it has already spawned by overwriting the
+    // first letter of its script name, so this one must name no creature.
+    put_resref(&mut d, party_off + 0x0c, "*IDDEN");
+    put_resref(&mut d, party_off + 0x18, ARE_TARGET);
+    put_resref(&mut d, party_off + 0x9c, SPL_TARGET); // quick spell 1
+    put_resref(&mut d, party_off + 0xe4 + 0x4c, ITM_TARGET); // favourite weapon 1
+    put_u32(&mut d, 0x20, party_off as u32);
+    put_u32(&mut d, 0x24, 1);
+
+    let npc_off = d.len();
+    d.resize(npc_off + NPC_SIZE, 0);
+    put_resref(&mut d, npc_off + 0x0c, CRE_TARGET);
+    put_resref(&mut d, npc_off + 0x18, ARE_TARGET);
+    put_u32(&mut d, 0x30, npc_off as u32);
+    put_u32(&mut d, 0x34, 1);
+
+    let inventory_off = d.len();
+    d.resize(inventory_off + INVENTORY_SIZE, 0);
+    put_resref(&mut d, inventory_off, ITM_TARGET);
+    put_u32(&mut d, 0x28, inventory_off as u32);
+    put_u32(&mut d, 0x2c, 1);
+
+    let journal_off = d.len();
+    d.resize(journal_off + JOURNAL_SIZE, 0);
+    put_u32(&mut d, journal_off, JOURNAL_STRREF);
+    put_u32(&mut d, 0x50, journal_off as u32);
+    put_u32(&mut d, 0x4c, 1);
+
+    let familiar_off = d.len();
+    d.resize(familiar_off + FAMILIAR_SIZE, 0);
+    put_resref(&mut d, familiar_off, CRE_TARGET); // lawful good
+    put_u32(&mut d, 0x68, familiar_off as u32);
+
+    // The party member's own creature rides inside the file, as in a save game.
+    let cre_off = d.len();
+    let body = cre(&[ITM_TARGET]);
+    put_u32(&mut d, party_off + 0x04, cre_off as u32);
+    put_u32(&mut d, party_off + 0x08, body.len() as u32);
+    d.extend_from_slice(&body);
+    d
+}
+
 /// A standalone V2 effect that creates an item.
 fn eff() -> Vec<u8> {
     let mut d = vec![0u8; 0x110];
@@ -616,7 +685,7 @@ mod tests {
     fn fixture_game_opens_and_indexes() {
         let game = build();
         let manager = ResourceManager::open(&game.key_path()).expect("open fixture");
-        assert_eq!(manager.key().resources().len(), 11);
+        assert_eq!(manager.key().resources().len(), 12);
         let stats = manager.override_stats();
         assert!(stats.present);
         // SHADOWED.cre, LOOSE.sto, and the four IDS tables.

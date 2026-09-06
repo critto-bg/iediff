@@ -24,6 +24,7 @@ use crate::formats::bif::{BifArchive, BifError};
 use crate::formats::cre::{CRE_TYPE, Cre, CreError, CreNames};
 use crate::formats::dlg::{DLG_TYPE, Dlg, DlgError};
 use crate::formats::eff::{EFF_TYPE, Eff, EffError};
+use crate::formats::gam::{GAM_TYPE, Gam, GamError};
 use crate::formats::ids::{IDS_TYPE, IdsFile};
 use crate::formats::itm::{ITM_TYPE, Itm, ItmError};
 use crate::formats::key::{KeyError, KeyFile, extension_type, type_extension};
@@ -548,6 +549,21 @@ impl ResourceManager {
 
                 Resource::Are(are)
             }
+            GAM_TYPE => {
+                let mut gam = Gam::parse(data)?;
+
+                // The party's shared inventory names ITMs, and every journal
+                // entry is a strref — resolve both as the other formats do.
+                self.resolve_refs(
+                    gam.inventory_mut(),
+                    ITM_TYPE,
+                    |it| it.resource(),
+                    |it, n| it.set_name(n),
+                );
+                self.resolve_strrefs(gam.journal_mut(), |e| e.strref(), |e, l| e.set_label(l));
+
+                Resource::Gam(gam)
+            }
             DLG_TYPE => {
                 let mut dlg = Dlg::parse(data)?;
 
@@ -943,6 +959,7 @@ pub enum Resource {
     Sto(Sto),
     Are(Are),
     Dlg(Dlg),
+    Gam(Gam),
     Bcs(Script),
     Other(ResourceInfo),
 }
@@ -961,6 +978,7 @@ impl Resource {
             Resource::Sto(sto) => sto.write_raw(out),
             Resource::Are(are) => are.write_raw(out),
             Resource::Dlg(dlg) => dlg.write_raw(out),
+            Resource::Gam(gam) => gam.write_raw(out),
             Resource::Bcs(script) => script.write_raw(out),
             Resource::Ids(ids) => write!(out, "{ids}"),
             Resource::TwoDA(table) => table.write_raw(out),
@@ -982,6 +1000,7 @@ impl fmt::Display for Resource {
             Resource::Sto(sto) => write!(f, "{sto}"),
             Resource::Are(are) => write!(f, "{are}"),
             Resource::Dlg(dlg) => write!(f, "{dlg}"),
+            Resource::Gam(gam) => write!(f, "{gam}"),
             Resource::Bcs(script) => write!(f, "{script}"),
             Resource::Other(info) => write!(f, "{info}"),
         }
@@ -1169,6 +1188,7 @@ pub enum ResourceError {
     Sto(StoError),
     Are(AreError),
     Dlg(DlgError),
+    Gam(GamError),
     Bcs(BcsError),
     /// No resource with this name and type exists in the KEY.
     NotFound {
@@ -1195,6 +1215,7 @@ impl fmt::Display for ResourceError {
             ResourceError::Sto(e) => write!(f, "{e}"),
             ResourceError::Are(e) => write!(f, "{e}"),
             ResourceError::Dlg(e) => write!(f, "{e}"),
+            ResourceError::Gam(e) => write!(f, "{e}"),
             ResourceError::Bcs(e) => write!(f, "{e}"),
             ResourceError::NotFound { name, res_type } => {
                 write!(f, "resource not found: {name} (type 0x{res_type:04x})")
@@ -1222,6 +1243,7 @@ impl std::error::Error for ResourceError {
             ResourceError::Sto(e) => Some(e),
             ResourceError::Are(e) => Some(e),
             ResourceError::Dlg(e) => Some(e),
+            ResourceError::Gam(e) => Some(e),
             _ => None,
         }
     }
@@ -1302,6 +1324,12 @@ impl From<AreError> for ResourceError {
 impl From<DlgError> for ResourceError {
     fn from(e: DlgError) -> Self {
         ResourceError::Dlg(e)
+    }
+}
+
+impl From<GamError> for ResourceError {
+    fn from(e: GamError) -> Self {
+        ResourceError::Gam(e)
     }
 }
 

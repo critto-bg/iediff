@@ -50,53 +50,54 @@ const TEXT_XOR_KEY: [u8; 64] = [
 /// Short usage guide. `--help` and a bare invocation print this; it needs no
 /// game data, so it works without a readable KEY.
 const USAGE: &str = "\
-iediff — inspect Infinity Engine resources (BG2:EE)
+iediff — inspect Infinity Engine resources (BG:EE, BG2:EE)
 
 Usage:
-  iediff <name>[.ext]      print a resource; a bare name or an inexact match runs a prefix search
+  iediff <name>[.ext]      print a resource (inexact queries search by prefix)
   iediff <name>.ext --uses list the resources that reference this resource
   iediff strref:<n>        resolve a dialog.tlk string by index
   iediff strref:<n> --uses list the resources that reference the string
-  iediff --edges           dump every reference in the index, one record per line
-  iediff --file <path>     print a discrete file by path, bypassing the index
+  iediff --edges           dump every reference in the index, one per line
+  iediff --file <path>     print a discrete file by path, skipping the index
                            (a .baf is compiled to a .bcs next to it)
-  iediff --stats           summarise the KEY index and override directory
+  iediff --stats           summarize the KEY index and override directory
   iediff [--help|-h]       show this help
 
 Options:
   --raw                 machine-readable key=value output (binary formats)
-  --biff                bypass the override directory; read the archived original
-  --file                read the argument as a filesystem path (type from its extension)
-  --uses                find where a resource or string is referenced; the query
+  --biff                skip the override directory, read the archived original
+  --file                read the argument as a path, typed by its extension
+  --uses                find where a resource or string is referenced. The query
                         must name a type (sw1h01.itm, strref:8000)
-  --type <ext>          with --uses or --edges, scan only one resource type
+  --type <ext>          with --uses or --edges, scan only one referring type
   --out <dir>           with --file on a .baf, write the .bcs into <dir>
   --using <tra>         with --file on a .baf, resolve @N strings from this tra
-                        (repeatable; later files win a shared @N)
-  --templates <dir>     with --file on a .baf, expand @@name marker lines from
+                        (repeatable, and a later file wins a shared @N)
+  --templates <dir>     with --file on a .baf, expand @@name directives from
                         <dir>/name.baf (ImprovedAnvil mod convention)
 
-Decoded formats: 2da ids eff itm spl cre pro sto are dlg bcs
-Other resource types are located and summarised (type, size) but not parsed.
+Decoded formats: 2da ids eff itm spl cre pro sto are dlg gam bcs
+Every other resource type is found and reported by type and size, not parsed.
 
---uses searches the decoded binary formats (eff itm spl cre pro sto are dlg bcs)
-for typed references, so it can find these as targets:
+--uses searches the decoded binary formats (eff itm spl cre pro sto are dlg gam
+bcs) for typed references. It finds these as targets:
   itm spl cre dlg are pro eff bcs sto 2da bam vvc wav wed bmp mve mos wmp
-Effect opcodes are covered in full: every resource an effect names is resolved to
-its type. BCS scripts and a DLG's trigger/action scripts are compiled and their
-calls' arguments typed, so a script naming an item, spell (by number too),
-creature, store or strref is a hard hit. A .pro is named by projectl.ids number
-rather than by resref, and resolved through that table. 2DA/IDS tables are
-scanned as text and reported separately as candidates.
 
---edges dumps those same references with nothing filtered out: one tab-separated
-record per occurrence, holding the source and its type, the field path, the
-target and its type, hard or soft, whether the target resolves (1/0), and the
-layer the source came from. Records are sorted by source type, then source, then
-path. Naming a resource (iediff map.are --edges) dumps only its references. A
-2DA/IDS token is resolved against the index, so a table naming a resource that
-does not exist contributes nothing — only a typed field reports a dangling
-reference.
+Every resource an effect names resolves to its type, for every opcode. A BCS,
+and a DLG's script blocks, compile first, so each argument gets the type its
+call declares: an item, a spell (by number too), a creature, a store, a strref.
+A .pro is named by a projectl.ids number, never by resref, and resolved through
+that table. A .gam names its roster by script name, which is the creature's
+resref, and a save game carries each party member's whole .cre inline. 2DA and
+IDS tables are read as text and listed separately, as candidates.
+
+--edges dumps those same references, nothing filtered out: one tab-separated
+record per occurrence. The columns are source, source type, field path, target,
+target type, hard or soft, target resolves (1/0), and source layer. Records sort
+by source type, then source, then path. Naming a resource (iediff map.are
+--edges) dumps only its references. A 2DA/IDS token is resolved against the
+index, so a table naming a resource that does not exist contributes nothing.
+Only a typed field reports a dangling reference.
 
 Reads ./chitin.key if present (run from a game root), else game/chitin.key.
 ";
