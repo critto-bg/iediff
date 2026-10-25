@@ -175,9 +175,12 @@ Each `@N` resolves to its text, which must already exist in `dialog.tlk`. A
 string the game does not hold is an error, not a new entry. The output matches
 WeiDU's byte for byte.
 
-Some mods preprocess their BAF with directives of their own. `--templates`
-supports one such convention, ImprovedAnvil's: a whole line `@@name` expands to
-`<dir>/name.baf` before compiling. The directives are:
+### BAF preprocessor
+
+The `--templates` flag provides support for Improved Anvil's experimental BAF
+preprocessor: a whole line `@@name` expands to `<dir>/name.baf` before compiling.
+
+The directives are:
 
 - `@@name(key=value; …)` — arguments that fill the template's `%key%` slot lines
   and inline placeholders, over several lines if needed.
@@ -190,7 +193,8 @@ supports one such convention, ImprovedAnvil's: a whole line `@@name` expands to
 - `key=@none` — one call opts out of a definition or a default.
 
 An unknown template, a malformed directive, or a leftover placeholder is an
-error.
+error. See `docs/baf-preprocessor.md` for in-depth explanation of each directive
+with examples.
 
 ```sh
 iediff --file S!hlkang.baf --templates ImprovedAnvil/scripts/_templates --out build
